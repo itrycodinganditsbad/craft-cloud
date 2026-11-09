@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use craft_cloud_app::{ConflictCopy, ConflictsResponse, RecentEntry};
+use craft_cloud_app::{ConflictCopy, ConflictsResponse, RecentEntry, SpaceId};
 
 /// The Craft apps whose recent files the page asks for: the lower-case name an app uses for its list, and its name in the
 /// suite.
@@ -65,12 +65,30 @@ impl Place {
     }
 }
 
-/// One recent file: the app whose list it is in, the entry, and whether it can be opened here.
+/// A team space whose recent files the page shows, and the folder it syncs to on this computer (what its files' paths are
+/// relative to).
+#[derive(Clone, PartialEq, Eq)]
+pub struct FileSpace {
+    pub id: SpaceId,
+    pub name: String,
+    pub folder: String,
+}
+
+impl std::fmt::Debug for FileSpace {
+    /// (The name and the folder are left out.)
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileSpace").field("id", &self.id).finish_non_exhaustive()
+    }
+}
+
+/// One recent file: the app whose list it is in, the entry, and whether it can be opened here. `space` is the team space whose
+/// list it is in (none: the personal list).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecentFile {
     pub app: String,
     pub entry: RecentEntry,
     pub place: Place,
+    pub space: Option<FileSpace>,
 }
 
 impl RecentFile {
@@ -312,17 +330,37 @@ pub fn merge(
     lists: Vec<(String, Result<Vec<RecentEntry>, craft_cloud_app::Error>)>,
     place: impl Fn(&str) -> Place,
 ) -> Result<Vec<RecentFile>, craft_cloud_app::Error> {
+    merge_groups(vec![(None, lists)], |_, path| place(path))
+}
+
+/// What the agent answered for each app's list (by the name of the list).
+pub type AppLists = Vec<(String, Result<Vec<RecentEntry>, craft_cloud_app::Error>)>;
+
+/// [`merge`] for the personal lists (`None`) and the lists of team spaces together: each file is placed against its own space's
+/// folder (`place` gets the space), and carries the space it came from.
+pub fn merge_groups(
+    groups: Vec<(Option<FileSpace>, AppLists)>,
+    place: impl Fn(Option<&FileSpace>, &str) -> Place,
+) -> Result<Vec<RecentFile>, craft_cloud_app::Error> {
     let mut files = Vec::new();
     let mut first_error = None;
     let mut answered = false;
-    for (app, list) in lists {
-        match list {
-            Ok(entries) => {
-                answered = true;
-                files.extend(entries.into_iter().map(|entry| RecentFile { place: place(&entry.path), app: app.clone(), entry }));
-            }
-            Err(e) => {
-                first_error.get_or_insert(e);
+    for (space, lists) in groups {
+        for (app, list) in lists {
+            match list {
+                Ok(entries) => {
+                    answered = true;
+                    files.extend(entries.into_iter().map(|entry| RecentFile {
+                        place: place(space.as_ref(), &entry.path),
+                        app: app.clone(),
+                        entry,
+                        space: space.clone(),
+                    }));
+                }
+                // The first error is the personal lists': it is only given when no list at all could be had.
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
             }
         }
     }
@@ -424,6 +462,16 @@ pub struct Files {
 }
 
 impl Files {
+    /// Whether any file is in a team space's list (the page then names the space of each).
+    pub fn has_team(&self) -> bool {
+        self.list.iter().flatten().any(|f| f.space.is_some())
+    }
+
+    /// Whether anybody else has any of the files open right now (the page then has a column for it).
+    pub fn has_open_now(&self) -> bool {
+        self.list.iter().flatten().any(|f| !f.entry.open_now.is_empty())
+    }
+
     /// The files that pass the app filter and the search.
     pub fn visible(&self) -> Vec<&RecentFile> {
         let needle = self.search.trim().to_lowercase();
@@ -456,7 +504,7 @@ mod tests {
     use super::*;
 
     fn entry(path: &str, title: &str, opened_ms: i64) -> RecentEntry {
-        RecentEntry { node: None, path: path.into(), title: title.into(), opened_ms, saved_ms: None, machine: "BEAST".into() }
+        RecentEntry { node: None, path: path.into(), title: title.into(), opened_ms, saved_ms: None, machine: "BEAST".into(), open_now: Vec::new() }
     }
 
     #[test]
@@ -652,7 +700,7 @@ mod tests {
 
     #[test]
     fn a_saved_time_counts_when_it_is_newer() {
-        let mut file = RecentFile { app: "a".into(), entry: entry("a", "a", 10), place: Place::Here };
+        let mut file = RecentFile { app: "a".into(), entry: entry("a", "a", 10), place: Place::Here, space: None };
         file.entry.saved_ms = Some(50);
         assert_eq!(file.when_ms(), 50);
         file.entry.saved_ms = Some(5);
@@ -679,7 +727,7 @@ mod tests {
 
     #[test]
     fn counts_and_filters_follow_the_apps_and_the_search() {
-        let file = |app: &str, path: &str, title: &str| RecentFile { app: app.into(), entry: entry(path, title, 1), place: Place::Here };
+        let file = |app: &str, path: &str, title: &str| RecentFile { app: app.into(), entry: entry(path, title, 1), place: Place::Here, space: None };
         let mut files = Files {
             list: Some(vec![
                 file("wordcraft", "Letters/a.docx", "Letter"),

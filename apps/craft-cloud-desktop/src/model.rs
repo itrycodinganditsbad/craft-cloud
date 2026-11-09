@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 use craft_cloud_app::{
     AccountUsage, AuditEvent, AuditPage, DeviceId, DeviceInfo, Error, FolderUsageResponse, HistoryResponse, JoinRequest, LoginRequest, NodeId,
-    PairingInfo, PairingState, PairingStatus, RestoreResponse, RunState, SecondFactorLoginRequest, Status, TrashResponse, TrashRestoreResponse,
-    UserQuery, Uuid, VersionId, codes,
+    PairingInfo, PairingState, PairingStatus, RestoreResponse, RunState, SecondFactorLoginRequest, SpaceId, Status, TrashResponse,
+    TrashRestoreResponse, UserQuery, Uuid, VersionId, codes,
 };
 use craft_cloud_proto::api::AdminConfirm;
 use craft_cloud_proto::api::codes as api_codes;
@@ -848,15 +848,19 @@ pub enum Event {
     ShowConflictOriginal(String),
     /// The home page's "On this computer" section opens or closes.
     ToggleFolders,
-    /// Open the file of this app's list at this path (relative to the synced folder) with the OS's default program.
+    /// Open the file of this app's list at this path (relative to the synced folder, or the team space's) with the OS's default
+    /// program. `space`: the team space whose list it is in (none: the personal list).
     OpenRecent {
         app: String,
         path: String,
+        space: Option<SpaceId>,
     },
-    /// Show the file of this app's list at this path (relative to the synced folder) in its folder, in the file manager.
+    /// Show the file of this app's list at this path (relative to the synced folder, or the team space's) in its folder, in the
+    /// file manager.
     ShowRecent {
         app: String,
         path: String,
+        space: Option<SpaceId>,
     },
     /// [`Effect::CheckFile`]'s answer: the path to open (links followed, as it was checked), or why the file can't be opened.
     FileChecked(Result<String, Place>),
@@ -1849,8 +1853,8 @@ impl Model {
             }
             Event::OpenConflictCopy(path) => self.open_conflict(&path, false),
             Event::ShowConflictOriginal(path) => self.open_conflict(&path, true),
-            Event::OpenRecent { app, path } => self.open_recent(&app, &path),
-            Event::ShowRecent { app, path } => self.show_recent(&app, &path),
+            Event::OpenRecent { app, path, space } => self.open_recent(&app, &path, space),
+            Event::ShowRecent { app, path, space } => self.show_recent(&app, &path, space),
             Event::FileChecked(result) => match result {
                 Ok(full) => vec![Effect::OpenFile(full)],
                 Err(place) => {
@@ -2759,10 +2763,14 @@ impl Model {
     /// its text ([`crate::files::resolve`]) however the list placed it, then on the disk as it is at this moment
     /// ([`Effect::CheckFile`]: the list may be old, and a file may have been swapped for a link since), and the path that
     /// check gives is the one opened. Otherwise the page says why not.
-    fn open_recent(&mut self, app: &str, path: &str) -> Vec<Effect> {
+    fn open_recent(&mut self, app: &str, path: &str, space: Option<SpaceId>) -> Vec<Effect> {
         let root = self.status.as_ref().and_then(|s| s.folder.clone());
         let Screen::Files(files) = &mut self.screen else { return Vec::new() };
-        let Some(file) = files.list.iter().flatten().find(|f| f.app == app && f.entry.path == path) else { return Vec::new() };
+        let Some(file) = files.list.iter().flatten().find(|f| f.app == app && f.entry.path == path && f.space.as_ref().map(|s| s.id) == space) else {
+            return Vec::new();
+        };
+        // A team space's file is relative to that space's folder.
+        let root = file.space.as_ref().map(|s| s.folder.clone()).or(root);
         let place = file.place;
         let path = file.entry.path.clone();
         files.open_error = None;
@@ -2782,10 +2790,13 @@ impl Model {
 
     /// Shows a recent file that is here in the file manager, by opening the folder it is in (the synced folder for a file at
     /// its top). A file that can't be opened can be shown; one that isn't here, or whose folder is a bundle, can't.
-    fn show_recent(&mut self, app: &str, path: &str) -> Vec<Effect> {
+    fn show_recent(&mut self, app: &str, path: &str, space: Option<SpaceId>) -> Vec<Effect> {
         let root = self.status.as_ref().and_then(|s| s.folder.clone());
         let Screen::Files(files) = &mut self.screen else { return Vec::new() };
-        let Some(file) = files.list.iter().flatten().find(|f| f.app == app && f.entry.path == path) else { return Vec::new() };
+        let Some(file) = files.list.iter().flatten().find(|f| f.app == app && f.entry.path == path && f.space.as_ref().map(|s| s.id) == space) else {
+            return Vec::new();
+        };
+        let root = file.space.as_ref().map(|s| s.folder.clone()).or(root);
         files.open_error = None;
         let (place, path) = (file.place, file.entry.path.clone());
         let folder = match (place, root) {
@@ -4887,8 +4898,10 @@ pub(crate) mod tests {
                 opened_ms,
                 saved_ms: None,
                 machine: "BEAST".into(),
+                open_now: Vec::new(),
             },
             place,
+            space: None,
         }
     }
 
@@ -4898,6 +4911,68 @@ pub(crate) mod tests {
             recent_file("photocraft", "art/cover.psd", "cover.psd", 20, Place::NotYet),
             recent_file("wordcraft", "memo.docx", "Memo", 10, Place::Here),
         ]
+    }
+
+    fn team_file(path: &str, people: &[&str]) -> RecentFile {
+        let mut file = recent_file("wordcraft", path, "Brief", 40, Place::Here);
+        file.entry.open_now =
+            people.iter().enumerate().map(|(n, name)| craft_cloud_app::RecentPerson { name: (*name).into(), colour: n as u8 }).collect();
+        file.space = Some(crate::files::FileSpace {
+            id: SpaceId::from_uuid(Uuid::from_u128(7)),
+            name: "Studio".into(),
+            folder: "/home/ana/Craft Cloud Shared/Studio".into(),
+        });
+        file
+    }
+
+    /// Who has a file open follows the agent's answer on every refresh: somebody joins, an overflowing crowd arrives, they leave,
+    /// and an older agent's answer (no field) shows nobody. The page keeps no state of its own about them.
+    #[test]
+    fn the_people_of_a_file_follow_each_answer_of_the_agent() {
+        let mut m = signed_in();
+        let open_now = |m: &Model| {
+            let Screen::Files(files) = &m.screen else { panic!("{:?}", m.screen) };
+            files.list.iter().flatten().find(|f| f.space.is_some()).map(|f| f.entry.open_now.iter().map(|p| p.name.clone()).collect::<Vec<_>>())
+        };
+        let ticket = |m: &mut Model, load: bool| {
+            let effects = m.update(if load { Event::LoadFiles } else { Event::Tab(Tab::Files) });
+            match effects.first() {
+                Some(Effect::Recents { ticket, .. }) => *ticket,
+                other => panic!("{other:?}"),
+            }
+        };
+        let answer = |m: &mut Model, first: bool, people: &[&str]| {
+            let ticket = ticket(m, !first);
+            m.update(Event::Recents { ticket, result: Ok(vec![team_file("Briefs/plan.docx", people)]) });
+        };
+        answer(&mut m, true, &[]);
+        assert_eq!(open_now(&m), Some(Vec::new()), "nobody else is there");
+        assert!(!matches!(&m.screen, Screen::Files(f) if f.has_open_now()));
+        answer(&mut m, false, &["ben"]);
+        assert_eq!(open_now(&m), Some(vec!["ben".to_owned()]), "ben joins");
+        assert!(matches!(&m.screen, Screen::Files(f) if f.has_open_now() && f.has_team()));
+        answer(&mut m, false, &["ben", "cy", "dee", "eli", "fay"]);
+        assert_eq!(open_now(&m).map(|p| p.len()), Some(5), "the page keeps them all; the widget counts the overflow");
+        answer(&mut m, false, &[]);
+        assert_eq!(open_now(&m), Some(Vec::new()), "they left");
+    }
+
+    /// A team space's file is opened and shown against that space's folder, never the personal one, and the personal file with the
+    /// same path is not mistaken for it.
+    #[test]
+    fn a_team_files_open_and_show_use_its_spaces_folder() {
+        let mut m = signed_in();
+        let effects = m.update(Event::Tab(Tab::Files));
+        let [Effect::Recents { ticket, .. }, ..] = effects.as_slice() else { panic!("{effects:?}") };
+        let personal = recent_file("wordcraft", "Briefs/plan.docx", "Plan", 50, Place::NotYet);
+        m.update(Event::Recents { ticket: *ticket, result: Ok(vec![personal, team_file("Briefs/plan.docx", &["ben"])]) });
+        let space = Some(SpaceId::from_uuid(Uuid::from_u128(7)));
+        let got = m.update(Event::OpenRecent { app: "wordcraft".into(), path: "Briefs/plan.docx".into(), space });
+        assert_eq!(got, vec![Effect::CheckFile { root: "/home/ana/Craft Cloud Shared/Studio".into(), path: "Briefs/plan.docx".into() }]);
+        let personal = m.update(Event::OpenRecent { app: "wordcraft".into(), path: "Briefs/plan.docx".into(), space: None });
+        assert!(personal.is_empty(), "the personal file with this path is not on this computer");
+        let shown = m.update(Event::ShowRecent { app: "wordcraft".into(), path: "Briefs/plan.docx".into(), space });
+        assert!(matches!(shown.as_slice(), [Effect::OpenFolder(folder)] if folder.contains("Studio") && folder.ends_with("Briefs")), "{shown:?}");
     }
 
     /// The Files page after its list came.
@@ -5182,7 +5257,7 @@ pub(crate) mod tests {
     #[test]
     fn open_asks_the_os_for_a_file_that_is_here_inside_the_synced_folder() {
         let mut m = files_loaded();
-        let effects = m.update(Event::OpenRecent { app: "wordcraft".into(), path: "Letters/letter.docx".into() });
+        let effects = m.update(Event::OpenRecent { app: "wordcraft".into(), path: "Letters/letter.docx".into(), space: None });
         assert_eq!(effects, vec![Effect::CheckFile { root: "/home/ana/Craft Cloud".into(), path: "Letters/letter.docx".into() }]);
         assert!(files_page(&m).open_error.is_none());
         // The disk is looked at again at the click, and the path that check gives is the one opened.
@@ -5204,7 +5279,7 @@ pub(crate) mod tests {
             (Place::NotOpenable, "Open it from its folder"),
         ] {
             let mut m = files_loaded();
-            m.update(Event::OpenRecent { app: "wordcraft".into(), path: "Letters/letter.docx".into() });
+            m.update(Event::OpenRecent { app: "wordcraft".into(), path: "Letters/letter.docx".into(), space: None });
             assert!(m.update(Event::FileChecked(Err(place))).is_empty(), "{place:?}");
             assert_eq!(files_page(&m).open_error.as_deref(), Some(format!("Can't open this file: {why}.").as_str()));
         }
@@ -5214,14 +5289,17 @@ pub(crate) mod tests {
     fn show_in_folder_opens_the_folder_of_a_file_that_is_here() {
         let mut m = files_loaded();
         let folder = Path::new("/home/ana/Craft Cloud").join("Letters").to_string_lossy().into_owned();
-        assert_eq!(m.update(Event::ShowRecent { app: "wordcraft".into(), path: "Letters/letter.docx".into() }), vec![Effect::OpenFolder(folder)]);
         assert_eq!(
-            m.update(Event::ShowRecent { app: "wordcraft".into(), path: "memo.docx".into() }),
+            m.update(Event::ShowRecent { app: "wordcraft".into(), path: "Letters/letter.docx".into(), space: None }),
+            vec![Effect::OpenFolder(folder)]
+        );
+        assert_eq!(
+            m.update(Event::ShowRecent { app: "wordcraft".into(), path: "memo.docx".into(), space: None }),
             vec![Effect::OpenFolder("/home/ana/Craft Cloud".into())],
             "a file at the top of the synced folder shows that folder"
         );
         // Not here: nothing to show.
-        assert!(m.update(Event::ShowRecent { app: "photocraft".into(), path: "art/cover.psd".into() }).is_empty());
+        assert!(m.update(Event::ShowRecent { app: "photocraft".into(), path: "art/cover.psd".into(), space: None }).is_empty());
         assert_eq!(files_page(&m).open_error.as_deref(), Some("Can't show this file: Not on this computer yet."));
         // A file the page won't open can still be shown, unless its folder is a bundle or leaves the synced folder.
         let mut m = signed_in();
@@ -5233,19 +5311,22 @@ pub(crate) mod tests {
         ];
         m.update(Event::Recents { ticket: 1, result: Ok(list) });
         let shown = Path::new("/home/ana/Craft Cloud").join("tools").to_string_lossy().into_owned();
-        assert_eq!(m.update(Event::ShowRecent { app: "wordcraft".into(), path: "tools/setup.exe".into() }), vec![Effect::OpenFolder(shown)]);
-        assert!(m.update(Event::ShowRecent { app: "wordcraft".into(), path: "Tool.app/readme.txt".into() }).is_empty());
-        assert!(m.update(Event::ShowRecent { app: "wordcraft".into(), path: "../x.txt".into() }).is_empty());
+        assert_eq!(
+            m.update(Event::ShowRecent { app: "wordcraft".into(), path: "tools/setup.exe".into(), space: None }),
+            vec![Effect::OpenFolder(shown)]
+        );
+        assert!(m.update(Event::ShowRecent { app: "wordcraft".into(), path: "Tool.app/readme.txt".into(), space: None }).is_empty());
+        assert!(m.update(Event::ShowRecent { app: "wordcraft".into(), path: "../x.txt".into(), space: None }).is_empty());
     }
 
     #[test]
     fn open_refuses_a_file_that_is_not_here_and_says_why() {
         let mut m = files_loaded();
-        assert!(m.update(Event::OpenRecent { app: "photocraft".into(), path: "art/cover.psd".into() }).is_empty());
+        assert!(m.update(Event::OpenRecent { app: "photocraft".into(), path: "art/cover.psd".into(), space: None }).is_empty());
         assert_eq!(files_page(&m).open_error.as_deref(), Some("Can't open this file: Not on this computer yet."));
         // Nothing is asked of the OS for a file the list doesn't have.
-        assert!(m.update(Event::OpenRecent { app: "wordcraft".into(), path: "art/cover.psd".into() }).is_empty());
-        assert!(m.update(Event::OpenRecent { app: "wordcraft".into(), path: "/etc/passwd".into() }).is_empty());
+        assert!(m.update(Event::OpenRecent { app: "wordcraft".into(), path: "art/cover.psd".into(), space: None }).is_empty());
+        assert!(m.update(Event::OpenRecent { app: "wordcraft".into(), path: "/etc/passwd".into(), space: None }).is_empty());
     }
 
     /// A path from the network that gets past the list's placing (a list placed before the folder changed, or a bug) is
@@ -5265,7 +5346,7 @@ pub(crate) mod tests {
             let mut m = signed_in();
             m.update(Event::Tab(Tab::Files));
             m.update(Event::Recents { ticket: 1, result: Ok(vec![recent_file("wordcraft", path, "x", 1, Place::Here)]) });
-            let effects = m.update(Event::OpenRecent { app: "wordcraft".into(), path: path.into() });
+            let effects = m.update(Event::OpenRecent { app: "wordcraft".into(), path: path.into(), space: None });
             assert!(effects.is_empty(), "{path}: {effects:?}");
             assert_eq!(files_page(&m).open_error.as_deref(), Some(format!("Can't open this file: {why}.").as_str()), "{path}");
         }
@@ -5274,7 +5355,7 @@ pub(crate) mod tests {
             let mut m = signed_in();
             m.update(Event::Tab(Tab::Files));
             m.update(Event::Recents { ticket: 1, result: Ok(vec![recent_file("wordcraft", "ok.docx", "x", 1, place)]) });
-            assert!(m.update(Event::OpenRecent { app: "wordcraft".into(), path: "ok.docx".into() }).is_empty(), "{place:?}");
+            assert!(m.update(Event::OpenRecent { app: "wordcraft".into(), path: "ok.docx".into(), space: None }).is_empty(), "{place:?}");
             assert!(files_page(&m).open_error.is_some());
         }
         // No synced folder known: nothing to open it from.
@@ -5282,7 +5363,7 @@ pub(crate) mod tests {
         m.update(Event::Tab(Tab::Files));
         m.update(Event::Recents { ticket: 1, result: Ok(files_list()) });
         m.status = Some(Status { folder: None, ..status(true) });
-        assert!(m.update(Event::OpenRecent { app: "wordcraft".into(), path: "memo.docx".into() }).is_empty());
+        assert!(m.update(Event::OpenRecent { app: "wordcraft".into(), path: "memo.docx".into(), space: None }).is_empty());
         assert!(files_page(&m).open_error.is_some());
     }
 
@@ -5295,7 +5376,10 @@ pub(crate) mod tests {
         let effects = m.update(Event::Tab(Tab::Computers));
         assert!(effects.contains(&Effect::Devices), "{effects:?}");
         assert_eq!(m.tab(), Some(Tab::Computers));
-        assert!(m.update(Event::OpenRecent { app: "wordcraft".into(), path: "memo.docx".into() }).is_empty(), "not on the page any more");
+        assert!(
+            m.update(Event::OpenRecent { app: "wordcraft".into(), path: "memo.docx".into(), space: None }).is_empty(),
+            "not on the page any more"
+        );
     }
 
     #[test]

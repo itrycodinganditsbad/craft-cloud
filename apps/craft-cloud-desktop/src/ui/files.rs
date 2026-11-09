@@ -68,13 +68,23 @@ fn recent(ui: &mut egui::Ui, files: &Files, now_ms: i64, events: &mut Vec<Event>
     } else if visible.is_empty() {
         ui.label(RichText::new("Nothing in the list matches the filter.").color(t.muted));
     } else {
-        let columns = [
-            Column::flex("File", 130.0).weighted(2.0),
-            Column::fixed("App", 112.0),
-            Column::fixed("Computer", 90.0),
-            Column::fixed("Changed", 90.0),
-            Column::fixed("", 146.0),
-        ];
+        // The columns for a team space and for the people who have a file open appear only when some file has them.
+        let (team, people) = (files.has_team(), files.has_open_now());
+        let mut columns = vec![Column::flex("File", 130.0).weighted(2.0)];
+        let space_at = team.then(|| {
+            columns.push(Column::fixed("Space", 110.0));
+            columns.len() - 1
+        });
+        columns.push(Column::fixed("App", 112.0));
+        let app_at = columns.len() - 1;
+        columns.push(Column::fixed("Computer", 90.0));
+        let people_at = people.then(|| {
+            columns.push(Column::fixed("Open now", 140.0));
+            columns.len() - 1
+        });
+        columns.push(Column::fixed("Changed", 90.0));
+        let changed_at = columns.len() - 1;
+        columns.push(Column::fixed("", 146.0));
         kit::table(ui, "files", &columns, visible.len(), ROW_H, |ui, row, column| {
             let Some(file) = visible.get(row) else { return };
             match column {
@@ -82,14 +92,21 @@ fn recent(ui: &mut egui::Ui, files: &Files, now_ms: i64, events: &mut Vec<Event>
                     kit::item_icon(ui, false, 20.0);
                     kit::two_lines(ui, ROW_H, file.name(), Some(&file.entry.path));
                 }
-                1 => {
+                c if Some(c) == space_at => {
+                    match &file.space {
+                        Some(space) => kit::truncated(ui, &space.name),
+                        None => kit::truncated(ui, RichText::new("Personal").color(t.muted)),
+                    };
+                }
+                c if c == app_at => {
                     kit::tag(ui, app_label(&file.app), Tone::Accent);
                 }
-                2 => {
-                    kit::truncated(ui, &file.entry.machine);
-                }
-                3 => {
+                c if Some(c) == people_at => super::people::open_now(ui, &file.entry.open_now),
+                c if c == changed_at => {
                     ui.label(super::ago(now_ms, file.when_ms()));
+                }
+                c if c == app_at + 1 => {
+                    kit::truncated(ui, &file.entry.machine);
                 }
                 _ => {
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -99,14 +116,22 @@ fn recent(ui: &mut egui::Ui, files: &Files, now_ms: i64, events: &mut Vec<Event>
                             None => open,
                         };
                         if open.clicked() {
-                            events.push(Event::OpenRecent { app: file.app.clone(), path: file.entry.path.clone() });
+                            events.push(Event::OpenRecent {
+                                app: file.app.clone(),
+                                path: file.entry.path.clone(),
+                                space: file.space.as_ref().map(|s| s.id),
+                            });
                         }
                         // A file that is here can always be shown in its folder, also one that isn't opened from the page.
                         let here = matches!(file.place, Place::Here | Place::NotOpenable);
                         let show = ui.add_enabled_ui(here, |ui| kit::icon_button(ui, "Show in folder", kit::Icon::Folder)).inner;
                         let show = if here { show } else { show.on_disabled_hover_text("Show in folder: not on this computer") };
                         if show.clicked() {
-                            events.push(Event::ShowRecent { app: file.app.clone(), path: file.entry.path.clone() });
+                            events.push(Event::ShowRecent {
+                                app: file.app.clone(),
+                                path: file.entry.path.clone(),
+                                space: file.space.as_ref().map(|s| s.id),
+                            });
                         }
                     });
                 }

@@ -91,6 +91,9 @@ pub trait Agent: Send + Sync {
     /// `app`'s recent files now, newest first: the list the account's computers share. Opens the agent's recents
     /// connection for the one answer and closes it again.
     fn recents(&self, app: &str) -> Result<Vec<RecentEntry>, Error>;
+    /// [`Agent::recents`] for the list of the team space `space`, which must sync on this computer; the entries say who
+    /// else has the file open right now ([`RecentEntry::open_now`]), as the agent has it at this moment.
+    fn recents_in(&self, app: &str, space: SpaceId) -> Result<Vec<RecentEntry>, Error>;
     /// The conflict copies in the synced folder, as the agent's last finished sync pass left them.
     fn conflicts(&self) -> Result<ConflictsResponse, Error>;
     /// The local logical sizes of the synced folder, by top-level folder and by kind.
@@ -306,6 +309,9 @@ impl Agent for ClientAgent {
     }
     fn recents(&self, app: &str) -> Result<Vec<RecentEntry>, Error> {
         self.with(|c| c.recents(app))
+    }
+    fn recents_in(&self, app: &str, space: SpaceId) -> Result<Vec<RecentEntry>, Error> {
+        self.with(|c| c.recents_in(app, space))
     }
     fn conflicts(&self) -> Result<ConflictsResponse, Error> {
         self.with(Client::conflicts)
@@ -622,19 +628,50 @@ fn spaces_call(agent: &dyn Agent, call: SpacesCall) -> SpacesMsg {
     }
 }
 
+/// Whether an error means the agent can't be talked to at all (so nothing more is asked of it).
+fn agent_gone(list: &Result<Vec<RecentEntry>, Error>) -> bool {
+    matches!(list, Err(Error::NotRunning(_) | Error::Io(_) | Error::Protocol(_) | Error::Version(_)))
+}
+
 /// The recent files of every app of the suite ([`crate::files::APPS`]), asked for one after the other, each placed against the
-/// synced folder `root`. When the agent can't be reached the first list says so and the rest aren't asked for.
+/// synced folder `root`, then those of every team space that syncs on this computer (an agent from before team spaces lists
+/// none), each placed against that space's folder. When the agent can't be reached the first list says so and the rest aren't
+/// asked for.
 fn recent_files(agent: &dyn Agent, root: Option<&std::path::Path>) -> Result<Vec<crate::files::RecentFile>, Error> {
     let mut lists = Vec::new();
+    let mut gone = false;
     for (app, _) in crate::files::APPS {
         let list = agent.recents(app);
-        let gone = matches!(list, Err(Error::NotRunning(_) | Error::Io(_) | Error::Protocol(_) | Error::Version(_)));
+        gone = agent_gone(&list);
         lists.push((app.to_owned(), list));
         if gone {
             break;
         }
     }
-    crate::files::merge(lists, |path| crate::files::place(root, path))
+    let mut groups = vec![(None, lists)];
+    if !gone {
+        // A list of the spaces that can't be had (an old agent, a refusal) leaves the personal files as they are.
+        let spaces = agent.spaces().map(|l| l.spaces).unwrap_or_default();
+        for info in spaces {
+            let (Some(folder), true) =
+                (info.folder.clone(), info.kind == "team" && info.state == "active" && info.sync == craft_cloud_app::SpaceSync::On)
+            else {
+                continue;
+            };
+            let space = crate::files::FileSpace { id: info.space, name: info.name.clone().unwrap_or_default(), folder };
+            let mut lists = Vec::new();
+            for (app, _) in crate::files::APPS {
+                let list = agent.recents_in(app, info.space);
+                let stop = agent_gone(&list);
+                lists.push((app.to_owned(), list));
+                if stop {
+                    break;
+                }
+            }
+            groups.push((Some(space), lists));
+        }
+    }
+    crate::files::merge_groups(groups, |space, path| crate::files::place(space.map_or(root, |s| Some(std::path::Path::new(&s.folder))), path))
 }
 
 /// The conflict copies the agent lists, each placed against the synced folder `root` ([`crate::files::conflicts`]).
@@ -779,6 +816,8 @@ pub(crate) mod fake {
         pub updates: Vec<(SpaceId, UpdateSpace)>,
         /// The requests to make a team space from a folder, in order.
         pub from_folder: Vec<FromFolderRequest>,
+        /// The recent files of each team space and app (by the name of its list).
+        pub recents: Vec<(SpaceId, String, Vec<RecentEntry>)>,
     }
 
     /// A team space as the agent lists it: `state` is `active` or `invited`.
@@ -1427,6 +1466,18 @@ pub(crate) mod fake {
             }
             Ok(self.recent_files.lock().unwrap().iter().find(|(a, _)| a == app).map(|(_, list)| list.clone()).unwrap_or_default())
         }
+        fn recents_in(&self, app: &str, space: SpaceId) -> Result<Vec<RecentEntry>, Error> {
+            self.answer("recents_in", |_| ())?;
+            Ok(self
+                .team
+                .lock()
+                .unwrap()
+                .recents
+                .iter()
+                .find(|(s, a, _)| *s == space && a == app)
+                .map(|(_, _, list)| list.clone())
+                .unwrap_or_default())
+        }
         fn conflicts(&self) -> Result<craft_cloud_app::ConflictsResponse, Error> {
             self.answer("conflicts", |_| ())?;
             self.conflict_copies.lock().unwrap().clone().unwrap_or_else(|| Ok(craft_cloud_app::ConflictsResponse::default()))
@@ -1798,6 +1849,7 @@ mod tests {
             opened_ms,
             saved_ms: None,
             machine: "BEAST".into(),
+            open_now: Vec::new(),
         };
         *agent.recent_files.lock().unwrap() = vec![
             ("wordcraft".into(), vec![entry("here.docx", 20), entry("missing.docx", 10)]),
@@ -1826,6 +1878,56 @@ mod tests {
         let Screen::Files(files) = &model.screen else { panic!("{:?}", model.screen) };
         assert!(files.error.is_some(), "{files:?}");
         assert_eq!(agent.asked.lock().unwrap().iter().filter(|a| *a == "recents").count(), 1, "the rest aren't asked once the agent is gone");
+    }
+
+    /// The recent files of each team space that syncs here come with the personal ones, each with who has it open and placed
+    /// against its own folder; a space that doesn't sync, an invitation, and an agent from before team spaces add nothing.
+    #[test]
+    fn the_recent_files_of_the_synced_team_spaces_come_with_who_has_them_open() {
+        use craft_cloud_app::{RecentPerson, SpaceRole, SpaceSync};
+        let agent = FakeAgent::new(signed_in());
+        let entry = |path: &str, open_now: Vec<RecentPerson>| craft_cloud_app::RecentEntry {
+            node: None,
+            path: path.into(),
+            title: String::new(),
+            opened_ms: 5,
+            saved_ms: None,
+            machine: "BEAST".into(),
+            open_now,
+        };
+        let mut studio = fake::team_space("Studio", SpaceRole::Editor, "active");
+        studio.sync = SpaceSync::On;
+        let (quiet, invited) = (fake::team_space("Quiet", SpaceRole::Editor, "active"), fake::team_space("Invited", SpaceRole::Viewer, "invited"));
+        let id = studio.space;
+        let ben = RecentPerson { name: "ben".into(), colour: 3 };
+        {
+            let mut team = agent.team.lock().unwrap();
+            team.spaces = vec![studio, quiet.clone(), invited];
+            team.recents = vec![
+                (id, "wordcraft".into(), vec![entry("Briefs/plan.docx", vec![ben.clone()])]),
+                (quiet.space, "wordcraft".into(), vec![entry("never.docx", Vec::new())]),
+            ];
+        }
+        *agent.recent_files.lock().unwrap() = vec![("wordcraft".into(), vec![entry("mine.docx", Vec::new())])];
+        let files = recent_files(&agent, None).unwrap();
+        let got: Vec<(&str, Option<&str>, usize)> =
+            files.iter().map(|f| (f.entry.path.as_str(), f.space.as_ref().map(|s| s.name.as_str()), f.entry.open_now.len())).collect();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got.contains(&("mine.docx", None, 0)) && got.contains(&("Briefs/plan.docx", Some("Studio"), 1)), "{got:?}");
+        let team_file = files.iter().find(|f| f.space.is_some()).unwrap();
+        assert_eq!(team_file.entry.open_now, vec![ben]);
+        assert_eq!(team_file.space.as_ref().map(|s| s.folder.as_str()), Some("/home/fabio/Craft Cloud Shared/Studio"));
+        assert_eq!(
+            agent.asked.lock().unwrap().iter().filter(|a| *a == "recents_in").count(),
+            crate::files::APPS.len(),
+            "one synced space, each app once"
+        );
+
+        // An agent from before team spaces can't list them: the personal files are all there is.
+        agent.team.lock().unwrap().too_old = true;
+        let files = recent_files(&agent, None).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].space.is_none());
     }
 
     /// The link runs a call on a thread, wakes the UI, and hands the answer over; other effects come back at once.

@@ -14,6 +14,7 @@ mod join;
 pub mod kit;
 mod make_space;
 mod overview;
+mod people;
 mod problem;
 mod second_factor;
 mod security;

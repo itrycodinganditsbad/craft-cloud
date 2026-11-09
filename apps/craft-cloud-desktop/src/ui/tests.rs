@@ -624,8 +624,10 @@ fn recent(app: &str, path: &str, title: &str, machine: &str, ago_ms: i64, place:
             opened_ms: NOW - ago_ms,
             saved_ms: None,
             machine: machine.into(),
+            open_now: Vec::new(),
         },
         place,
+        space: None,
     }
 }
 
@@ -680,7 +682,7 @@ fn snapshot_files() {
     nothing.update(Event::FilesSearch("no such file".into()));
     snapshot(nothing, egui::Theme::Light, "files-no-match");
     let mut problem = files_model(Some(files_list()));
-    problem.update(Event::OpenRecent { app: "photocraft".into(), path: "art/2026/cover.psd".into() });
+    problem.update(Event::OpenRecent { app: "photocraft".into(), path: "art/2026/cover.psd".into(), space: None });
     snapshot(problem, egui::Theme::Light, "files-open-problem");
     let mut loading = signed_in_model(signed_in());
     loading.update(Event::Tab(Tab::Files));
@@ -703,8 +705,8 @@ fn the_files_buttons_send_open_and_the_filter() {
     assert_eq!(
         sent,
         [
-            &Event::OpenRecent { app: "wordcraft".into(), path: "Letters/quarterly-letter.docx".into() },
-            &Event::OpenRecent { app: "photocraft".into(), path: "art/2026/poster-draft.psd".into() },
+            &Event::OpenRecent { app: "wordcraft".into(), path: "Letters/quarterly-letter.docx".into(), space: None },
+            &Event::OpenRecent { app: "photocraft".into(), path: "art/2026/poster-draft.psd".into(), space: None },
         ],
         "only the files that are here"
     );
@@ -716,6 +718,91 @@ fn the_files_buttons_send_open_and_the_filter() {
     h.get_by_label("Refresh").click();
     h.run_steps(2);
     assert!(std::mem::take(&mut h.state_mut().1).contains(&Event::LoadFiles));
+}
+
+// ---- team spaces' recent files, and who has a file open now ----
+
+fn person(name: &str, colour: u8) -> craft_cloud_app::RecentPerson {
+    craft_cloud_app::RecentPerson { name: name.into(), colour }
+}
+
+fn studio() -> crate::files::FileSpace {
+    crate::files::FileSpace {
+        id: craft_cloud_app::SpaceId::from_uuid(Uuid::from_u128(7)),
+        name: "Studio".into(),
+        folder: "/home/ana/Craft Cloud Shared/Studio".into(),
+    }
+}
+
+/// A file of the team space "Studio" with `people` there.
+fn team_recent(app: &str, path: &str, ago_ms: i64, people: Vec<craft_cloud_app::RecentPerson>) -> RecentFile {
+    let mut file = recent(app, path, path.rsplit('/').next().unwrap_or(path), "lptp1", ago_ms, Place::Here);
+    file.entry.open_now = people;
+    file.space = Some(studio());
+    file
+}
+
+/// The personal files and files of a team space, `people` there.
+fn team_files_list(people: Vec<craft_cloud_app::RecentPerson>) -> Vec<RecentFile> {
+    let mut list = files_list();
+    list.truncate(3);
+    list.push(team_recent("wordcraft", "Briefs/launch-brief.docx", 10 * 60_000, people));
+    list.push(team_recent("photocraft", "Posters/spring.pcraft", 3 * 3_600_000, vec![person("cy", 7)]));
+    list.push(team_recent("filmcraft", "Cuts/teaser.fcproj", 30 * 3_600_000, Vec::new()));
+    list.sort_by_key(|f| std::cmp::Reverse(f.when_ms()));
+    list
+}
+
+#[test]
+fn snapshot_files_of_a_team_space_and_who_has_a_file_open() {
+    let two = vec![person("ben", 3), person("dee lee", 10)];
+    snapshot(files_model(Some(team_files_list(Vec::new()))), egui::Theme::Light, "files-team-recents");
+    snapshot(files_model(Some(team_files_list(two.clone()))), egui::Theme::Light, "files-open-now");
+    snapshot(files_model(Some(team_files_list(two.clone()))), egui::Theme::Dark, "files-open-now-dark");
+    let five: Vec<_> = ["ben", "dee lee", "eli", "fay", "gus"].iter().zip([3u8, 10, 0, 6, 8]).map(|(n, c)| person(n, c)).collect();
+    snapshot(files_model(Some(team_files_list(five))), egui::Theme::Light, "files-open-now-overflow");
+    // At the largest scale (160 %), in a window tall enough for the rows.
+    let mut h = harness_sized(files_model(Some(team_files_list(two))), egui::Theme::Light, [WINDOW_SIZE[0], 1500.0]);
+    h.ctx.set_zoom_factor(1.6);
+    h.run_steps(4);
+    compare(h.render().unwrap(), "files-open-now-zoom-160");
+}
+
+/// The people are named for a screen reader, the overflow lists the names behind it, and nothing shows when nobody else is there.
+#[test]
+fn the_people_of_a_file_are_named_and_the_rest_counted() {
+    let five: Vec<_> = ["ben", "dee lee", "eli", "fay", "gus"].iter().map(|n| person(n, 2)).collect();
+    let mut h = harness(files_model(Some(team_files_list(five))), egui::Theme::Light);
+    h.run_steps(3);
+    assert!(h.query_by_label("ben").is_some() && h.query_by_label("cy").is_some());
+    assert!(h.query_by_label("2 more: fay, gus").is_some(), "the overflow names the people behind it");
+    assert!(h.query_by_label("fay").is_none(), "only three are drawn");
+    let mut quiet = harness(files_model(Some(team_files_list(Vec::new()))), egui::Theme::Light);
+    quiet.run_steps(3);
+    assert!(quiet.query_by_label("ben").is_none());
+    let mut plain = harness(files_model(Some(files_list())), egui::Theme::Light);
+    plain.run_steps(3);
+    assert!(
+        plain.query_by_label("Open now").is_none() && plain.query_by_label("Space").is_none(),
+        "no extra columns without a team file or a person"
+    );
+}
+
+/// Open and Show on a team space's file send the space, so the file is looked up in that space's list.
+#[test]
+fn the_buttons_of_a_team_file_send_its_space() {
+    let mut h = harness(files_model(Some(team_files_list(Vec::new()))), egui::Theme::Light);
+    h.run_steps(3);
+    for open in h.query_all_by_label("Open") {
+        open.click();
+    }
+    h.run_steps(2);
+    let events = std::mem::take(&mut h.state_mut().1);
+    let space = Some(studio().id);
+    assert!(
+        events.iter().any(|e| matches!(e, Event::OpenRecent { path, space: s, .. } if path == "Briefs/launch-brief.docx" && *s == space)),
+        "{events:?}"
+    );
 }
 
 /// The overview's "Recent files" link opens the Files tab.
