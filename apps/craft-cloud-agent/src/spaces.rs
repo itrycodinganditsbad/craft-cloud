@@ -32,6 +32,12 @@
 //!   to have been deleted. A file that was deleted on the server meanwhile and is still in the folder is uploaded again. A
 //!   file that exists on both sides with different content is not overwritten: the local one is moved aside as a conflict
 //!   copy and the server's version takes its path.
+//! - **A state is trusted only when nothing doubtful happened to it**: the setting's `generation` (saved in `account.json`) is
+//!   raised before a state is retired or a new folder's marker is written, and a state made under another generation is not
+//!   used; a state that can't be removed fails the turn-off; and a session whose folder now leads somewhere else (a link
+//!   pointed at another folder) is dropped with its state before the next pass.
+//!   A raised generation that can't be saved (account.json can't be written) is kept in memory and saved again at every look at
+//!   the list; no space is started meanwhile, so a session that begins cannot use a state that was meant to be dropped.
 //! - **One pass at a time**: passes of the spaces run one after another on a thread of their own, and take turns with the
 //!   personal space's passes ([`PassGate`]). A pass that is queued when its space is closed (turned off, moved to another
 //!   folder, lost) or the agent stops is not run; the running pass finishes. A second change of a space that is still
@@ -191,6 +197,7 @@ pub fn reconcile(settings: &[SpaceSetting], listed: &[SpaceListItem], shared: Op
                 sync: false,
                 name: Some(name),
                 root: item.root,
+                generation: 0,
             });
         }
     }
@@ -311,7 +318,7 @@ enum ToThread {
     Close {
         space: SpaceId,
         forget: bool,
-        ack: Option<oneshot::Sender<()>>,
+        ack: Option<oneshot::Sender<Result<(), String>>>,
     },
 }
 
@@ -338,8 +345,21 @@ enum Ev {
     /// A discovery ended.
     Listed(Looked),
     Pass(Box<Done>),
-    /// The wait for a space's session to close ended (`true`: it is closed), for the change asked under this number.
-    Closed(u64, bool),
+    /// The wait for a space's session to close ended, for the change asked under this number.
+    Closed(u64, Closure),
+    /// The pass thread found that a space's folder leads somewhere else than its session was opened on, and dropped the
+    /// session: the space's generation is raised and saved before its next pass.
+    FolderMoved(SpaceId),
+}
+
+/// How the wait for a space's session to close ended.
+enum Closure {
+    /// The session is closed (and the state forgotten if that was asked).
+    Closed,
+    /// The pass thread did not let go within [`CLOSE_WAIT`].
+    TimedOut,
+    /// The session is closed but its saved state could not be removed.
+    NotForgotten(String),
 }
 
 /// The runnings of the sync ([`Active::run`]) that are current: a queued pass of any other is not started.
@@ -366,11 +386,12 @@ fn pass_thread(
         let job = match job {
             ToThread::Close { space, forget, ack } => {
                 sessions.retain(|(id, _)| *id != space);
-                if forget && let Err(e) = data.space_dir(space).remove_state() {
+                let forgotten = if forget { data.space_dir(space).remove_state().map_err(|e| e.to_string()) } else { Ok(()) };
+                if let Err(e) = &forgotten {
                     crate::runlog::note(format_args!("can't forget the saved state of team space {space}: {e}"));
                 }
                 if let Some(ack) = ack {
-                    let _ = ack.send(());
+                    let _ = ack.send(forgotten);
                 }
                 continue;
             }
@@ -393,6 +414,27 @@ fn pass_thread(
             *id == space && (s.account().folder != job.setting.folder || s.joined_ms().zip(job.joined_ms).is_some_and(|(a, b)| a != b))
         }) {
             sessions.retain(|(id, _)| *id != space);
+        }
+        // The folder may lead somewhere else than when the session opened (a link pointed at another folder): the session's
+        // state is about the old one, so it is dropped and the space starts afresh there, as a first sync. The task is told
+        // first, so it raises and saves the space's generation: a state that can't be removed is not trusted again either.
+        // This pass is not run; the next one starts under the new generation.
+        if sessions.iter().any(|(id, s)| *id == space && s.folder_moved()) {
+            sessions.retain(|(id, _)| *id != space);
+            crate::runlog::note(format_args!("the folder of team space {space} leads somewhere else now: starting afresh, nothing is deleted"));
+            let removed = data.space_dir(space).remove_state();
+            let _ = events.send(Ev::FolderMoved(space));
+            let why = match removed {
+                Ok(()) => "the folder of this space leads somewhere else now; the next pass starts afresh there".to_owned(),
+                Err(e) => format!(
+                    "the folder of this space leads somewhere else now, and its saved state could not be removed ({e}); the next pass starts afresh there"
+                ),
+            };
+            let done = Done { space, run: job.run, result: Err(AgentError::Usage(why)), last_pass: None, seq: None, recheck_in: None };
+            if events.send(Ev::Pass(Box::new(done))).is_err() {
+                return;
+            }
+            continue;
         }
         let index = match sessions.iter().position(|(id, _)| *id == space) {
             Some(index) => Ok(index),
@@ -418,9 +460,12 @@ fn pass_thread(
             sessions.retain(|(id, _)| *id != space);
         }
         let session = sessions.iter().find(|(id, _)| *id == space).map(|(_, s)| s);
-        let last_pass = session
-            .and_then(Session::last_pass)
-            .or_else(|| data.space_dir(space).load_state_for(space, &job.setting.folder, job.joined_ms).ok().and_then(|(s, _)| s.last_pass));
+        let last_pass = session.and_then(Session::last_pass).or_else(|| {
+            data.space_dir(space)
+                .load_state_for(space, &job.setting.folder, job.joined_ms, job.setting.generation)
+                .ok()
+                .and_then(|(s, _)| s.last_pass)
+        });
         let seq = session.filter(|s| s.state().space.is_some()).map(|s| s.state().seq);
         let recheck_in = session.and_then(Session::recheck_in);
         if events.send(Ev::Pass(Box::new(Done { space, run: job.run, result, last_pass, seq, recheck_in }))).is_err() {
@@ -650,6 +695,10 @@ struct Manager {
     live: Live,
     /// Turning a space off or moving it waits for its session to close, apart from the task: those under way.
     pending: Vec<Pending>,
+    /// A raised generation of a space could not be saved (account.json can't be written): it is saved again at every look at the
+    /// list, and no space is started meanwhile. (Running syncs go on: their state is valid.) Without this, a restart before the
+    /// save would find the old generation on disk and trust a state that was meant to be dropped.
+    generation_unsaved: bool,
     /// The last number given to a change in `pending`.
     changes: u64,
     /// When those waiting for a discovery stop being kept waiting for one that works.
@@ -712,6 +761,7 @@ impl Manager {
             thread,
             live,
             pending: Vec::new(),
+            generation_unsaved: false,
             changes: 0,
             refresh_until: None,
             runs: 0,
@@ -869,6 +919,14 @@ impl Manager {
             Ev::Listed(looked) => self.listed(looked),
             Ev::Pass(done) => self.pass_done(*done, now),
             Ev::Closed(id, closed) => self.closed(id, closed),
+            Ev::FolderMoved(space) => {
+                if let Err(e) = self.raise_generation(space) {
+                    crate::runlog::note(format_args!(
+                        "can't save the raised generation of team space {space} yet (tried again at the next look): {e}"
+                    ));
+                }
+                self.settled();
+            }
         }
     }
 
@@ -1031,6 +1089,12 @@ impl Manager {
 
     /// The list (or its absence) is known: settings, runs and the local API's view follow.
     fn settled(&mut self) {
+        if self.generation_unsaved {
+            match self.data.save_account(&self.account) {
+                Ok(()) => self.generation_unsaved = false,
+                Err(e) => crate::runlog::note(format_args!("can't save a raised generation of a team space yet: {e}")),
+            }
+        }
         let shared = shared_root(&self.account.folder);
         let before = self.account.spaces.clone();
         let reconciled = reconcile(&self.account.spaces, &self.listed, shared.as_deref());
@@ -1080,9 +1144,13 @@ impl Manager {
         // Access was just lost: the saved state goes, once the session is closed, so that if access comes back the folder
         // is merged with the space afresh (what was deleted on either side meanwhile is not deleted on the other).
         let newly_lost = lost && !team.lost;
+        if newly_lost && let Err(e) = self.raise_generation(space) {
+            crate::runlog::note(format_args!("can't save the raised generation of lost team space {space} yet (tried again at the next look): {e}"));
+        }
         let timing = self.options.timing;
         let (options, events, now, paused) = (self.options, self.events_tx.clone(), self.now(), self.paused);
         let (data, account, live) = (self.data.clone(), self.account.clone(), self.live.clone());
+        let may_start = !self.generation_unsaved;
         self.runs += 1;
         let run = self.runs;
         let Some(team) = self.teams.get_mut(index) else { return };
@@ -1096,7 +1164,7 @@ impl Manager {
         }
         team.read_only = read_only;
         match (want, team.active.is_some()) {
-            (true, false) => {
+            (true, false) if may_start => {
                 team.active = start_active(&data, &account, &team.setting, joined_ms, timing, options, events, now, (run, live), paused);
             }
             (false, true) => {
@@ -1135,10 +1203,17 @@ impl Manager {
     }
 
     /// The wait for a session to close ended: the change that waited for it is applied and its caller answered.
-    fn closed(&mut self, id: u64, closed: bool) {
+    fn closed(&mut self, id: u64, closure: Closure) {
         let Some(index) = self.pending.iter().position(|p| p.id == id) else { return };
         let Pending { space, request, reply, .. } = self.pending.remove(index);
-        let answer = match self.apply_sync(space, &request, Some(closed)) {
+        // A state that could not be removed is not acknowledged as gone: the change fails, with the error. (The generation
+        // was raised and saved before, so that state is not used again either way.)
+        if let Closure::NotForgotten(why) = &closure {
+            self.settled();
+            let _ = reply.send(Err(AgentError::Usage(format!("the saved state of this space could not be removed: {why}"))));
+            return;
+        }
+        let answer = match self.apply_sync(space, &request, Some(matches!(closure, Closure::Closed))) {
             Ok(Applied::Done(info)) => Ok(*info),
             Ok(Applied::NeedsClose { .. }) => Err(AgentError::Usage("the space's session could not be closed; try again in a moment".into())),
             Err(e) => Err(e),
@@ -1166,6 +1241,10 @@ impl Manager {
             // in this folder or another, the space starts afresh as a first sync, so what was deleted here or on the server
             // while it was off is not deleted on the other side.
             if closed.is_none() {
+                // The old state is made unusable before it is removed: a generation raised and saved first, so a state that
+                // survives its removal (a file that can't be deleted, a crash in between) is not trusted when the space is
+                // turned on again.
+                self.raise_generation(space)?;
                 return Ok(Applied::NeedsClose { forget: true });
             }
             if let Some(setting) = self.account.spaces.get_mut(index) {
@@ -1203,8 +1282,13 @@ impl Manager {
                     Some(false) => return Err(AgentError::Usage(STILL_FINISHING.into())),
                 }
             }
-            set_up_folder(&self.data, &folder, space, root, request.adopt)?;
-            let setting = SpaceSetting { space, folder, sync: true, name: item.name.clone(), root: Some(root) };
+            // Setting up a folder that has no marker yet installs one and starts the space's state afresh. The old state is
+            // made unusable (the generation raised and saved) before the marker is written, so a crash between the marker and
+            // the removal of the state leaves a state that is never trusted for this folder.
+            let data = self.data.clone();
+            set_up_folder(&data, &folder, space, root, request.adopt, || self.raise_generation(space))?;
+            let generation = known.and_then(|i| self.account.spaces.get(i)).map_or(0, |s| s.generation);
+            let setting = SpaceSetting { space, folder, sync: true, name: item.name.clone(), root: Some(root), generation };
             match known {
                 Some(index) => {
                     if let Some(slot) = self.account.spaces.get_mut(index) {
@@ -1219,6 +1303,20 @@ impl Manager {
         self.info_of(space).map(|info| Applied::Done(Box::new(info))).ok_or_else(not_found)
     }
 
+    /// Raises the generation of the space's setting and saves it, so a state made under the old one is not used again.
+    /// A raise that could not be saved stays in memory and is saved again at the next look at the list; until then no space is
+    /// started (see `generation_unsaved`), so a state that was meant to be unusable is not used by a session that begins.
+    fn raise_generation(&mut self, space: SpaceId) -> Result<(), AgentError> {
+        if let Some(setting) = self.account.spaces.iter_mut().find(|s| s.space == space) {
+            setting.generation = setting.generation.saturating_add(1);
+            if let Err(e) = self.data.save_account(&self.account) {
+                self.generation_unsaved = true;
+                return Err(e.into());
+            }
+        }
+        Ok(())
+    }
+
     /// Stops the space's sync here and asks the pass thread to close its session (a pass that was running has ended and
     /// nothing of the space writes its state any more once it is closed). The task is told by [`Ev::Closed`], `false` if
     /// that didn't happen within [`CLOSE_WAIT`].
@@ -1229,13 +1327,17 @@ impl Manager {
         let (ack, closed) = oneshot::channel();
         let events = self.events_tx.clone();
         if self.jobs.send(ToThread::Close { space, forget, ack: Some(ack) }).is_err() {
-            let _ = events.send(Ev::Closed(id, true));
+            let _ = events.send(Ev::Closed(id, Closure::Closed));
             return;
         }
         tokio::spawn(async move {
             // A thread that has ended drops the acknowledgement: nothing runs then either.
-            let in_time = tokio::time::timeout(CLOSE_WAIT, closed).await.is_ok();
-            let _ = events.send(Ev::Closed(id, in_time));
+            let closure = match tokio::time::timeout(CLOSE_WAIT, closed).await {
+                Ok(Ok(Err(why))) => Closure::NotForgotten(why),
+                Ok(_) => Closure::Closed,
+                Err(_) => Closure::TimedOut,
+            };
+            let _ = events.send(Ev::Closed(id, closure));
         });
     }
 
@@ -1341,7 +1443,7 @@ impl Manager {
 
 /// The last pass summary a team space's own `state.json` holds, if that state is for the space's folder.
 fn active_summary(state_dir: &DataDir, setting: &SpaceSetting) -> Option<PassSummary> {
-    state_dir.load_state_for(setting.space, &setting.folder, None).ok().and_then(|(s, _)| s.last_pass).and_then(|l| l.summary)
+    state_dir.load_state_for(setting.space, &setting.folder, None, setting.generation).ok().and_then(|(s, _)| s.last_pass).and_then(|l| l.summary)
 }
 
 /// The parts of a synced team space: scheduler, folder watcher, long-poll.
@@ -1362,7 +1464,7 @@ fn start_active(
     let transport = HttpTransport::new(account.server.clone(), &account.token).and_then(|t| t.bound_to(space)).ok()?;
     let since = data
         .space_dir(space)
-        .load_state_for(space, &setting.folder, joined_ms)
+        .load_state_for(space, &setting.folder, joined_ms, setting.generation)
         .ok()
         .and_then(|(saved, _)| saved.state.space.map(|_| saved.state.seq));
     let (since_tx, _) = watch::channel(since);
@@ -1409,10 +1511,31 @@ fn start_active(
     Some(active)
 }
 
+/// For tests: the folder at which the next set-up stops right after its marker is written, as if the agent had crashed there.
+#[doc(hidden)]
+pub static STOP_AFTER_MARKER: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Whether the set-up of `folder` is to stop now (once; see [`STOP_AFTER_MARKER`]).
+fn stop_after_marker(folder: &Path) -> bool {
+    let mut armed = STOP_AFTER_MARKER.lock().unwrap_or_else(PoisonError::into_inner);
+    if armed.as_deref() == Some(folder) {
+        *armed = None;
+        return true;
+    }
+    false
+}
+
 /// Makes `folder` the folder of `space`, whose root is `root`: a new or empty folder gets the space's marker; one with
 /// files is taken only with `adopt` (what differs from the space's becomes conflict copies, nothing is deleted); one that
 /// already has this space's marker is taken as it is; another space's marker refuses it.
-fn set_up_folder(data: &DataDir, folder: &Path, space: SpaceId, root: NodeId, adopt: bool) -> Result<(), AgentError> {
+fn set_up_folder(
+    data: &DataDir,
+    folder: &Path,
+    space: SpaceId,
+    root: NodeId,
+    adopt: bool,
+    invalidate_state: impl FnOnce() -> Result<(), AgentError>,
+) -> Result<(), AgentError> {
     let marker = RootMarker { space, root };
     let existing = if folder.is_dir() { root::read(folder)? } else { None };
     match existing {
@@ -1423,8 +1546,12 @@ fn set_up_folder(data: &DataDir, folder: &Path, space: SpaceId, root: NodeId, ad
     if folder.is_dir() && crate::cli::has_files(folder)? && !adopt {
         return Err(AgentError::FolderHasFiles(folder.to_owned()));
     }
+    invalidate_state()?;
     std::fs::create_dir_all(folder).map_err(|source| AgentError::Io { path: folder.to_owned(), source })?;
     root::write(folder, &marker)?;
+    if stop_after_marker(folder) {
+        return Err(AgentError::Usage("stopped after the marker was written (test hook)".into()));
+    }
     // A fresh folder starts from a fresh state: what a state remembers of an older folder must not decide what this one
     // is missing.
     data.space_dir(space).remove_state()?;
