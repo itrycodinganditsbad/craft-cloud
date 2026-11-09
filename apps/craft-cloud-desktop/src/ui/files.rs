@@ -72,14 +72,14 @@ fn recent(ui: &mut egui::Ui, files: &Files, now_ms: i64, events: &mut Vec<Event>
         let (team, people) = (files.has_team(), files.has_open_now());
         let mut columns = vec![Column::flex("File", 130.0).weighted(2.0)];
         let space_at = team.then(|| {
-            columns.push(Column::fixed("Space", 110.0));
+            columns.push(Column::fixed("Space", 90.0));
             columns.len() - 1
         });
         columns.push(Column::fixed("App", 112.0));
         let app_at = columns.len() - 1;
         columns.push(Column::fixed("Computer", 90.0));
         let people_at = people.then(|| {
-            columns.push(Column::fixed("Open now", 140.0));
+            columns.push(Column::fixed("Open now", 112.0));
             columns.len() - 1
         });
         columns.push(Column::fixed("Changed", 90.0));

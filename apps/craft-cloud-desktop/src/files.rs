@@ -457,9 +457,16 @@ pub struct Files {
     pub ticket: u64,
     /// The app whose files are shown (`None`: all of them).
     pub app: Option<String>,
-    /// What the name or the path of a shown file contains (any case).
+    /// What the name, the path or the team space of a shown file contains (any case).
     pub search: String,
+    /// The list is being asked for again without the page saying so ([`FILES_EVERY_MS`]): the list stays as it is meanwhile.
+    pub refreshing: bool,
+    /// When the list was last asked for (the model's clock, milliseconds).
+    pub asked_ms: i64,
 }
+
+/// How often the Files page asks for the recent files again while it is open, so that who has a file open stays current.
+pub const FILES_EVERY_MS: i64 = 15_000;
 
 impl Files {
     /// Whether any file is in a team space's list (the page then names the space of each).
@@ -479,7 +486,12 @@ impl Files {
             .iter()
             .flatten()
             .filter(|f| self.app.as_deref().is_none_or(|app| f.app == app))
-            .filter(|f| needle.is_empty() || f.name().to_lowercase().contains(&needle) || f.entry.path.to_lowercase().contains(&needle))
+            .filter(|f| {
+                needle.is_empty()
+                    || f.name().to_lowercase().contains(&needle)
+                    || f.entry.path.to_lowercase().contains(&needle)
+                    || f.space.as_ref().is_some_and(|s| s.name.to_lowercase().contains(&needle))
+            })
             .collect()
     }
 

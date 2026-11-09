@@ -9,7 +9,7 @@ use craft_cloud_proto::colour::palette_colour;
 use egui::{Color32, RichText, Ui};
 
 /// How many people are drawn before the rest are counted.
-pub const SHOWN: usize = 3;
+pub const SHOWN: usize = 2;
 
 /// Two letters at most to tell an account by: the first letters of its first two words, or the first two letters of a single
 /// word.

@@ -775,8 +775,8 @@ fn the_people_of_a_file_are_named_and_the_rest_counted() {
     let mut h = harness(files_model(Some(team_files_list(five))), egui::Theme::Light);
     h.run_steps(3);
     assert!(h.query_by_label("ben").is_some() && h.query_by_label("cy").is_some());
-    assert!(h.query_by_label("2 more: fay, gus").is_some(), "the overflow names the people behind it");
-    assert!(h.query_by_label("fay").is_none(), "only three are drawn");
+    assert!(h.query_by_label("3 more: eli, fay, gus").is_some(), "the overflow names the people behind it");
+    assert!(h.query_by_label("eli").is_none(), "only two are drawn");
     let mut quiet = harness(files_model(Some(team_files_list(Vec::new()))), egui::Theme::Light);
     quiet.run_steps(3);
     assert!(quiet.query_by_label("ben").is_none());

@@ -1777,7 +1777,10 @@ impl Model {
                     return Vec::new();
                 }
                 files.loading = false;
+                let quiet = std::mem::take(&mut files.refreshing);
                 match result {
+                    // A quiet look that failed leaves the list as it is: the status poll says when the agent is gone.
+                    Err(_) if quiet => {}
                     Ok(list) => {
                         files.list = Some(list);
                         files.error = None;
@@ -2247,6 +2250,7 @@ impl Model {
             self.polling = true;
             effects.push(Effect::Status);
         }
+        effects.extend(self.refresh_files());
         let now = self.now_ms;
         if let Screen::AddingComputer(adding) = &mut self.screen
             && adding.state == AddState::Waiting
@@ -2710,6 +2714,8 @@ impl Model {
         }
         self.files_ticket = self.files_ticket.saturating_add(1);
         files.ticket = self.files_ticket;
+        files.refreshing = false;
+        files.asked_ms = self.now_ms;
         files.loading = true;
         files.error = None;
         files.open_error = None;
@@ -2718,6 +2724,22 @@ impl Model {
         files.conflicts.error = None;
         files.conflicts.open_error = None;
         vec![Effect::Recents { root: root.clone(), ticket: files.ticket }, Effect::Conflicts { root, ticket: files.conflicts.ticket }]
+    }
+
+    /// The page's own look at the recent files again ([`crate::files::FILES_EVERY_MS`] after the last), for who has a file open:
+    /// only the recents, with no spinner, and the list as it is meanwhile. Nothing while the page is loading or shows something
+    /// else.
+    fn refresh_files(&mut self) -> Vec<Effect> {
+        let (root, now) = (self.status.as_ref().and_then(|s| s.folder.clone()), self.now_ms);
+        let Screen::Files(files) = &mut self.screen else { return Vec::new() };
+        if files.view != FilesView::Recent || files.loading || files.refreshing || now.saturating_sub(files.asked_ms) < crate::files::FILES_EVERY_MS {
+            return Vec::new();
+        }
+        self.files_ticket = self.files_ticket.saturating_add(1);
+        files.ticket = self.files_ticket;
+        files.refreshing = true;
+        files.asked_ms = now;
+        vec![Effect::Recents { root, ticket: files.ticket }]
     }
 
     /// Opens a conflict copy with the OS's default program, or (`original`) the folder of the file it is a copy of, if that is
@@ -4955,6 +4977,59 @@ pub(crate) mod tests {
         assert_eq!(open_now(&m).map(|p| p.len()), Some(5), "the page keeps them all; the widget counts the overflow");
         answer(&mut m, false, &[]);
         assert_eq!(open_now(&m), Some(Vec::new()), "they left");
+    }
+
+    /// While the Files page is open and nothing loads it asks for the recent files again every 15 s (only them: no conflict copies,
+    /// no spinner), so that who has a file open fades and arrives; a failed quiet look keeps the list.
+    #[test]
+    fn the_files_page_asks_again_every_fifteen_seconds_while_it_is_open() {
+        let mut m = signed_in();
+        m.update(Event::Tick { now_ms: 1_000 });
+        let effects = m.update(Event::Tab(Tab::Files));
+        let [Effect::Recents { ticket, .. }, Effect::Conflicts { .. }] = effects.as_slice() else { panic!("{effects:?}") };
+        let asks = |m: &mut Model, now_ms| -> Vec<u64> {
+            m.update(Event::Tick { now_ms })
+                .into_iter()
+                .filter_map(|e| match e {
+                    Effect::Recents { ticket, .. } => Some(ticket),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(asks(&mut m, 20_000).is_empty(), "not while the first look runs");
+        m.update(Event::Recents { ticket: *ticket, result: Ok(vec![team_file("Briefs/plan.docx", &["ben"])]) });
+        assert!(asks(&mut m, 15_000).is_empty(), "not before 15 s after the last look (asked at 1 s)");
+        let again = asks(&mut m, 16_000);
+        assert_eq!(again.len(), 1, "{again:?}");
+        let Screen::Files(files) = &m.screen else { panic!("{:?}", m.screen) };
+        assert!(!files.loading && files.refreshing, "no spinner for a quiet look");
+        assert!(asks(&mut m, 17_000).is_empty(), "one look at a time");
+        // The answer replaces the list (ben has left); a failed one keeps it.
+        m.update(Event::Recents { ticket: again[0], result: Ok(vec![team_file("Briefs/plan.docx", &[])]) });
+        let Screen::Files(files) = &m.screen else { panic!("{:?}", m.screen) };
+        assert!(!files.refreshing && !files.has_open_now());
+        assert!(asks(&mut m, 30_000).is_empty());
+        let third = asks(&mut m, 31_000);
+        m.update(Event::Recents { ticket: third[0], result: Err(Error::Io("down".into())) });
+        let Screen::Files(files) = &m.screen else { panic!("{:?}", m.screen) };
+        assert!(files.error.is_none() && files.list.as_ref().is_some_and(|l| l.len() == 1), "a failed quiet look keeps the list: {files:?}");
+        // Not on the conflict copies, and not once the page is left.
+        m.update(Event::FilesView(FilesView::Conflicts));
+        assert!(asks(&mut m, 60_000).is_empty());
+        m.update(Event::Tab(Tab::Overview));
+        assert!(asks(&mut m, 90_000).is_empty());
+    }
+
+    /// The search matches the team space's name too.
+    #[test]
+    fn the_search_finds_the_files_of_a_team_space_by_its_name() {
+        let files = Files {
+            list: Some(vec![team_file("Briefs/plan.docx", &[]), recent_file("wordcraft", "memo.docx", "Memo", 10, Place::Here)]),
+            search: "studi".into(),
+            ..Files::default()
+        };
+        let found: Vec<&str> = files.visible().iter().map(|f| f.entry.path.as_str()).collect();
+        assert_eq!(found, ["Briefs/plan.docx"]);
     }
 
     /// A team space's file is opened and shown against that space's folder, never the personal one, and the personal file with the
