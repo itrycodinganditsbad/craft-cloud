@@ -40,11 +40,27 @@ const MAX_OPENS: usize = 4096;
 /// After a write to the app failed, its frames already sent are still read for this long (until its close or EOF).
 const READ_ON: Duration = Duration::from_secs(5);
 
+/// [`READ_ON`], or what a test set.
+fn read_on() -> Duration {
+    match READ_ON_MS.load(Ordering::Relaxed) {
+        0 => READ_ON,
+        ms => Duration::from_millis(ms),
+    }
+}
+
 static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
 
 /// Tests: while set, every write to an app fails, as when the app has already shut its socket down.
 #[doc(hidden)]
 pub static FAIL_WRITES: AtomicBool = AtomicBool::new(false);
+
+/// Tests: the name of an app whose connections' writes fail, as with [`FAIL_WRITES`] but for that app only.
+#[doc(hidden)]
+pub static FAIL_WRITES_OF: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Tests: how many milliseconds a connection whose write failed is read on (0: [`READ_ON`]).
+#[doc(hidden)]
+pub static READ_ON_MS: AtomicU64 = AtomicU64::new(0);
 
 /// `GET /v1/docs`: the WebSocket of an app's live documents.
 pub async fn docs_socket(State(api): State<Arc<ApiState>>, upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>) -> Response {
@@ -97,6 +113,8 @@ struct Link {
     /// Set when a write to the app failed: nothing is written to it any more, and what it sent before is read until
     /// this time (or its close).
     mute: Option<tokio::time::Instant>,
+    /// The app named by the connection's last `open` (for the tests' [`FAIL_WRITES_OF`]).
+    app: Option<String>,
 }
 
 impl Link {
@@ -111,13 +129,22 @@ impl Link {
             docs: HashMap::new(),
             open_docs: HashMap::new(),
             mute: None,
+            app: None,
         }
+    }
+
+    /// Whether a test made the writes to this connection's app fail.
+    fn writes_fail(&self) -> bool {
+        let named = FAIL_WRITES_OF.lock().ok().and_then(|n| n.clone());
+        named.is_some() && named == self.app
     }
 
     /// A write to the app failed: stop writing, and read on for a while.
     fn mute_now(&mut self) {
         if self.mute.is_none() {
-            self.mute = Some(tokio::time::Instant::now() + READ_ON);
+            self.mute = Some(tokio::time::Instant::now() + read_on());
+            // Nothing from the hubs is read any more: they learn that at once, instead of when the queue is full.
+            self.from_hub = None;
         }
     }
 
@@ -127,7 +154,7 @@ impl Link {
         if self.mute.is_some() {
             return Ok(());
         }
-        let result = send_json(socket, event).await;
+        let result = if self.writes_fail() { Err(Unsent::Closed) } else { send_json(socket, event).await };
         self.sent(result)
     }
 
@@ -224,6 +251,9 @@ async fn serve(mut socket: WebSocket, api: Arc<ApiState>) {
     let _end = loop {
         tokio::select! {
             message = socket.recv() => {
+                // A receive error ends the connection, muted or not: after an abrupt reset (as opposed to the app's close
+                // or EOF) frames that were still unread may be lost with it. Reading on after an error is not safe to
+                // rely on (the stream may keep failing), so that is a limit of what the agent can keep.
                 let message = match message {
                     Some(Ok(message)) => message,
                     Some(Err(_)) | None => break End::App,
@@ -248,7 +278,7 @@ async fn serve(mut socket: WebSocket, api: Arc<ApiState>) {
                         DocOut::NotLive { id, .. } | DocOut::Refused { id: Some(id), seq: None, .. } => link.end_open(*id),
                         _ => {}
                     }
-                    let result = send_out(&mut socket, out).await;
+                    let result = if link.writes_fail() { Err(Unsent::Closed) } else { send_out(&mut socket, out).await };
                     if let Err(end) = link.sent(result) {
                         break end;
                     }
@@ -264,7 +294,8 @@ async fn serve(mut socket: WebSocket, api: Arc<ApiState>) {
         let _ = hub.docs(DocsCall::Gone { conn: link.conn }).await;
     }
     if link.mute.is_none() {
-        let _ = socket.send(Message::Close(None)).await;
+        // Bounded: an app that is too slow to take messages may not take this one either.
+        let _ = tokio::time::timeout(SEND_TIMEOUT, socket.send(Message::Close(None))).await;
     }
 }
 
@@ -282,6 +313,9 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                     return Ok(true);
                 }
             };
+            if let DocsRequest::Open { app, .. } = &request {
+                link.app = Some(app.clone());
+            }
             match request {
                 DocsRequest::Open { id, path, app, file_hash, identity } => {
                     if link.opens.contains_key(&id) || link.opens.len() >= MAX_OPENS {
@@ -292,7 +326,7 @@ async fn on_message(socket: &mut WebSocket, link: &mut Link, api: &ApiState, mes
                         };
                         let event = DocsEvent::Error { id: Some(id), seq: None, code: code.into(), message: message.into() };
                         link.reply(socket, &event).await?;
-                    return Ok(true);
+                        return Ok(true);
                     }
                     // An absolute path inside a synced team folder is that space's; any other is the personal space's.
                     let key = api.control.route_path(&path).map(|team| team.space);
