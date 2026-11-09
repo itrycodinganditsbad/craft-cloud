@@ -117,14 +117,18 @@ fn devices() -> Vec<DeviceInfo> {
 pub(super) fn shared_wgpu() -> eframe::egui_wgpu::WgpuSetup {
     static SHARED: OnceLock<eframe::egui_wgpu::WgpuSetupExisting> = OnceLock::new();
     let shared = SHARED.get_or_init(|| {
-        let mut setup = egui_kittest::wgpu::default_wgpu_setup();
+        let setup = egui_kittest::wgpu::default_wgpu_setup();
         // On Windows the snapshots render on WARP (D3D12). Enumerating the OpenGL (EGL) adapter as well makes
         // wgpu-hal lock its context, which panicked with "Could not lock adapter context" while other test threads
         // were busy; no test uses it, so it is not created.
         #[cfg(windows)]
-        if let eframe::egui_wgpu::WgpuSetup::CreateNew(create) = &mut setup {
-            create.instance_descriptor.backends.remove(eframe::wgpu::Backends::GL);
-        }
+        let setup = {
+            let mut setup = setup;
+            if let eframe::egui_wgpu::WgpuSetup::CreateNew(create) = &mut setup {
+                create.instance_descriptor.backends.remove(eframe::wgpu::Backends::GL);
+            }
+            setup
+        };
         let state = egui_kittest::wgpu::create_render_state(setup, eframe::egui_wgpu::RendererOptions::PREDICTABLE);
         eframe::egui_wgpu::WgpuSetupExisting {
             instance: state.instance.clone(),
