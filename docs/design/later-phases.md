@@ -2,6 +2,10 @@
 
 This document expands P3 to P6 from [collaboration.md](collaboration.md). It is a proposal for later pull requests. P1 and P2 remain prerequisites where stated. Names and routes explicitly called proposed are not present in the current code. Existing HTTP routes are under `/api/v1`; agents access their local service on `/v1`.
 
+## Metadata backends
+
+A possible MariaDB metadata backend, scope decision, dialect mapping, migration safety, code estimate, CI and open questions: [mysql.md](mysql.md).
+
 ## Decisions and changes to earlier decisions
 
 - **Decided (recommended):** libraries remain ordinary files and manifests. No library database tables, special chunk ownership or server-side interpretation. This follows collaboration.md §9 and keeps history, conflict copies, restore and quota behavior uniform.
