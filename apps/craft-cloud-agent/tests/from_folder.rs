@@ -77,11 +77,42 @@ struct World {
     bob: UserRecord,
     counts: Arc<Counts>,
     _shutdown: tokio::sync::oneshot::Sender<()>,
-    _dirs: Vec<tempfile::TempDir>,
+    _dirs: Vec<Scratch>,
+}
+
+/// A temporary folder that is removed when it goes out of scope, without ever holding the test for long. On Windows the removal
+/// of a folder has been seen to stop for minutes in the system (the process idle, nothing of the agent running, the folder's files
+/// untouched), and a test that waits for it never ends. The removal runs in a thread that is waited for a while; if it does not
+/// come back the folder is left in the temporary folder of the system.
+struct Scratch(Option<tempfile::TempDir>);
+
+impl Scratch {
+    fn new() -> Self {
+        Self(Some(tempfile::tempdir().unwrap()))
+    }
+
+    fn path(&self) -> &Path {
+        self.0.as_ref().unwrap().path()
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let Some(dir) = self.0.take() else { return };
+        let path = dir.path().to_owned();
+        let (done, removed) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            drop(dir);
+            let _ = done.send(());
+        });
+        if removed.recv_timeout(Duration::from_secs(20)).is_err() {
+            eprintln!("the removal of {} did not finish; it is left behind", path.display());
+        }
+    }
 }
 
 async fn world() -> World {
-    let (db, blobs) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (db, blobs) = (Scratch::new(), Scratch::new());
     let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
     let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
     let state = Arc::new(AppState::new(meta.clone(), store, vec![]).unwrap());
@@ -165,12 +196,12 @@ struct Person {
     running: Option<Running>,
     data: DataDir,
     personal: PathBuf,
-    dir: tempfile::TempDir,
+    dir: Scratch,
 }
 
 impl Person {
     async fn signed_in(url: &str, user: &str) -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = Scratch::new();
         let person = Self { running: None, data: DataDir::new(dir.path().join("data")), personal: dir.path().join("Craft Cloud"), dir };
         let args = LoginArgs {
             url: url.to_owned(),
