@@ -228,4 +228,5 @@ fi
 echo
 echo "Craft Cloud runs at $public_url"
 [ "$tls_mode" != internal ] || echo "TLS mode 'internal': the certificate is from Caddy's own CA; clients must be told to trust it (curl -k for a test)."
+echo "Two-factor sign-in is on. Its key is in the data volume (two-factor.key): back it up apart from the database."
 echo "Next: docker compose ps, and docker compose logs -f server"
