@@ -302,6 +302,15 @@ pub fn restore(control: &Control, data: &DataDir, account: &Account) {
     let (stranded, unknown) = recover_quarantine_all(account);
     let path = journal_path(data);
     let Some(mut status) = read_journal(data, account.space) else {
+        // A journal of another account (or of a newer agent) is dropped; team files its copy moved aside are put back first, or
+        // noted in the log (the status of another account is never shown here).
+        if let Some(other) = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Journal>(&b).ok())
+            && let (Some(folder), Some(space)) = (other.status.team_folder.as_deref(), other.status.space)
+        {
+            for left in recover_team_asides(data, space, Path::new(folder)) {
+                crate::runlog::note(format_args!("a team file that a copy of another account moved aside is kept in {}", left.display()));
+            }
+        }
         if path.exists() {
             let _ = std::fs::remove_file(&path);
         }
@@ -1137,7 +1146,9 @@ impl Job {
         let batch_size = hook::trash_batch(self.data.path()).unwrap_or(TRASH_BATCH).max(1);
         // A file edited in the team folder stays here: only its version is beside the edit there.
         let (edited, copied): (Vec<Copied>, Vec<Copied>) = copied.into_iter().partition(|c| c.team_edit.is_some());
-        let mut stats = TrashStats { edited: edited.len() as u64, ..TrashStats::default() };
+        // A file that was busy (touched again and again) has an empty name: it is a changed file, not an edit.
+        let busy = edited.iter().filter(|c| c.team_edit.as_deref() == Some("")).count() as u64;
+        let mut stats = TrashStats { edited: edited.len() as u64 - busy, changed: busy, ..TrashStats::default() };
         let mut at = 0usize;
         let mut last_full: Option<Instant> = None;
         while at < copied.len() {
@@ -1329,6 +1340,9 @@ enum Landing {
     /// The old folder's version is in the team folder, and what was there (changed in the instant before it was replaced) is kept
     /// beside it as the conflict copy with this name.
     Kept(ManifestId, String),
+    /// The team file kept being touched (its times changed, its content did not) while it was looked at: it stays as it is, the old
+    /// folder's version is not in the team space, and the file counts as changed.
+    Busy(ManifestId),
 }
 
 /// How often the copy saves what it wrote while it goes on (a crash then loses at most this much of the record).
@@ -1405,7 +1419,7 @@ fn copy_all(
             }
         }
     }
-    let left = recover_asides(&tmp, &team_real, written, cancelled);
+    let left = recover_asides(&tmp, &team_real, written, false, cancelled);
     if let Some(first) = left.first() {
         return Err(CopyStop::Failed(format!(
             "{} file(s) that an interrupted copy moved aside could not be put back into the team folder; the first is kept in {}; nothing was deleted",
@@ -1454,6 +1468,10 @@ fn copy_all(
                     known.insert(key, manifest.to_string());
                     copied.push(Copied { entry: entry.clone(), manifest, team_edit: None });
                 }
+                Landing::Busy(manifest) => {
+                    // Not copied: counted as changed (see `trash`).
+                    copied.push(Copied { entry: entry.clone(), manifest, team_edit: Some(String::new()) });
+                }
                 Landing::Kept(manifest, name) => {
                     known.insert(key, manifest.to_string());
                     copied.push(Copied { entry: entry.clone(), manifest, team_edit: Some(name) });
@@ -1493,11 +1511,13 @@ fn drop_aside(aside: &Path, note: &Path) {
     }
 }
 
+/// With `free_only` (the start of the agent) only files whose place is free are put back, and the others are returned as waiting: no
+/// file is read, so the start is not held up by a big one; the next copy handles them.
 /// Puts back the team files an earlier copy moved aside and did not finish with (a crash between moving the old file aside and
 /// the end of its replacement): to their place if it is free; if something is there now, the aside file goes if it is this job's own
 /// old content, and is kept next to it (under a `.cc-kept` name) if it is anything else. Returns every aside file that is still in
 /// `tmp` because it could not be handled (a note that can't be read, a place behind a link, a failed move, a file with no note).
-fn recover_asides(tmp: &Path, team_real: &Path, written: &Mutex<Written>, cancelled: &dyn Fn() -> bool) -> Vec<PathBuf> {
+fn recover_asides(tmp: &Path, team_real: &Path, written: &Mutex<Written>, free_only: bool, cancelled: &dyn Fn() -> bool) -> Vec<PathBuf> {
     let mut left = Vec::new();
     let Ok(entries) = std::fs::read_dir(tmp) else { return left };
     let ext_aside = format!(".{ASIDE_EXT}");
@@ -1533,12 +1553,23 @@ fn recover_asides(tmp: &Path, team_real: &Path, written: &Mutex<Written>, cancel
         let place = join(team_real, &os);
         let ours = written.lock().unwrap_or_else(PoisonError::into_inner).get(&parsed.key).cloned();
         let free = matches!(std::fs::symlink_metadata(&place), Err(e) if e.kind() == io::ErrorKind::NotFound);
+        if free_only && !free {
+            // The start of the agent only puts back what has a free place (no file is read there); the next copy reads the rest.
+            left.push(aside);
+            continue;
+        }
         let own_old = !free && matches!(chunk_file(&aside, cancelled, |_| Ok(())), Ok((m, _)) if Some(m.to_string()) == ours);
         let done = if own_old {
             drop_aside(&aside, &note);
             !aside.exists()
         } else if put_back(&aside, &place).is_ok() {
             let _ = std::fs::remove_file(&note);
+            if !free {
+                crate::runlog::note(format_args!(
+                    "a team file that an interrupted copy moved aside is kept next to {} as <name>.cc-kept",
+                    place.display()
+                ));
+            }
             true
         } else {
             false
@@ -1556,7 +1587,7 @@ fn recover_team_asides(data: &DataDir, space: SpaceId, folder: &Path) -> Vec<Pat
     let Ok(team_real) = std::fs::canonicalize(folder) else { return Vec::new() };
     let tmp = team_real.join(AGENT_DIR).join("tmp");
     let written = Mutex::new(load_written(&data.space_dir(space).path().join(WRITTEN_FILE)));
-    recover_asides(&tmp, &team_real, &written, &|| false)
+    recover_asides(&tmp, &team_real, &written, true, &|| false)
 }
 
 /// The destination of a copy, as it is when the copy starts.
@@ -1842,7 +1873,7 @@ fn replace_own(
             }
         };
     }
-    Err(CopyStop::Failed(format!("{}: keeps changing while the new version is put in its place; try again", dest.display())))
+    Ok(Landing::Busy(*manifest))
 }
 
 /// Lands the finished copy on a place that is free; a name taken in that instant gets the new version beside it.
@@ -2784,7 +2815,7 @@ mod tests {
         // Something else is there and the moved file is an edit: both stay, the edit under a kept name.
         aside("a3", "Dir/edit.txt", b"somebody's edit");
         std::fs::write(team.join("Dir").join("edit.txt"), b"what is there now").unwrap();
-        let left = recover_asides(&tmp, &team, &written, &|| false);
+        let left = recover_asides(&tmp, &team, &written, false, &|| false);
         assert!(left.is_empty(), "{left:?}");
         assert_eq!(std::fs::read(team.join("Dir").join("lost.txt")).unwrap(), b"must come back");
         assert_eq!(std::fs::read(team.join("own.txt")).unwrap(), b"the new copy");
@@ -2817,7 +2848,7 @@ mod tests {
         let folder = "Cafe\u{301}";
         std::fs::create_dir_all(team.join(folder)).unwrap();
         leave_aside(&tmp, "n1", "Caf\u{e9}/a.txt", &[folder, "a.txt"], b"must come back");
-        let left = recover_asides(&tmp, &team, &Mutex::new(Written::new()), &|| false);
+        let left = recover_asides(&tmp, &team, &Mutex::new(Written::new()), false, &|| false);
         assert!(left.is_empty(), "{left:?}");
         assert_eq!(std::fs::read(team.join(folder).join("a.txt")).unwrap(), b"must come back");
         let names: Vec<_> = std::fs::read_dir(&tmp).unwrap().flatten().map(|e| e.file_name()).collect();
@@ -2834,7 +2865,7 @@ mod tests {
         std::fs::write(tmp.join(format!("orphan.{ASIDE_EXT}")), b"two").unwrap();
         std::fs::write(team.join("Blocked"), b"a file where a folder should be").unwrap();
         leave_aside(&tmp, "blocked", "Blocked/a.txt", &["Blocked", "a.txt"], b"three");
-        let left = recover_asides(&tmp, &team, &Mutex::new(Written::new()), &|| false);
+        let left = recover_asides(&tmp, &team, &Mutex::new(Written::new()), false, &|| false);
         let mut names: Vec<String> = left.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
         names.sort();
         assert_eq!(names, vec![format!("bad.{ASIDE_EXT}"), format!("blocked.{ASIDE_EXT}"), format!("orphan.{ASIDE_EXT}")]);
@@ -2976,6 +3007,80 @@ mod tests {
         assert!(first.join("a.txt").exists() && first.join("b.txt").exists(), "both files went where the team folder really is");
         let strays: Vec<_> = std::fs::read_dir(&second).unwrap().flatten().map(|e| e.file_name()).collect();
         assert!(strays.is_empty(), "nothing went to the folder the link points to now: {strays:?}");
+    }
+
+    #[test]
+    fn the_start_of_the_agent_reads_no_file_and_reports_what_waits_for_the_next_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let (team, tmp) = team_with_tmp(dir.path());
+        // The place is taken (the new copy landed, the crash came before the end): an edit that waits, and the job's own old copy.
+        std::fs::write(team.join("edit.txt"), b"the new copy").unwrap();
+        leave_aside(&tmp, "w1", "edit.txt", &["edit.txt"], b"rewritten in the team space");
+        std::fs::write(team.join("own.txt"), b"the new copy").unwrap();
+        leave_aside(&tmp, "w2", "own.txt", &["own.txt"], b"the old copy");
+        let manifest = |content: &[u8]| {
+            let path = tmp.join("probe");
+            std::fs::write(&path, content).unwrap();
+            let (m, _) = chunk_file(&path, &|| false, |_| Ok(())).map_err(|_| ()).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            m.to_string()
+        };
+        let written = Mutex::new(Written::from([("own.txt".to_owned(), manifest(b"the old copy"))]));
+        let waiting = recover_asides(&tmp, &team, &written, true, &|| panic!("the start of the agent reads no file"));
+        assert_eq!(waiting.len(), 2, "{waiting:?}");
+        assert!(tmp.join(format!("w1.{ASIDE_EXT}")).exists() && tmp.join(format!("w2.{ASIDE_EXT}")).exists());
+        // The next copy reads them: the old copy goes, the rewrite is kept next to the new file.
+        let left = recover_asides(&tmp, &team, &written, false, &|| false);
+        assert!(left.is_empty(), "{left:?}");
+        assert_eq!(std::fs::read(team.join("edit.txt.cc-kept")).unwrap(), b"rewritten in the team space");
+        assert!(!team.join("own.txt.cc-kept").exists());
+    }
+
+    #[test]
+    fn a_file_that_is_touched_again_and_again_is_kept_and_not_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let (team, tmp) = team_with_tmp(dir.path());
+        let dest = team.join("busy.txt");
+        std::fs::write(&dest, b"the old copy").unwrap();
+        let temp = tmp.join("new.cc-copy");
+        std::fs::write(&temp, b"the new version").unwrap();
+        let manifest = |path: &Path| chunk_file(path, &|| false, |_| Ok(())).map_err(|_| ()).unwrap().0;
+        let ours = manifest(&dest).to_string();
+        let new = manifest(&temp);
+        // Every look at the file is followed by a touch: its time changes, its content does not.
+        let touches = std::sync::atomic::AtomicU64::new(0);
+        let touch = || {
+            let n = touches.fetch_add(1, Ordering::SeqCst) + 1;
+            let file = std::fs::OpenOptions::new().write(true).open(&dest).unwrap();
+            file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 + n)).unwrap();
+            false
+        };
+        let hooks = CopyHooks { delay: None, before_replace: None, after_check: None, save_every: Duration::ZERO };
+        let os = [std::ffi::OsString::from("busy.txt")];
+        let known = Known { ours: Some(&ours), beside: None, key: "busy.txt", os: &os };
+        let landing = replace_own(&temp, &dest, &tmp, &new, None, hooks, known, "dev", &touch);
+        assert!(matches!(landing, Ok(Landing::Busy(_))));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"the old copy", "the team file is as it was");
+        let left: Vec<_> = std::fs::read_dir(&tmp).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left.len(), 1, "no aside file or note is left: {left:?}");
+    }
+
+    #[test]
+    fn the_asides_of_a_journal_of_another_account_are_put_back_before_it_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path());
+        let control = Control::new(tokio::sync::mpsc::channel(1).0);
+        let account = account_in(dir.path());
+        std::fs::create_dir_all(&account.folder).unwrap();
+        let (team, tmp) = team_with_tmp(&dir.path().join("Team"));
+        let journal =
+            FromFolderStatus { team_folder: Some(team.display().to_string()), space: Some(SpaceId::generate()), ..status(FromFolderStep::Failed) };
+        write_journal(&data, SpaceId::generate(), &journal);
+        leave_aside(&tmp, "f1", "brief.txt", &["brief.txt"], b"the brief");
+        restore(&control, &data, &account);
+        assert_eq!(std::fs::read(team.join("brief.txt")).unwrap(), b"the brief");
+        assert!(!journal_path(&data).exists(), "the foreign journal is dropped");
+        assert_eq!(control.from_folder(), None, "and nothing of it is shown");
     }
 
     #[test]
