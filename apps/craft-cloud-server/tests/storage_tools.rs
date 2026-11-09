@@ -366,7 +366,17 @@ async fn estimating_is_read_only_and_remembered(env: Env) {
     // Remembered with its date, and an unparsable value is no estimate rather than an error.
     storage_tools::save_estimate(&env.meta, &estimate, 1234).await.unwrap();
     let (kept, at) = storage_tools::last_estimate(&env.meta).await.unwrap().unwrap();
-    assert_eq!((kept, at), (estimate, 1234));
+    assert_eq!(at, 1234);
+    // The value is kept as JSON, and serde_json may read a float back one unit in the last place off, so floats are
+    // compared within a relative tolerance and everything else exactly.
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0);
+    assert_eq!((kept.sampled_blobs, kept.sampled_bytes), (estimate.sampled_blobs, estimate.sampled_bytes));
+    assert!(close(kept.current_saving_percent, estimate.current_saving_percent), "{kept:?} {estimate:?}");
+    assert_eq!(kept.levels.len(), estimate.levels.len());
+    for (k, e) in kept.levels.iter().zip(&estimate.levels) {
+        assert_eq!(k.level, e.level);
+        assert!(close(k.saving_percent, e.saving_percent) && close(k.mib_per_second, e.mib_per_second), "{k:?} {e:?}");
+    }
     env.meta.set_server_value(ESTIMATE_KEY, "{not json", 99).await.unwrap();
     assert!(storage_tools::last_estimate(&env.meta).await.unwrap().is_none());
 }
