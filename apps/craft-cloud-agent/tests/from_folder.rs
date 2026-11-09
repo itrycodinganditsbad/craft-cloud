@@ -200,7 +200,27 @@ impl Person {
     }
 
     async fn crash(&mut self) -> LoopResult {
-        self.running.take().unwrap().crash().await
+        let result = self.running.take().unwrap().crash().await;
+        self.wait_until_unlocked().await;
+        result
+    }
+
+    /// The second stop does not wait for the team spaces' pass thread (a process that ends takes it along), so a pass still
+    /// running holds its folder's lock for a moment after the loop is gone. A crashed process holds no lock: this waits until
+    /// the folders' locks are free, so that the next start is not refused by a lock of the "crashed" run.
+    async fn wait_until_unlocked(&self) {
+        let mut locks = vec![self.personal.join(".craft-cloud").join(craft_cloud_agent::lock::FOLDER_LOCK)];
+        if let Ok(shared) = std::fs::read_dir(self.shared()) {
+            locks.extend(shared.flatten().map(|e| e.path().join(".craft-cloud").join(craft_cloud_agent::lock::FOLDER_LOCK)));
+        }
+        let deadline = Instant::now() + PATIENCE;
+        while locks
+            .iter()
+            .any(|lock| lock.exists() && matches!(craft_cloud_agent::lock::acquire(lock), Err(craft_cloud_agent::lock::LockError::Busy(_))))
+        {
+            assert!(Instant::now() < deadline, "a folder of the crashed run is still locked");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     fn shared(&self) -> PathBuf {

@@ -2634,6 +2634,9 @@ fn ctrl_f_focuses_the_search_field_where_there_is_one() {
 #[test]
 fn the_first_nine_tabs_have_a_shortcut_to_name() {
     let ctx = egui::Context::default();
+    // Writing a shortcut looks at the fonts (macOS writes "⌘" only if a font has it), and a context has fonts only after its first
+    // frame: the window always writes them inside a frame.
+    ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
     let named: Vec<Option<String>> = (0..10).map(|index| shortcuts::tab_shortcut(&ctx, index)).collect();
     assert!(named[..9].iter().enumerate().all(|(i, s)| s.as_deref().is_some_and(|s| s.ends_with(&(i + 1).to_string()))), "{named:?}");
     assert_eq!(named[9], None);
