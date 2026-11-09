@@ -712,6 +712,13 @@ impl State {
         self.seen.decorate(Instant::now(), self.config.space, self.me, members, entries)
     }
 
+    /// The time to fade has come for somebody: they are dropped and the lists are handed out again without them.
+    fn expire_open_now(&mut self) {
+        if self.seen.sweep(Instant::now()) {
+            self.refresh_open_now();
+        }
+    }
+
     /// Hands every followed list out again with who is there now, to the followers whose list differs. Nothing is sent when
     /// nobody is (and nobody was) there.
     fn refresh_open_now(&mut self) {
@@ -1788,6 +1795,10 @@ async fn run(
                 state.send(frames).await;
             }
             Some(Inner::People { me, members, why }) = inner_rx.recv() => state.people_known(me, members, why),
+            // Somebody heard in a followed document may have faded: the lists say so to every follower.
+            () = async { match state.seen.next_expiry() { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => {
+                state.expire_open_now();
+            }
             // The writer gave up (the server took nothing for the send timeout): the connection is gone.
             () = async { match &writer_gone { Some(gone) => gone.notified().await, None => std::future::pending().await } } => {
                 state.drop_socket();

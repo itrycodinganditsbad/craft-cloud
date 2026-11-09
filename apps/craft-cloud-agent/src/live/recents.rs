@@ -111,7 +111,7 @@ fn ranked(mut all: Vec<(String, RecentEntry)>) -> Vec<(String, RecentEntry, bool
 
 /// The list the rules make of these entries (by their add keys): newest first, one per file, at most [`MAX_RECENTS`].
 pub fn view_of(entries: impl IntoIterator<Item = (AddKey, RecentEntry)>) -> Vec<RecentEntry> {
-    let all = entries.into_iter().map(|(k, e)| (hex(&k), e)).collect();
+    let all = entries.into_iter().map(|(k, e)| (hex(&k), RecentEntry { open_now: Vec::new(), ..e })).collect();
     ranked(all).into_iter().filter(|(_, _, show)| *show).map(|(_, e, _)| e).collect()
 }
 
@@ -120,7 +120,9 @@ pub fn view_of(entries: impl IntoIterator<Item = (AddKey, RecentEntry)>) -> Vec<
 fn read_entry(value: &ValueOrContainer) -> Option<RecentEntry> {
     match value {
         ValueOrContainer::Value(LoroValue::String(json)) if json.len() <= MAX_ENTRY_JSON => {
-            serde_json::from_str::<RecentEntry>(json.as_str()).ok().filter(|e| check_entry(e).is_ok())
+            // Who has a file open is the agent's own word when it hands a list out, never what a document holds (another
+            // machine's, a hostile device's, or an older write of this one's).
+            serde_json::from_str::<RecentEntry>(json.as_str()).ok().filter(|e| check_entry(e).is_ok()).map(|e| RecentEntry { open_now: Vec::new(), ..e })
         }
         _ => None,
     }
@@ -235,7 +237,8 @@ impl Recents {
         if let Some(version) = self.newer() {
             return Err(UpdateError::Newer(version));
         }
-        let json = serde_json::to_string(entry).map_err(|e| UpdateError::Malformed(e.to_string()))?;
+        // Never written: who has the file open is not part of the shared list.
+        let json = serde_json::to_string(&RecentEntry { open_now: Vec::new(), ..entry.clone() }).map_err(|e| UpdateError::Malformed(e.to_string()))?;
         self.guard(|doc| {
             let before = doc.oplog_vv();
             let fail = |e: loro::LoroError| UpdateError::Malformed(e.to_string());
@@ -437,6 +440,34 @@ mod tests {
         }
         let copy = Recents::load(&r.snapshot().unwrap(), 2).unwrap();
         assert_eq!(copy.view(), r.view());
+    }
+
+    /// Who has a file open is never written to the shared list, and never read back from it: not from this agent's own add, and not
+    /// from another machine's entry that carries it.
+    #[test]
+    fn the_shared_list_never_carries_or_hands_out_open_now() {
+        let there = vec![craft_cloud_proto::local::RecentPerson { name: "ben".into(), colour: 3 }];
+        let r = Recents::new(1);
+        r.add(key(1), &RecentEntry { open_now: there.clone(), ..entry(None, "mine.txt", 1) }).unwrap();
+        let stored = LoroDoc::new();
+        stored.import(&r.snapshot().unwrap()).unwrap();
+        match stored.get_map(ENTRIES).get(&hex(&key(1))) {
+            Some(ValueOrContainer::Value(LoroValue::String(json))) => assert!(!json.as_str().contains("open_now"), "written as {}", json.as_str()),
+            other => panic!("{other:?}"),
+        }
+        // Another machine's entry that names people: taken, shown without them.
+        let other = LoroDoc::new();
+        let _ = other.set_peer_id(9);
+        other.import(&r.snapshot().unwrap()).unwrap();
+        let hostile = serde_json::to_string(&RecentEntry { open_now: there.clone(), ..entry(None, "theirs.txt", 2) }).unwrap();
+        assert!(hostile.contains("open_now"));
+        let update = honest(&other, 77, hostile);
+        r.import(&update).unwrap();
+        let view = r.view();
+        assert_eq!(view.len(), 2);
+        assert!(view.iter().all(|e| e.open_now.is_empty()), "{view:?}");
+        assert!(r.readable().iter().all(|(_, e)| e.open_now.is_empty()));
+        assert!(view_of(vec![(key(5), RecentEntry { open_now: there, ..entry(None, "x.txt", 3) })]).iter().all(|e| e.open_now.is_empty()));
     }
 
     /// Remote updates: one Loro refuses, or over the limit, leaves the document as it was; anything else is taken,

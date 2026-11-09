@@ -2610,9 +2610,44 @@ async fn a_recent_file_of_a_team_space_says_who_else_has_it_open_and_never_the_a
     let colour = t.ana.api(move |c| c.recents_in("wordcraft", space)).await.unwrap().into_iter().find(|e| e.path == "plan.txt").unwrap().open_now;
     assert_eq!(colour[0].colour, craft_cloud_proto::colour::member_colour(t.world.ben.id.0), "the palette index every machine derives");
 
-    // The personal lists say nothing of them, and once ben goes quiet he fades (the agent hears no more from him).
+    // The personal lists say nothing of them.
     assert!(t.ana.api(|c| c.recents("wordcraft")).await.unwrap().is_empty());
-    eventually("ben fades from ana's list", || async { names(t.ana.api(move |c| c.recents_in("wordcraft", space)).await.unwrap()).is_empty() }).await;
+
+    // A follower of the list is told when ben fades, with no new presence and no new look: ana follows the space's list, ben
+    // shows presence once more, and then nothing is sent for ten seconds.
+    let client = t.ana.client();
+    let follower = off(move || client.watch_recents_in("wordcraft", space).unwrap()).await;
+    ben.doc.presence(b"ben's cursor").unwrap();
+    eventually("the follower is told ben is there", || async { names(follower.entries()) == ["ben"] }).await;
+    eventually("the follower is told ben has faded", || async { names(follower.entries()).is_empty() }).await;
+    // The same through a call that follows once more: nobody is there.
+    assert!(names(t.ana.api(move |c| c.recents_in("wordcraft", space)).await.unwrap()).is_empty());
+}
+
+/// The lists of several apps and spaces in one connection: each at its own app and space, the personal list apart, a space that
+/// does not sync here refused for that list alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn several_recents_lists_come_over_one_connection() {
+    let (t, ana_folder, _ben_folder) = team_with_plan(SpaceRole::Editor).await;
+    let space = t.space;
+    let path = ana_folder.join("plan.txt").display().to_string();
+    t.ana.api(move |c| c.add_recent("wordcraft", NewRecent { path, title: Some("Team plan".into()), saved: false })).await.unwrap();
+    t.ana.api(|c| c.add_recent("wordcraft", NewRecent { path: "personal.txt".into(), title: Some("Mine".into()), saved: false })).await.unwrap();
+    let other = SpaceId::generate();
+    let wanted: Vec<(String, Option<SpaceId>)> = vec![
+        ("wordcraft".into(), None),
+        ("wordcraft".into(), Some(space)),
+        ("photocraft".into(), Some(space)),
+        ("wordcraft".into(), Some(other)),
+    ];
+    let answers = t.ana.api(move |c| c.recents_of(&wanted)).await.unwrap();
+    assert_eq!(answers.len(), 4);
+    let list = |i: usize| answers[i].2.as_ref().map(|l| l.iter().map(|e| e.title.clone()).collect::<Vec<_>>());
+    assert_eq!(list(0).unwrap(), ["Mine"], "the personal list is not the space's");
+    assert_eq!(list(1).unwrap(), ["Team plan"]);
+    assert_eq!(list(2).unwrap(), Vec::<String>::new(), "an app with no files has an empty list");
+    assert!(matches!(&answers[3].2, Err(craft_cloud_app::Error::Refused { code, .. }) if code == "not_found"), "{:?}", answers[3].2);
+    assert_eq!((answers[1].0.as_str(), answers[1].1), ("wordcraft", Some(space)));
 }
 
 /// A server whose live service does not serve team spaces (it answers the upgrade with `404`) is asked once and then left alone

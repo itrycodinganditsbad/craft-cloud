@@ -27,23 +27,47 @@ const MAX_PER_DOC: usize = 64;
 #[derive(Debug, Default)]
 pub struct Seen {
     docs: HashMap<DocId, HashMap<Uuid, Instant>>,
+    /// When the earliest account may fade (an account heard again fades later, so this can be early, never late). None while
+    /// nobody is counted.
+    next: Option<Instant>,
 }
 
 impl Seen {
     /// Presence from `user` in `doc` at `now`. `true` when that account was not counted as there before (the lists change).
     pub fn note(&mut self, now: Instant, doc: DocId, user: Uuid) -> bool {
-        self.docs.retain(|_, users| {
-            users.retain(|_, at| now.saturating_duration_since(*at) < OPEN_NOW_TTL);
-            !users.is_empty()
-        });
+        // Only once the earliest deadline has passed is there anything to drop.
+        if self.next.is_some_and(|deadline| now >= deadline) {
+            self.sweep(now);
+        }
         if self.docs.len() >= MAX_DOCS && !self.docs.contains_key(&doc) {
             self.docs.clear();
+            self.next = None;
         }
         let users = self.docs.entry(doc).or_default();
         if users.len() >= MAX_PER_DOC && !users.contains_key(&user) {
             return false;
         }
-        users.insert(user, now).is_none()
+        let new = users.insert(user, now).is_none();
+        self.next.get_or_insert(now + OPEN_NOW_TTL);
+        new
+    }
+
+    /// Drops the accounts that have faded by `now`, and finds when the next one will. `true` when anybody was dropped (the
+    /// lists change).
+    pub fn sweep(&mut self, now: Instant) -> bool {
+        let before: usize = self.docs.values().map(HashMap::len).sum();
+        self.docs.retain(|_, users| {
+            users.retain(|_, at| now.saturating_duration_since(*at) < OPEN_NOW_TTL);
+            !users.is_empty()
+        });
+        let after: usize = self.docs.values().map(HashMap::len).sum();
+        self.next = self.docs.values().flat_map(HashMap::values).min().map(|at| *at + OPEN_NOW_TTL);
+        after < before
+    }
+
+    /// When somebody may fade next: the hub looks at its lists again then (none while nobody is counted).
+    pub fn next_expiry(&self) -> Option<Instant> {
+        self.next
     }
 
     /// The accounts there in `doc` at `now`, apart from `me` and anybody `members` marks as the account itself, with the
@@ -107,6 +131,24 @@ mod tests {
         assert!(seen.note(later, doc, members[1].user), "ben is back, and counts as a change");
         let names: Vec<_> = seen.people(later, doc, me, &members).into_iter().map(|p| p.name).collect();
         assert_eq!(names, ["ben", "cy"]);
+    }
+
+    #[test]
+    fn the_next_expiry_follows_the_oldest_account_and_a_sweep_drops_what_faded() {
+        let (doc, ben, cy) = (DocId::generate(), Uuid::from_bytes([2; 16]), Uuid::from_bytes([3; 16]));
+        let t0 = Instant::now();
+        let mut seen = Seen::default();
+        assert_eq!(seen.next_expiry(), None, "nobody, nothing to wait for");
+        seen.note(t0, doc, ben);
+        assert_eq!(seen.next_expiry(), Some(t0 + OPEN_NOW_TTL));
+        let t5 = t0 + Duration::from_secs(5);
+        seen.note(t5, doc, cy);
+        assert!(!seen.sweep(t5), "nobody faded yet");
+        assert_eq!(seen.next_expiry(), Some(t0 + OPEN_NOW_TTL), "ben is the oldest");
+        assert!(seen.sweep(t0 + OPEN_NOW_TTL), "ben faded");
+        assert_eq!(seen.next_expiry(), Some(t5 + OPEN_NOW_TTL), "cy is next");
+        assert!(seen.sweep(t5 + OPEN_NOW_TTL));
+        assert_eq!(seen.next_expiry(), None);
     }
 
     #[test]
