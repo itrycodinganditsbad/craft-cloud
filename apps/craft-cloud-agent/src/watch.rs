@@ -85,7 +85,8 @@ pub fn watch(folder: &Path, events: UnboundedSender<WatchEvent>) -> Result<Folde
 
 /// What to watch for `folder`. Where the folder itself is a link, inotify (with links not followed) watches the link and
 /// not the folder behind it, so no change in it would ever be reported: the folder it leads to is watched instead
-/// ([`roots`] knows both spellings). Elsewhere (Windows and macOS follow the link themselves) it is the folder as given.
+/// ([`roots`] knows both spellings). On macOS FSEvents resolves the path anyway, so this changes nothing there; on Windows
+/// the folder is watched as given.
 fn watched(folder: &Path) -> PathBuf {
     #[cfg(unix)]
     if std::fs::symlink_metadata(folder).is_ok_and(|m| m.file_type().is_symlink())

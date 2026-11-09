@@ -923,6 +923,16 @@ impl Manager {
             Ev::Pass(done) => self.pass_done(*done, now),
             Ev::Closed(id, closed) => self.closed(id, closed),
             Ev::FolderMoved(space) => {
+                // The folder leads somewhere else: what is watched (and what counts as inside it) is looked at again, under a
+                // new generation so the old watcher's last events are ignored.
+                if let Some(team) = self.teams.iter_mut().find(|t| t.setting.space == space)
+                    && let Some(active) = team.active.as_mut()
+                {
+                    active.generation += 1;
+                    active.roots = crate::watch::roots(&team.setting.folder);
+                    active.watcher = start_watcher(&team.setting.folder, space, active.generation, &active.polling.events);
+                    active.scheduler.set_watching(active.watcher.is_some());
+                }
                 if let Err(e) = self.raise_generation(space) {
                     crate::runlog::note(format_args!(
                         "can't save the raised generation of team space {space} yet (tried again at the next look): {e}"
@@ -1452,6 +1462,22 @@ fn active_summary(state_dir: &DataDir, setting: &SpaceSetting) -> Option<PassSum
     state_dir.load_state_for(setting.space, &setting.folder, None, setting.generation).ok().and_then(|(s, _)| s.last_pass).and_then(|l| l.summary)
 }
 
+/// Starts watching a team space's folder, forwarding what happens as events of the space under `generation`.
+fn start_watcher(folder: &Path, space: SpaceId, generation: u64, events: &mpsc::UnboundedSender<Ev>) -> Option<FolderWatcher> {
+    let (wtx, mut wrx) = mpsc::unbounded_channel();
+    let watcher = crate::watch::watch(folder, wtx).ok()?;
+    let forward = events.clone();
+    tokio::spawn(async move {
+        while let Some(event) = wrx.recv().await {
+            if forward.send(Ev::Watch(space, generation, event)).is_err() {
+                return;
+            }
+        }
+        let _ = forward.send(Ev::WatcherGone(space, generation));
+    });
+    Some(watcher)
+}
+
 /// The parts of a synced team space: scheduler, folder watcher, long-poll.
 #[allow(clippy::too_many_arguments)]
 fn start_active(
@@ -1478,24 +1504,7 @@ fn start_active(
     let mut scheduler = Scheduler::new(timing, now, random);
     let roots = crate::watch::roots(&setting.folder);
     let generation = 1;
-    let watcher = {
-        let (wtx, mut wrx) = mpsc::unbounded_channel();
-        match crate::watch::watch(&setting.folder, wtx) {
-            Ok(watcher) => {
-                let forward = events;
-                tokio::spawn(async move {
-                    while let Some(event) = wrx.recv().await {
-                        if forward.send(Ev::Watch(space, generation, event)).is_err() {
-                            return;
-                        }
-                    }
-                    let _ = forward.send(Ev::WatcherGone(space, generation));
-                });
-                Some(watcher)
-            }
-            Err(_) => None,
-        }
-    };
+    let watcher = start_watcher(&setting.folder, space, generation, &events);
     scheduler.set_watching(watcher.is_some());
     let mut active = Active {
         scheduler,
