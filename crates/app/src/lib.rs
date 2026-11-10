@@ -171,6 +171,10 @@ impl Client {
     /// Finds the agent running with the data folder `dir` (its `--data-dir`).
     pub fn connect_in(dir: &Path) -> Result<Self, Error> {
         let file: PathBuf = dir.join(LOCAL_API_FILE);
+        // The token in the file goes to whatever listens on the port it names, so the file must be one only this user
+        // could have written: a folder or file that someone else made or can change is not believed, and nothing is sent.
+        craft_cloud_api::local::private::check_private_dir(dir).map_err(|why| Error::NotRunning(format!("not used: {why}")))?;
+        craft_cloud_api::local::private::check_private_file(&file).map_err(|why| Error::NotRunning(format!("not used: {why}")))?;
         let bytes = std::fs::read(&file).map_err(|e| Error::NotRunning(format!("{}: {e}", file.display())))?;
         let record: LocalApiFile = serde_json::from_slice(&bytes).map_err(|e| Error::NotRunning(format!("{} doesn't read: {e}", file.display())))?;
         // A file a crashed agent left behind names a port nobody, or someone else, answers on: the connection tells.
@@ -552,6 +556,17 @@ mod tests {
         assert!(matches!(refusal(neither).unwrap_err(), Error::Refused { .. }));
     }
 
+    /// Writes `local-api.json` as the agent does: for its user alone.
+    fn write_discovery(dir: &std::path::Path, text: &str) {
+        let path = dir.join(LOCAL_API_FILE);
+        std::fs::write(&path, text).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
     /// What the fake agent was asked: method, path and body.
     type Asked = (String, String, String);
 
@@ -599,7 +614,7 @@ mod tests {
         });
         let dir = tempfile::tempdir().unwrap();
         let file = serde_json::json!({ "schema": 1, "port": port, "token": "t", "pid": std::process::id() });
-        std::fs::write(dir.path().join(LOCAL_API_FILE), file.to_string()).unwrap();
+        write_discovery(dir.path(), &file.to_string());
         let client = Client::connect_in(dir.path()).unwrap();
         (dir, client, asked)
     }
@@ -1138,7 +1153,7 @@ mod tests {
         });
         let dir = tempfile::tempdir().unwrap();
         let file = serde_json::json!({ "schema": 1, "port": port, "token": "t", "pid": std::process::id() });
-        std::fs::write(dir.path().join(LOCAL_API_FILE), file.to_string()).unwrap();
+        write_discovery(dir.path(), &file.to_string());
         let started = std::time::Instant::now();
         let result = Client::connect_in(dir.path());
         assert!(matches!(result, Err(Error::NotRunning(_))), "{result:?}");
@@ -1155,7 +1170,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         let file = serde_json::json!({ "schema": 1, "port": port, "token": "t", "pid": u32::MAX - 7 });
-        std::fs::write(dir.path().join(LOCAL_API_FILE), file.to_string()).unwrap();
+        write_discovery(dir.path(), &file.to_string());
         let Err(Error::NotRunning(why)) = Client::connect_in(dir.path()) else { panic!("connected to nothing") };
         assert!(!why.contains("its agent stopped"), "told by the pid: {why}");
     }
@@ -1364,5 +1379,43 @@ mod tests {
         // An agent from before the call: "no such call" is `agent_too_old`.
         let old = agent.make_space_from_folder(&request).unwrap_err();
         assert!(matches!(&old, Error::Refused { code, .. } if code == codes::AGENT_TOO_OLD), "{old:?}");
+    }
+
+    /// Nothing is sent to a listener on the word of a discovery file or folder that someone else could have written:
+    /// the token in it would go to whoever listens on the port it names.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_or_folder_others_can_write_is_not_believed_and_no_token_is_sent() {
+        use std::os::unix::fs::PermissionsExt;
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let file = serde_json::json!({ "schema": 1, "port": port, "token": "t", "pid": std::process::id() }).to_string();
+        let mode = |path: &std::path::Path, mode: u32| std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        let attempt = || {
+            let result = Client::connect_in(dir.path());
+            // Not even a connection was made.
+            assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+            result
+        };
+        write_discovery(dir.path(), &file);
+        for bad in [0o644, 0o640, 0o606, 0o666] {
+            mode(&dir.path().join(LOCAL_API_FILE), bad);
+            let Err(Error::NotRunning(why)) = attempt() else { panic!("{bad:o} was believed") };
+            assert!(why.contains("not used") && why.contains("other users"), "{why}");
+        }
+        mode(&dir.path().join(LOCAL_API_FILE), 0o600);
+        for bad in [0o770, 0o707, 0o777] {
+            mode(dir.path(), bad);
+            let Err(Error::NotRunning(why)) = attempt() else { panic!("a folder of mode {bad:o} was believed") };
+            assert!(why.contains("not used") && why.contains("written by other users"), "{why}");
+        }
+        // A link in the place of the file is not followed either.
+        mode(dir.path(), 0o700);
+        std::fs::rename(dir.path().join(LOCAL_API_FILE), dir.path().join("real.json")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real.json"), dir.path().join(LOCAL_API_FILE)).unwrap();
+        let Err(Error::NotRunning(why)) = attempt() else { panic!("a link was believed") };
+        assert!(why.contains("not a regular file"), "{why}");
     }
 }
