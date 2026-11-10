@@ -193,3 +193,20 @@ jobs:
 
       - name: Check
         run: cargo check --workspace --all-targets --locked
+
+  # The Docker deployment's shell tests (no Docker needed): the rendered config and the refusal of values that could break
+  # the TOML, the two-factor key files, the Caddyfile and compose file (no management API, no client address in the error
+  # log, a health check that does not need the management API) and the version script.
+  docker-files:
+    name: Docker deployment files
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Shell tests of packaging/docker
+        run: |
+          set -eu
+          for test in packaging/docker/tests/*.sh; do
+            echo "== $test"
+            sh "$test"
+          done
