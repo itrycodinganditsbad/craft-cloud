@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use axum::extract::rejection::{JsonRejection, PathRejection};
-use axum::extract::{DefaultBodyLimit, Path, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::http::header::{AUTHORIZATION, HOST, ORIGIN};
 use axum::middleware::{self, Next};
@@ -25,11 +25,16 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use craft_cloud_proto::DeviceId;
-use craft_cloud_proto::api::{DeviceInfo, ErrorBody, PairingStatus, codes as api_codes};
+use craft_cloud_proto::api::{
+    AccountUsage, DeviceInfo, HistoryResponse, PairingStatus, RecoveryCodes, RestoreResponse, RevokedOthers, TwoFactorChallenge,
+    TwoFactorSetupResponse, TwoFactorStatus, codes as api_codes,
+};
 use craft_cloud_proto::join::{Code, JoinString, MAX_JOIN_BYTES, PAIRING_CHARS};
 use craft_cloud_proto::local::{
-    AutostartRequest, JoinRequest, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_SCHEMA, LocalApiFile, LoginRequest, LogoutRequest, MAX_LOCAL_JSON_BYTES,
-    PairingInfo, RunState, Status, codes, paths,
+    ApproveDeletesAnswer, ApproveDeletesRequest, AutostartRequest, ChangePasswordRequest, ConflictsResponse, FolderUsageResponse, FromFolderRequest,
+    FromFolderStatus, JoinRequest, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_SCHEMA, LocalApiFile, LoginRequest, LogoutRequest, MAX_LOCAL_JSON_BYTES,
+    PairingInfo, PasswordRequest, RenameDeviceRequest, RunState, SecondFactorLoginRequest, SpaceInfo, SpaceList, SpaceRun, SpaceStatus, SpaceSync,
+    SpaceSyncRequest, Status, TotpRequest, TwoFactorProofRequest, codes, paths,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -41,17 +46,23 @@ use crate::autostart::{self, Roots};
 use crate::cli::{AgentError, Exit};
 use crate::http::HttpTransport;
 use crate::live::app_blobs::{self, BlobError};
+use crate::spaces::SpacesHandle;
 
 /// What the local API asks the `run` loop to do, with where to send the outcome.
 pub enum Command {
     Login(LoginRequest, oneshot::Sender<Result<(), AgentError>>),
     Join(JoinRequest, oneshot::Sender<Result<(), AgentError>>),
+    /// The second step of a sign-in that answered `two_factor_required`.
+    LoginSecondFactor(SecondFactorLoginRequest, oneshot::Sender<Result<(), AgentError>>),
     Logout(LogoutRequest, oneshot::Sender<Result<(), AgentError>>),
     /// Hold syncing and the live connection until [`Command::Resume`], also after a restart.
     Pause(oneshot::Sender<Result<(), AgentError>>),
     Resume(oneshot::Sender<Result<(), AgentError>>),
     /// Finish the pass under way and stop the agent. Answered at once.
     Quit(oneshot::Sender<Result<(), AgentError>>),
+    /// This computer was renamed on the server: keep the new name in the saved account, the status and the live hub.
+    /// Another computer's id changes nothing.
+    RenameDevice(DeviceId, String, oneshot::Sender<Result<(), AgentError>>),
     /// Run a sync pass soon (an app opened a file that isn't uploaded yet, to make it live). Not answered.
     SyncSoon,
 }
@@ -70,12 +81,29 @@ struct Shared {
     last_sync_ms: Option<i64>,
     /// The last pass found this device refused by the server.
     removed: bool,
+    /// The team spaces, as the spaces task last saw them (`GET /v1/spaces`, after the personal space), and the ones that sync
+    /// or lost access (`GET /v1/status`).
+    spaces: Vec<SpaceInfo>,
+    space_status: Vec<SpaceStatus>,
+    spaces_handle: Option<SpacesHandle>,
+    /// The work of making a team space from a folder, under way or how the last one ended.
+    from_folder: Option<FromFolderStatus>,
+}
+
+/// The running work of making a team space from a folder: its task, and the flag that tells it its session has ended.
+pub struct FromFolderJob {
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
+    pub task: tokio::task::JoinHandle<()>,
 }
 
 /// The loop's side of the local API: the status it reports, and the commands it receives. Cheap to clone.
 #[derive(Clone)]
 pub struct Control {
     shared: Arc<Mutex<Shared>>,
+    /// The task of the work of making a team space from a folder (not part of what the status copies).
+    from_job: Arc<Mutex<Option<FromFolderJob>>>,
+    /// Counts the sessions: it changes when one ends, so a call that was under way sees that its session is over.
+    session: Arc<std::sync::atomic::AtomicU64>,
     commands: mpsc::Sender<Command>,
     /// Where the start-at-login entry goes (`None`: `autostart` is refused, with `autostart_refusal`).
     autostart: Option<Roots>,
@@ -85,10 +113,21 @@ pub struct Control {
 impl Control {
     /// A control for a loop that receives its commands from `commands`' other end.
     pub fn new(commands: mpsc::Sender<Command>) -> Self {
-        let shared =
-            Shared { account: None, run_state: RunState::SignedOut, online: false, hub: None, autostart: None, last_sync_ms: None, removed: false };
+        let shared = Shared {
+            account: None,
+            run_state: RunState::SignedOut,
+            online: false,
+            hub: None,
+            autostart: None,
+            last_sync_ms: None,
+            removed: false,
+            spaces: Vec::new(),
+            space_status: Vec::new(),
+            spaces_handle: None,
+            from_folder: None,
+        };
         let autostart_refusal = "this agent doesn't handle starting at login here".to_owned();
-        Self { shared: Arc::new(Mutex::new(shared)), commands, autostart: None, autostart_refusal }
+        Self { shared: Arc::new(Mutex::new(shared)), from_job: Arc::default(), session: Arc::default(), commands, autostart: None, autostart_refusal }
     }
 
     /// The control with the start-at-login entry at `roots`, for the agent with data folder `data`. The entry is
@@ -131,8 +170,83 @@ impl Control {
                 s.online = false;
                 s.last_sync_ms = None;
                 s.removed = false;
+                s.spaces.clear();
+                s.space_status.clear();
+                s.from_folder = None;
             }
         });
+    }
+
+    /// What the spaces task sees: the team spaces (for `GET /v1/spaces`) and the status of those that sync.
+    pub fn set_spaces(&self, spaces: Vec<SpaceInfo>, status: Vec<SpaceStatus>) {
+        self.with(|s| {
+            s.spaces = spaces;
+            s.space_status = status;
+        });
+    }
+
+    /// The spaces task's handle, while signed in.
+    pub fn set_spaces_handle(&self, handle: Option<SpacesHandle>) {
+        self.with(|s| s.spaces_handle = handle);
+    }
+
+    pub fn spaces_handle(&self) -> Option<SpacesHandle> {
+        self.with(|s| s.spaces_handle.clone())
+    }
+
+    /// The work of making a team space from a folder (`Status::from_folder`).
+    pub fn from_folder(&self) -> Option<FromFolderStatus> {
+        self.with(|s| s.from_folder.clone())
+    }
+
+    pub fn set_from_folder(&self, status: Option<FromFolderStatus>) {
+        self.with(|s| s.from_folder = status);
+    }
+
+    /// Which session this is (see [`Control::bump_session`]).
+    pub fn session_id(&self) -> u64 {
+        self.session.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A session ended: whatever was started under the number before is over.
+    pub fn bump_session(&self) {
+        self.session.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Registers the job of a call that began in `session`, unless that session has ended meanwhile (then it is handed back as
+    /// refused: `end_session` could not have found it).
+    pub fn register_from_folder_job(&self, session: u64, job: FromFolderJob) -> bool {
+        let mut slot = self.from_job.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.session_id() != session {
+            job.task.abort();
+            return false;
+        }
+        *slot = Some(job);
+        true
+    }
+
+    pub fn set_from_folder_job(&self, job: Option<FromFolderJob>) {
+        *self.from_job.lock().unwrap_or_else(PoisonError::into_inner) = job;
+    }
+
+    pub fn take_from_folder_job(&self) -> Option<FromFolderJob> {
+        self.from_job.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
+
+    /// Starts the work's status, unless other work is still under way (`false`).
+    pub fn begin_from_folder(&self, status: FromFolderStatus) -> bool {
+        self.with(|s| {
+            if s.from_folder.as_ref().is_some_and(FromFolderStatus::running) {
+                return false;
+            }
+            s.from_folder = Some(status);
+            true
+        })
+    }
+
+    /// A team space as the spaces task last listed it.
+    pub fn space_info(&self, space: craft_cloud_proto::SpaceId) -> Option<SpaceInfo> {
+        self.with(|s| s.spaces.iter().find(|i| i.space == space).cloned())
     }
 
     /// Whether the server refused this device at the last pass (it was removed from the account).
@@ -187,27 +301,51 @@ impl Control {
             autostart: s.autostart,
             last_sync_ms: s.last_sync_ms,
             removed: s.account.is_some() && s.removed,
+            spaces: if s.account.is_some() { s.space_status.clone() } else { Vec::new() },
+            from_folder: if s.account.is_some() { s.from_folder.clone() } else { None },
         })
     }
 }
 
-/// An error answer: the HTTP status and the [`ErrorBody`].
+/// An error answer: the HTTP status, the typed local API code and message, and optional details such as a two-factor
+/// challenge, a lock wait, or a trash-restore name conflict.
 #[derive(Debug)]
 pub struct LocalError {
     pub status: StatusCode,
-    pub code: &'static str,
+    pub code: String,
     pub message: String,
+    pub two_factor: Option<TwoFactorChallenge>,
+    pub retry_after_secs: Option<u64>,
+    pub name_taken: Option<bool>,
 }
 
 impl LocalError {
-    pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        Self { status, code, message: message.into() }
+    pub fn new(status: StatusCode, code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self { status, code: code.into(), message: message.into(), two_factor: None, retry_after_secs: None, name_taken: None }
+    }
+
+    fn with_code(status: StatusCode, code: String, message: impl Into<String>) -> Self {
+        Self { status, code, message: message.into(), two_factor: None, retry_after_secs: None, name_taken: None }
     }
 }
 
 impl IntoResponse for LocalError {
     fn into_response(self) -> Response {
-        (self.status, Json(ErrorBody { error: self.code.to_owned(), message: self.message, ..ErrorBody::default() })).into_response()
+        let extras = craft_cloud_proto::local::ErrorExtras { two_factor: self.two_factor, retry_after_secs: self.retry_after_secs };
+        let mut body = serde_json::json!({ "error": self.code, "message": self.message });
+        if let (Some(object), Ok(serde_json::Value::Object(more))) = (body.as_object_mut(), serde_json::to_value(&extras)) {
+            object.extend(more);
+        }
+        if let Some(name_taken) = self.name_taken
+            && let Some(object) = body.as_object_mut()
+        {
+            object.insert("name_taken".to_owned(), serde_json::Value::Bool(name_taken));
+        }
+        let mut response = (self.status, Json(body)).into_response();
+        if let Some(secs) = self.retry_after_secs {
+            response.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from(secs));
+        }
+        response
     }
 }
 
@@ -217,7 +355,33 @@ impl From<AgentError> for LocalError {
         // A setup that failed after the code was spent answers as what failed, with the whole message.
         if let AgentError::JoinSetup(inner) = e {
             let inner = LocalError::from(*inner);
-            return Self::new(inner.status, inner.code, message);
+            return Self::with_code(inner.status, inner.code, message);
+        }
+        // The second factor: a challenge, a wrong code, a lock and a server's refusal keep what they carry. None of them is a
+        // revoked device (that is `Revoked`, from a 401 on a signed-in call).
+        match &e {
+            AgentError::TwoFactorRequired(challenge) => {
+                let mut error = Self::new(StatusCode::UNAUTHORIZED, codes::TWO_FACTOR_REQUIRED, message);
+                // `join` has no challenge to hand on: the same join goes again with the code.
+                error.two_factor = Some(challenge.clone());
+                return error;
+            }
+            AgentError::TwoFactorInvalid(_) => return Self::new(StatusCode::UNAUTHORIZED, codes::TWO_FACTOR_INVALID, message),
+            AgentError::ChallengeGone => return Self::new(StatusCode::CONFLICT, codes::TWO_FACTOR_EXPIRED, message),
+            AgentError::TwoFactorLocked { retry_after_secs, .. } => {
+                let mut error = Self::new(StatusCode::TOO_MANY_REQUESTS, codes::TWO_FACTOR_LOCKED, message);
+                error.retry_after_secs = *retry_after_secs;
+                return error;
+            }
+            AgentError::Refused { status, code, retry_after_secs, .. } => {
+                // The server's own status and code (never a 401: that is `Revoked`).
+                let status =
+                    StatusCode::from_u16(*status).ok().filter(|s| (s.is_client_error() || s.is_server_error()) && *s != StatusCode::UNAUTHORIZED);
+                let mut error = Self::new(status.unwrap_or(StatusCode::BAD_REQUEST), code.clone(), message);
+                error.retry_after_secs = *retry_after_secs;
+                return error;
+            }
+            _ => {}
         }
         let (status, code) = match &e {
             AgentError::WrongPassword => (StatusCode::UNAUTHORIZED, codes::WRONG_PASSWORD),
@@ -233,6 +397,7 @@ impl From<AgentError> for LocalError {
             AgentError::NotSignedIn => (StatusCode::CONFLICT, codes::NOT_SIGNED_IN),
             AgentError::Offline(_) | AgentError::LogoutOffline(_) => (StatusCode::SERVICE_UNAVAILABLE, codes::OFFLINE),
             AgentError::Usage(m) if m.starts_with("already signed in") => (StatusCode::CONFLICT, codes::ALREADY_SIGNED_IN),
+            AgentError::Usage(m) if m == crate::spaces::CHANGING => (StatusCode::CONFLICT, codes::CONFLICT),
             AgentError::Usage(_) => (StatusCode::BAD_REQUEST, api_codes::INVALID),
             other if other.exit() == Exit::NeedsYou => (StatusCode::CONFLICT, codes::NEEDS_YOU),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, api_codes::INTERNAL),
@@ -337,30 +502,186 @@ impl Drop for LocalApi {
     }
 }
 
-type Api = Arc<ApiState>;
+pub(crate) type Api = Arc<ApiState>;
 
 fn router(state: Api) -> Router {
     Router::new()
         .route(paths::STATUS, get(status))
         .route(paths::LOGIN, post(login))
+        .route(paths::LOGIN_SECOND_FACTOR, post(login_second_factor).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route(paths::LOGOUT, post(logout))
+        .route(paths::TWO_FACTOR, get(two_factor_status))
+        .route(paths::TWO_FACTOR_SETUP, post(two_factor_setup).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route(paths::TWO_FACTOR_CONFIRM, post(two_factor_confirm).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route(paths::TWO_FACTOR_DISABLE, post(two_factor_disable).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route(paths::TWO_FACTOR_RECOVERY_CODES, post(two_factor_recovery_codes).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route(paths::ACCOUNT_PASSWORD, post(change_password).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route(paths::DEVICES_REVOKE_OTHERS, post(revoke_other_devices))
         .route(paths::RECENTS, get(crate::live::recents_socket))
         .route(paths::DOCS, get(crate::live::docs::docs_socket))
         .route(paths::JOIN, post(join))
         .route(paths::PAIRINGS, post(create_pairing))
         .route(&format!("{}/{{id}}", paths::PAIRINGS), get(pairing_status).delete(delete_pairing))
         .route(paths::DEVICES, get(devices))
-        .route(&format!("{}/{{id}}", paths::DEVICES), delete(remove_device))
+        .route(paths::USAGE, get(usage))
+        .route(paths::USAGE_FOLDERS, get(usage_folders))
+        .route(paths::CONFLICTS, get(conflicts))
+        .route(&format!("{}/{{id}}", paths::DEVICES), delete(remove_device).patch(rename_device).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route(paths::SPACES, get(spaces))
+        .route(paths::SPACES_FROM_FOLDER, post(from_folder).layer(DefaultBodyLimit::max(craft_cloud_proto::local::MAX_ADMIN_JSON_BYTES)))
+        .route(&format!("{}/{{id}}/accept", paths::SPACES), post(accept_space))
+        .route(&format!("{}/{{id}}/decline", paths::SPACES), post(decline_space))
+        .route(&format!("{}/{{id}}/sync", paths::SPACES), post(sync_space).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route(&format!("{}/{{id}}/approve-deletes", paths::SPACES), post(approve_space_deletes).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route(paths::AUTOSTART, post(set_autostart))
         .route(paths::PAUSE, post(pause))
         .route(paths::RESUME, post(resume))
         .route(paths::QUIT, post(quit))
+        .merge(crate::admin::routes())
+        .route(paths::FILE_HISTORY, get(file_history))
+        .route(paths::FILE_RESTORE, post(file_restore))
+        .route(paths::TRASH, get(trash))
+        .route(paths::TRASH_RESTORE, post(trash_restore))
+        .route(paths::TRASH_REMOVE, post(trash_remove))
         .route(paths::BLOBS, axum::routing::put(put_blob).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
         .route(&format!("{}/{{hash}}", paths::BLOBS), get(get_blob))
         .fallback(|| async { LocalError::new(StatusCode::NOT_FOUND, api_codes::NOT_FOUND, "no such call") })
         .layer(DefaultBodyLimit::max(MAX_LOCAL_JSON_BYTES))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
+}
+
+#[derive(serde::Deserialize)]
+struct HistoryQuery {
+    path: String,
+    cursor: Option<String>,
+    limit: Option<u32>,
+}
+
+fn file_node(state: &ApiState, path: &str) -> Result<craft_cloud_proto::NodeId, LocalError> {
+    if path.is_empty() || path.starts_with('/') || path.contains('\\') || path.contains(':') || path.as_bytes().contains(&0) {
+        return Err(LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, "path must be relative to the sync root"));
+    }
+    let names = path
+        .split('/')
+        .map(craft_cloud_proto::Name::new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, "path contains an invalid name"))?;
+    let saved =
+        DataDir::new(&state.data).load_state().map_err(|e| LocalError::new(StatusCode::INTERNAL_SERVER_ERROR, api_codes::INTERNAL, e.to_string()))?;
+    let rel = craft_cloud_sync::RelPath::from_names(names);
+    let node =
+        saved.state.base_at(&rel).ok_or_else(|| LocalError::new(StatusCode::NOT_FOUND, api_codes::NOT_FOUND, "no synced file at that path"))?;
+    if !matches!(saved.state.base.get(&node).map(|entry| &entry.kind), Some(craft_cloud_sync::BaseKind::File { .. })) {
+        return Err(LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, "history is only available for files"));
+    }
+    Ok(node)
+}
+
+fn history_error(error: crate::http::HistoryCallError) -> LocalError {
+    match error {
+        crate::http::HistoryCallError::Refused { status: StatusCode::UNAUTHORIZED, body } => {
+            LocalError::new(StatusCode::CONFLICT, codes::NEEDS_YOU, body.message)
+        }
+        crate::http::HistoryCallError::Refused { status, body } => {
+            let name_taken = body
+                .conflicts
+                .as_ref()
+                .map(|conflicts| conflicts.iter().any(|conflict| matches!(conflict.kind, craft_cloud_proto::ConflictKind::NameTaken { .. })));
+            LocalError { status, code: body.error, message: body.message, name_taken, two_factor: None, retry_after_secs: None }
+        }
+        crate::http::HistoryCallError::Transport(craft_cloud_sync::TransportError::NotFound) => {
+            LocalError::new(StatusCode::NOT_FOUND, api_codes::NOT_FOUND, "no such file or version")
+        }
+        crate::http::HistoryCallError::Transport(craft_cloud_sync::TransportError::Unauthorized) => {
+            LocalError::new(StatusCode::CONFLICT, codes::NEEDS_YOU, "sign in again to continue")
+        }
+        crate::http::HistoryCallError::Transport(error) => AgentError::from(error).into(),
+    }
+}
+
+async fn file_history(
+    State(state): State<Api>,
+    query: Result<Query<HistoryQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<HistoryResponse>, LocalError> {
+    let Query(query) = query.map_err(|e| LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, e.body_text()))?;
+    let node = file_node(&state, &query.path)?;
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.file_history(node, query.cursor.as_deref(), query.limit).await.map_err(history_error)?))
+}
+
+async fn file_restore(
+    State(state): State<Api>,
+    body: Result<Json<craft_cloud_proto::local::RestoreRequest>, JsonRejection>,
+) -> Result<Json<RestoreResponse>, LocalError> {
+    let Json(request) = body?;
+    let node = file_node(&state, &request.path)?;
+    let (_, transport) = server_api(&state)?;
+    let answer = transport.restore_file(node, request.version, request.expected_version).await.map_err(history_error)?;
+    state.control.request_pass();
+    Ok(Json(answer))
+}
+
+#[derive(serde::Deserialize)]
+struct TrashQuery {
+    cursor: Option<String>,
+    limit: Option<u32>,
+}
+
+fn trash_path_hint(saved: Option<&crate::account::SavedState>, parent: craft_cloud_proto::NodeId, name: &str) -> Option<String> {
+    let saved = saved?;
+    let parent_path = saved.state.base_path(parent)?;
+    if parent_path.is_root() { Some(name.to_owned()) } else { Some(format!("{parent_path}/{name}")) }
+}
+
+async fn trash(
+    State(state): State<Api>,
+    query: Result<Query<TrashQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<craft_cloud_proto::local::TrashResponse>, LocalError> {
+    let Query(query) = query.map_err(|e| LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, e.body_text()))?;
+    let (_, transport) = server_api(&state)?;
+    let response = transport.trash(query.cursor.as_deref(), query.limit).await.map_err(history_error)?;
+    let saved = DataDir::new(&state.data).load_state().ok();
+    Ok(Json(craft_cloud_proto::local::TrashResponse {
+        items: response
+            .items
+            .into_iter()
+            .map(|item| craft_cloud_proto::local::TrashItem {
+                path: trash_path_hint(saved.as_ref(), item.parent, &item.name),
+                id: item.id,
+                parent: item.parent,
+                name: item.name,
+                is_dir: item.is_dir,
+                size: item.size,
+                deleted_ms: item.deleted_ms,
+                purge_after_ms: item.purge_after_ms,
+            })
+            .collect(),
+        next: response.next,
+    }))
+}
+
+async fn trash_restore(
+    State(state): State<Api>,
+    body: Result<Json<craft_cloud_proto::local::TrashNodeRequest>, JsonRejection>,
+) -> Result<Json<craft_cloud_proto::api::TrashRestoreResponse>, LocalError> {
+    let Json(request) = body?;
+    let id = request.id.parse().map_err(|_| LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, "id must be a node ID"))?;
+    let (_, transport) = server_api(&state)?;
+    let answer = transport.restore_from_trash(id).await.map_err(history_error)?;
+    state.control.request_pass();
+    Ok(Json(answer))
+}
+
+async fn trash_remove(
+    State(state): State<Api>,
+    body: Result<Json<craft_cloud_proto::local::TrashNodeRequest>, JsonRejection>,
+) -> Result<StatusCode, LocalError> {
+    let Json(request) = body?;
+    let id = request.id.parse().map_err(|_| LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, "id must be a node ID"))?;
+    let (_, transport) = server_api(&state)?;
+    transport.remove_from_trash(id).await.map_err(history_error)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Equal strings, compared in time that doesn't depend on where they differ.
@@ -406,6 +727,110 @@ async fn ask(state: &ApiState, make: impl FnOnce(oneshot::Sender<Result<(), Agen
 async fn login(State(state): State<Api>, body: Result<Json<LoginRequest>, JsonRejection>) -> Result<Json<Status>, LocalError> {
     let Json(request) = body?;
     ask(&state, |reply| Command::Login(request, reply)).await
+}
+
+/// Most bytes of the small bodies (a password, a code, a name): far less than a join string's megabyte.
+const TINY_JSON_BYTES: usize = 4 * 1024;
+
+async fn login_second_factor(
+    State(state): State<Api>,
+    body: Result<Json<SecondFactorLoginRequest>, JsonRejection>,
+) -> Result<Json<Status>, LocalError> {
+    let Json(request) = body?;
+    ask(&state, |reply| Command::LoginSecondFactor(request, reply)).await
+}
+
+/// A call of the signed-in account to the server, its refusals kept whole: never mistaken for a revoked device.
+fn account_call_error(e: crate::http::CallError) -> LocalError {
+    AgentError::from(e).into()
+}
+
+async fn two_factor_status(State(state): State<Api>) -> Result<Json<TwoFactorStatus>, LocalError> {
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.two_factor_status().await.map_err(account_call_error)?))
+}
+
+async fn two_factor_setup(
+    State(state): State<Api>,
+    body: Result<Json<PasswordRequest>, JsonRejection>,
+) -> Result<Json<TwoFactorSetupResponse>, LocalError> {
+    let Json(request) = body?;
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.two_factor_setup(&request.password).await.map_err(account_call_error)?))
+}
+
+async fn two_factor_confirm(State(state): State<Api>, body: Result<Json<TotpRequest>, JsonRejection>) -> Result<Json<RecoveryCodes>, LocalError> {
+    let Json(request) = body?;
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.two_factor_confirm(&request.totp_code).await.map_err(account_call_error)?))
+}
+
+async fn two_factor_disable(State(state): State<Api>, body: Result<Json<TwoFactorProofRequest>, JsonRejection>) -> Result<StatusCode, LocalError> {
+    let Json(request) = body?;
+    let (_, transport) = server_api(&state)?;
+    transport
+        .two_factor_disable(&craft_cloud_proto::api::TwoFactorProofRequest {
+            password: request.password,
+            totp_code: request.totp_code,
+            recovery_code: request.recovery_code,
+        })
+        .await
+        .map_err(account_call_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn two_factor_recovery_codes(
+    State(state): State<Api>,
+    body: Result<Json<TwoFactorProofRequest>, JsonRejection>,
+) -> Result<Json<RecoveryCodes>, LocalError> {
+    let Json(request) = body?;
+    let (_, transport) = server_api(&state)?;
+    let sent = craft_cloud_proto::api::TwoFactorProofRequest {
+        password: request.password,
+        totp_code: request.totp_code,
+        recovery_code: request.recovery_code,
+    };
+    Ok(Json(transport.two_factor_recovery_codes(&sent).await.map_err(account_call_error)?))
+}
+
+async fn change_password(State(state): State<Api>, body: Result<Json<ChangePasswordRequest>, JsonRejection>) -> Result<StatusCode, LocalError> {
+    let Json(request) = body?;
+    let (_, transport) = server_api(&state)?;
+    let sent = craft_cloud_proto::api::ChangePasswordRequest { current_password: request.current_password, new_password: request.new_password };
+    transport.change_password(&sent).await.map_err(account_call_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn revoke_other_devices(State(state): State<Api>) -> Result<Json<RevokedOthers>, LocalError> {
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.revoke_other_devices().await.map_err(account_call_error)?))
+}
+
+async fn rename_device(
+    State(state): State<Api>,
+    id: Result<Path<DeviceId>, PathRejection>,
+    body: Result<Json<RenameDeviceRequest>, JsonRejection>,
+) -> Result<Json<DeviceInfo>, LocalError> {
+    let id = path_id(id)?;
+    let Json(request) = body?;
+    let (_, transport) = server_api(&state)?;
+    let renamed = transport.rename_device(id, &request.name).await.map_err(|e| match e {
+        // A device that isn't there (or isn't ours, or is signed out): the server's `not_found`.
+        crate::http::CallError::Transport(craft_cloud_sync::TransportError::NotFound) => {
+            LocalError::new(StatusCode::NOT_FOUND, api_codes::NOT_FOUND, "no such computer in this cloud")
+        }
+        other => account_call_error(other),
+    })?;
+    // The server has the new name. This computer's own name is kept here too (the agent owns the saved account), so the
+    // status and the hub say the same. A rename of another computer changes nothing here.
+    if state.control.account().is_some_and(|account| account.device == renamed.id) {
+        let (tx, rx) = oneshot::channel();
+        // An agent that is stopping has nothing left to update.
+        if state.control.commands.send(Command::RenameDevice(renamed.id, renamed.name.clone(), tx)).await.is_ok() {
+            let _ = rx.await;
+        }
+    }
+    Ok(Json(renamed))
 }
 
 async fn logout(State(state): State<Api>, body: Result<Json<LogoutRequest>, JsonRejection>) -> Result<Json<Status>, LocalError> {
@@ -475,14 +900,14 @@ async fn join(State(state): State<Api>, body: Result<Json<JoinRequest>, JsonReje
 }
 
 /// The signed-in account's server API, for the calls the local API makes itself (they touch nothing here).
-fn server_api(state: &ApiState) -> Result<(Account, HttpTransport), LocalError> {
+pub(crate) fn server_api(state: &ApiState) -> Result<(Account, HttpTransport), LocalError> {
     let account = state.control.account().ok_or(AgentError::NotSignedIn)?;
     let transport = HttpTransport::new(account.server.clone(), &account.token).map_err(AgentError::from)?;
     Ok((account, transport))
 }
 
 /// A path's ID, or `400 invalid`.
-fn path_id<T>(id: Result<Path<T>, PathRejection>) -> Result<T, LocalError> {
+pub(crate) fn path_id<T>(id: Result<Path<T>, PathRejection>) -> Result<T, LocalError> {
     id.map(|Path(id)| id).map_err(|e| LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, e.body_text()))
 }
 
@@ -526,6 +951,44 @@ async fn devices(State(state): State<Api>) -> Result<Json<Vec<DeviceInfo>>, Loca
     Ok(Json(transport.devices().await.map_err(AgentError::from)?))
 }
 
+/// `GET /v1/usage`: asks the signed-in account's server each time; nothing is cached.
+async fn usage(State(state): State<Api>) -> Result<Json<AccountUsage>, LocalError> {
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.usage().await.map_err(AgentError::from)?))
+}
+
+/// The saved sync state, read off the async threads. The state file is replaced atomically and read without any lock, so
+/// this never waits for a pass.
+async fn saved_state(state: &ApiState) -> Result<crate::account::SavedState, LocalError> {
+    let data = DataDir::new(&state.data);
+    tokio::task::spawn_blocking(move || data.load_state())
+        .await
+        .map_err(|e| LocalError::new(StatusCode::INTERNAL_SERVER_ERROR, api_codes::INTERNAL, e.to_string()))?
+        .map_err(|e| LocalError::new(StatusCode::INTERNAL_SERVER_ERROR, api_codes::INTERNAL, e.to_string()))
+}
+
+/// `GET /v1/conflicts`: the conflict copies in the synced folder, from the saved state. Signed out is `409 not_signed_in`,
+/// as for the other calls about the account's files.
+async fn conflicts(State(state): State<Api>) -> Result<Json<ConflictsResponse>, LocalError> {
+    state.control.account().ok_or(AgentError::NotSignedIn)?;
+    let saved = saved_state(&state).await?;
+    let list = tokio::task::spawn_blocking(move || crate::local_state::conflicts(&saved))
+        .await
+        .map_err(|e| LocalError::new(StatusCode::INTERNAL_SERVER_ERROR, api_codes::INTERNAL, e.to_string()))?;
+    Ok(Json(list))
+}
+
+/// `GET /v1/usage/folders`: local logical bytes by top-level folder and kind, from the saved state (not the server's
+/// stored bytes, which are `GET /v1/usage`).
+async fn usage_folders(State(state): State<Api>) -> Result<Json<FolderUsageResponse>, LocalError> {
+    state.control.account().ok_or(AgentError::NotSignedIn)?;
+    let saved = saved_state(&state).await?;
+    let usage = tokio::task::spawn_blocking(move || crate::local_state::folder_usage(&saved))
+        .await
+        .map_err(|e| LocalError::new(StatusCode::INTERNAL_SERVER_ERROR, api_codes::INTERNAL, e.to_string()))?;
+    Ok(Json(usage))
+}
+
 /// Removes (revokes) another computer of the account; answered with the list as it is then. This computer can't be
 /// removed this way: that is signing out.
 async fn remove_device(State(state): State<Api>, id: Result<Path<DeviceId>, PathRejection>) -> Result<Json<Vec<DeviceInfo>>, LocalError> {
@@ -539,6 +1002,154 @@ async fn remove_device(State(state): State<Api>, id: Result<Path<DeviceId>, Path
         other => AgentError::from(other).into(),
     })?;
     Ok(Json(transport.devices().await.map_err(AgentError::from)?))
+}
+
+/// The personal space as `GET /v1/spaces` lists it: always syncing (to the account's folder), the account its owner.
+fn personal_space(control: &Control, account: &Account) -> SpaceInfo {
+    let status = control.status();
+    SpaceInfo {
+        space: account.space,
+        kind: "personal".into(),
+        name: None,
+        role: craft_cloud_proto::api::SpaceRole::Owner,
+        state: "active".into(),
+        archived: false,
+        folder: Some(account.folder.display().to_string()),
+        sync: SpaceSync::On,
+        run_state: Some(match status.run_state {
+            RunState::Retrying { message } => SpaceRun::Retrying { message },
+            RunState::Paused { reason, reason_code } => SpaceRun::Paused { reason, reason_code },
+            RunState::PausedByUser => SpaceRun::PausedByUser,
+            RunState::Syncing => SpaceRun::Syncing,
+            RunState::SignedOut | RunState::Idle | RunState::Stopping => SpaceRun::Idle,
+        }),
+        last_sync_ms: status.last_sync_ms,
+        read_only: false,
+    }
+}
+
+/// `GET /v1/spaces`: the personal space, then the team spaces (invitations among them) as the agent last saw the server's list.
+async fn spaces(State(state): State<Api>) -> Result<Json<SpaceList>, LocalError> {
+    let account = state.control.account().ok_or(AgentError::NotSignedIn)?;
+    let mut list = vec![personal_space(&state.control, &account)];
+    list.extend(state.control.with(|s| s.spaces.clone()));
+    Ok(Json(SpaceList { spaces: list }))
+}
+
+/// `POST /v1/spaces/from-folder`: makes a team space from a folder (see [`crate::from_folder`]).
+async fn from_folder(State(state): State<Api>, body: Result<Json<FromFolderRequest>, JsonRejection>) -> Result<Json<FromFolderStatus>, LocalError> {
+    let Json(request) = body?;
+    let start = crate::from_folder::Start { control: state.control.clone(), data: DataDir::new(&state.data) };
+    Ok(Json(crate::from_folder::start(start, request).await?))
+}
+
+/// `POST /v1/spaces/{id}/accept`: passed on to the server; the agent looks at its list again before it answers.
+async fn accept_space(
+    State(state): State<Api>,
+    id: Result<Path<craft_cloud_proto::SpaceId>, PathRejection>,
+) -> Result<Json<craft_cloud_proto::api::SpaceListItem>, LocalError> {
+    let id = path_id(id)?;
+    let (_, transport) = server_api(&state)?;
+    let accepted = transport.accept_space(id).await?;
+    if let Some(spaces) = state.control.spaces_handle() {
+        spaces.refresh().await;
+    }
+    Ok(Json(accepted))
+}
+
+/// `POST /v1/spaces/{id}/decline`: passed on to the server.
+async fn decline_space(State(state): State<Api>, id: Result<Path<craft_cloud_proto::SpaceId>, PathRejection>) -> Result<StatusCode, LocalError> {
+    let id = path_id(id)?;
+    let (_, transport) = server_api(&state)?;
+    transport.decline_space(id).await?;
+    if let Some(spaces) = state.control.spaces_handle() {
+        spaces.refresh().await;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /v1/spaces/{id}/sync`: turns the sync of a team space on this computer on or off.
+async fn sync_space(
+    State(state): State<Api>,
+    id: Result<Path<craft_cloud_proto::SpaceId>, PathRejection>,
+    body: Result<Json<SpaceSyncRequest>, JsonRejection>,
+) -> Result<Json<SpaceInfo>, LocalError> {
+    let id = path_id(id)?;
+    let Json(request) = body?;
+    let spaces = state.control.spaces_handle().ok_or(AgentError::NotSignedIn)?;
+    Ok(Json(spaces.sync(id, request).await?))
+}
+
+/// `POST /v1/spaces/{id}/approve-deletes`: hands the approval of a synced team space's waiting deletions to this agent
+/// (`spaces/<id>/approval.json`), by the rules of `sync --approve-deletes --space`: with a `set`, that set if it is the
+/// one waiting; without, the set the previous call listed.
+async fn approve_space_deletes(
+    State(state): State<Api>,
+    id: Result<Path<craft_cloud_proto::SpaceId>, PathRejection>,
+    body: Result<Json<ApproveDeletesRequest>, JsonRejection>,
+) -> Result<Json<ApproveDeletesAnswer>, LocalError> {
+    let id = path_id(id)?;
+    let Json(request) = body?;
+    let approve = match request.set.as_deref().map(str::trim) {
+        None => crate::cli::Approve::Listed,
+        Some("") => {
+            return Err(LocalError::new(
+                StatusCode::BAD_REQUEST,
+                api_codes::INVALID,
+                "the set is empty; leave it out to approve the set last listed",
+            ));
+        }
+        Some(set) => crate::cli::Approve::Set(set.to_ascii_lowercase()),
+    };
+    let data = DataDir::new(&state.data);
+    let answer = tokio::task::spawn_blocking(move || {
+        let account = data.load_account()?.ok_or(AgentError::NotSignedIn)?;
+        let setting = account.spaces.iter().find(|s| s.space == id && s.sync);
+        let Some(setting) = setting else { return Ok(None) };
+        let mut out = Vec::new();
+        let (_, summary, approved) = crate::cli::approve_team(&data, setting, &approve, &mut out)?;
+        Ok::<_, AgentError>(Some(held_answer(&summary, approved, String::from_utf8_lossy(&out).trim())))
+    })
+    .await
+    .map_err(|e| LocalError::new(StatusCode::INTERNAL_SERVER_ERROR, api_codes::INTERNAL, e.to_string()))??;
+    answer.map(Json).ok_or_else(|| LocalError::new(StatusCode::NOT_FOUND, api_codes::NOT_FOUND, "no such team space syncing on this computer"))
+}
+
+/// The answer to an approve-deletes call from what the pass last found: the waiting set with its paths (the first
+/// [`MAX_HELD_ENTRIES`], at most [`MAX_HELD_BYTES`] of paths), the deletions held behind a link, and the command line's words.
+pub(crate) fn held_answer(summary: &crate::account::PassSummary, approved: bool, words: &str) -> ApproveDeletesAnswer {
+    use craft_cloud_proto::local::{HeldEntry, HeldLink, MAX_HELD_BYTES, MAX_HELD_ENTRIES};
+    let all = summary.pending_deletes.iter().map(|p| (p, "server")).chain(summary.pending_local_deletes.iter().map(|p| (p, "here")));
+    let (mut entries, mut bytes, mut total) = (Vec::new(), 0usize, 0u64);
+    for (path, side) in all {
+        total += 1;
+        if entries.len() < MAX_HELD_ENTRIES && bytes.saturating_add(path.len()) <= MAX_HELD_BYTES {
+            bytes += path.len();
+            entries.push(HeldEntry { path: path.clone(), side: side.to_owned() });
+        }
+    }
+    let truncated = (entries.len() as u64) < total;
+    let held_total = summary.held_deletes.len() as u64;
+    let held: Vec<HeldLink> = summary
+        .held_deletes
+        .iter()
+        .take(100)
+        .map(|(path, links)| HeldLink { path: path.clone(), links: links.iter().take(5).cloned().collect() })
+        .collect();
+    // The words are for the command line; an app reads the fields above.
+    let mut message = words.to_owned();
+    if message.len() > 16 * 1024 {
+        let mut end = 16 * 1024;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+        message.push_str(
+            "
+…",
+        );
+    }
+    ApproveDeletesAnswer { approved, message, set: summary.pending_set(), total, truncated, entries, held_set: summary.held_set(), held_total, held }
 }
 
 /// Registers this agent to start at login, or removes the entry; the status after says which.
@@ -579,6 +1190,37 @@ async fn quit(State(state): State<Api>) -> Result<Json<Status>, LocalError> {
 mod tests {
     use super::*;
 
+    /// The answer to a look at held deletions lists up to the cap, counts them all, names the set and says it was cut; the
+    /// words are cut too, and a short list is whole.
+    #[test]
+    fn a_held_answer_is_capped_counted_and_names_its_set() {
+        use crate::account::PassSummary;
+        let many = PassSummary {
+            pending_deletes: (0..1500).map(|n| format!("Shots/{n:05}.psd")).collect(),
+            pending_local_deletes: (0..1000).map(|n| format!("Local/{n:05}.txt")).collect(),
+            held_deletes: vec![("Linked/a.txt".into(), vec!["Links/one".into(), "Links/two".into()])],
+            ..PassSummary::default()
+        };
+        let words = "x".repeat(40_000);
+        let answer = held_answer(&many, false, &words);
+        assert_eq!((answer.total, answer.entries.len(), answer.truncated), (2500, 1000, true));
+        assert!(answer.entries.iter().all(|e| e.side == "server"), "the first 1000 are the server's");
+        assert!(answer.set.as_deref().is_some_and(|s| s.len() == 12), "{:?}", answer.set);
+        assert!(answer.message.len() < 17 * 1024 && answer.message.ends_with('…'));
+        assert_eq!((answer.held_total, answer.held.len()), (1, 1));
+        assert!(serde_json::to_vec(&answer).unwrap().len() < 200 * 1024, "far under the local API's limit");
+        let few = PassSummary { pending_deletes: vec!["a".into()], pending_local_deletes: vec!["b".into()], ..PassSummary::default() };
+        let answer = held_answer(&few, true, "ok");
+        assert_eq!((answer.approved, answer.total, answer.truncated, answer.entries.len()), (true, 2, false, 2));
+        assert_eq!(answer.entries.iter().map(|e| e.side.as_str()).collect::<Vec<_>>(), ["server", "here"]);
+        let none = held_answer(&PassSummary::default(), false, "nothing was waiting for approval");
+        assert_eq!((none.set, none.total, none.held_total), (None, 0, 0));
+        // The bytes of paths are capped too.
+        let long = PassSummary { pending_deletes: (0..400).map(|n| format!("{n:04}{}", "d".repeat(4000))).collect(), ..PassSummary::default() };
+        let answer = held_answer(&long, false, "");
+        assert!(answer.truncated && answer.entries.len() < 400 && answer.total == 400);
+    }
+
     #[test]
     fn secrets_compare_whole() {
         assert!(same_secret("abc", "abc"));
@@ -596,6 +1238,7 @@ mod tests {
         assert_eq!(code(AgentError::LogoutOffline("x".into())), codes::OFFLINE);
         assert_eq!(code(AgentError::Usage("already signed in as ana".into())), codes::ALREADY_SIGNED_IN);
         assert_eq!(code(AgentError::Usage("not a URL".into())), api_codes::INVALID);
+        assert_eq!(code(AgentError::Usage(crate::spaces::CHANGING.into())), codes::CONFLICT);
         assert_eq!(code(AgentError::Revoked), codes::NEEDS_YOU);
         assert_eq!(code(AgentError::InvalidCode), codes::INVALID_CODE);
         assert_eq!(code(AgentError::PasswordRequired), codes::PASSWORD_REQUIRED);

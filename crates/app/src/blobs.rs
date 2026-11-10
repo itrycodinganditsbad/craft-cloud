@@ -28,7 +28,7 @@ pub struct Blobs {
 
 /// What an agent from before blobs answers.
 fn not_found() -> Error {
-    Error::Refused { code: craft_cloud_api::api::codes::NOT_FOUND.into(), message: "no such call".into() }
+    Error::Refused { code: craft_cloud_api::api::codes::NOT_FOUND.into(), message: "no such call".into(), name_taken: None }
 }
 
 /// An older agent's "no such call" as [`codes::AGENT_TOO_OLD`].
@@ -37,6 +37,7 @@ fn too_old(e: Error) -> Error {
         Error::Refused { code, .. } if code == craft_cloud_api::api::codes::NOT_FOUND => Error::Refused {
             code: codes::AGENT_TOO_OLD.into(),
             message: "the Craft Cloud agent on this computer is too old for binary content in live documents: update Craft Cloud".into(),
+            name_taken: None,
         },
         other => other,
     }
@@ -69,7 +70,11 @@ impl Blobs {
     /// agent too old for blobs is found out before a byte of them is sent ([`codes::AGENT_TOO_OLD`]).
     pub fn put(&self, bytes: &[u8]) -> Result<Stored, Error> {
         if bytes.is_empty() || bytes.len() > MAX_BLOB_BYTES {
-            return Err(Error::Refused { code: "too_large".into(), message: format!("a blob is 1 byte to {MAX_BLOB_BYTES} bytes") });
+            return Err(Error::Refused {
+                code: "too_large".into(),
+                message: format!("a blob is 1 byte to {MAX_BLOB_BYTES} bytes"),
+                name_taken: None,
+            });
         }
         self.check_agent()?;
         let answer =
