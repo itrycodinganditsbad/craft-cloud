@@ -39,7 +39,7 @@ use craft_cloud_chunker::{Chunker, FASTCDC_V1, chunk_reader};
 use craft_cloud_proto::api::{AdminCreateSpace, AdminSpaceInfo};
 use craft_cloud_proto::local::{FromFolderRequest, FromFolderStatus, FromFolderStep, SpaceRun, SpaceSyncRequest};
 use craft_cloud_proto::{ChunkId, ChunkRef, ChunkerParamsId, FileHash, Manifest, ManifestId, Name, NodeId, SpaceId, SpaceName};
-use craft_cloud_sync::Transport;
+use craft_cloud_sync::{Transport, TransportError};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 
@@ -154,18 +154,41 @@ fn read_journal(data: &DataDir, personal: SpaceId) -> Option<FromFolderStatus> {
     read_saved(data, personal).map(|j| j.status)
 }
 
-/// Writes the journal, keeping the start time it has.
+/// Writes the journal, keeping the start time it has. A failure is only noted in the log: for the places that report what already
+/// happened (the start of the agent, the end of a failed job). Work that is about to do something that cannot be undone uses
+/// [`save_journal`] and stops when it fails.
 fn write_journal(data: &DataDir, personal: SpaceId, status: &FromFolderStatus) {
+    if let Err(e) = save_journal(data, personal, status) {
+        crate::runlog::note(format_args!("can't write the journal of making a team space from a folder: {e}"));
+    }
+}
+
+/// [`write_journal`], returning the failure.
+fn save_journal(data: &DataDir, personal: SpaceId, status: &FromFolderStatus) -> io::Result<()> {
     let started_ms = read_saved(data, personal).and_then(|j| j.started_ms);
-    write_journal_started(data, personal, status, started_ms);
+    save_journal_started(data, personal, status, started_ms)
+}
+
+fn save_journal_started(data: &DataDir, personal: SpaceId, status: &FromFolderStatus, started_ms: Option<i64>) -> io::Result<()> {
+    if hook::journal_fails(data.path(), status.step) {
+        return Err(io::Error::other("the journal cannot be written (test)"));
+    }
+    let journal = Journal { schema: JOURNAL_SCHEMA, personal, status: status.clone(), started_ms };
+    let json = serde_json::to_vec_pretty(&journal).map_err(io::Error::other)?;
+    write_atomic(&journal_path(data), &json, true)
 }
 
 fn write_journal_started(data: &DataDir, personal: SpaceId, status: &FromFolderStatus, started_ms: Option<i64>) {
-    let journal = Journal { schema: JOURNAL_SCHEMA, personal, status: status.clone(), started_ms };
-    let result = serde_json::to_vec_pretty(&journal).map_err(io::Error::other).and_then(|json| write_atomic(&journal_path(data), &json, true));
-    if let Err(e) = result {
+    if let Err(e) = save_journal_started(data, personal, status, started_ms) {
         crate::runlog::note(format_args!("can't write the journal of making a team space from a folder: {e}"));
     }
+}
+
+/// What the person is told when the journal cannot be written: nothing that cannot be undone is done without it.
+fn journal_words(e: &io::Error) -> String {
+    format!(
+        "The record of this work could not be written ({e}), so nothing more was done. Free some space or fix the permissions of the          agent's data folder, then ask again."
+    )
 }
 
 /// Test hooks: stop at a step, or fail at it, for the agent whose data folder is named. Not used outside tests.
@@ -316,6 +339,21 @@ pub mod hook {
 
     pub(super) fn lose_unsaved(data: &Path) -> bool {
         LOSES.lock().unwrap_or_else(PoisonError::into_inner).iter().any(|path| path == data)
+    }
+
+    static JOURNALS: Mutex<Vec<(PathBuf, FromFolderStep)>> = Mutex::new(Vec::new());
+
+    /// Makes every write of the journal fail while the status is at `step` (or ends it with `None`), as a full or unwritable disk does.
+    pub fn set_journal_error(data: &Path, step: Option<FromFolderStep>) {
+        let mut journals = JOURNALS.lock().unwrap_or_else(PoisonError::into_inner);
+        journals.retain(|(path, _)| path != data);
+        if let Some(step) = step {
+            journals.push((data.to_owned(), step));
+        }
+    }
+
+    pub(super) fn journal_fails(data: &Path, at: FromFolderStep) -> bool {
+        JOURNALS.lock().unwrap_or_else(PoisonError::into_inner).iter().any(|(path, step)| path == data && *step == at)
     }
 
     static LINKS: Mutex<Vec<(PathBuf, io::ErrorKind)>> = Mutex::new(Vec::new());
@@ -605,8 +643,18 @@ pub(crate) async fn start(start: Start, request: FromFolderRequest) -> Result<Fr
         if !control.begin_from_folder(status.clone()) {
             return Err(busy());
         }
-        write_journal_started(&data, account.space, &status, started);
-        let created = create_space(&transport, &name, &request).await;
+        // The journal first: it is what a crash or a lost answer is found again by. Without it nothing is made on the server.
+        if let Err(e) = save_journal_started(&data, account.space, &status, started) {
+            control.set_from_folder(before);
+            crate::runlog::note(format_args!("can't write the journal of making a team space from a folder: {e}"));
+            return Err(journal_error(&e));
+        }
+        // An earlier try that may have made the space (it crashed, or its answer never came) is looked for before another is asked for.
+        let earlier = if crashed_creating { find_empty_own_space(&transport, &name, started_before).await } else { None };
+        let created = match earlier {
+            Some(space) => Ok(Created::Found(space)),
+            None => create_space(&transport, &name, &request).await.map(|c| Created::Made(c.id)),
+        };
         hold_at(&data, FromFolderStep::Creating, &alive).await;
         // The session ended while the server was asked: nothing of this call is written under the next one. (A space the
         // server made stays, and a journal of this account is found again, or dropped, by the next start.)
@@ -614,20 +662,38 @@ pub(crate) async fn start(start: Start, request: FromFolderRequest) -> Result<Fr
             return Err(ended());
         }
         match created {
-            Ok(created) => status.space = Some(created.id),
+            Ok(Created::Found(id) | Created::Made(id)) => status.space = Some(id),
             // A crash between the server's answer and the journal left a space of this name: it is ours only if the server made it
             // after that call started, has this account as its only member (as its owner) and holds nothing.
-            Err(e) if crashed_creating && is_name_taken(&e) => match find_empty_own_space(&transport, &name, started_before).await {
-                Some(space) => status.space = Some(space),
-                None => {
-                    if !alive() {
-                        return Err(ended());
+            Err(CreateFailed { error: e, .. }) if crashed_creating && is_name_taken(&e) => {
+                match find_empty_own_space(&transport, &name, started_before).await {
+                    Some(space) => status.space = Some(space),
+                    None => {
+                        if !alive() {
+                            return Err(ended());
+                        }
+                        give_back(&control, &data, account.space, before, started_before);
+                        return Err(e.into());
                     }
-                    give_back(&control, &data, account.space, before, started_before);
-                    return Err(e.into());
                 }
-            },
-            Err(e) => {
+            }
+            // The request went out and no answer came: the server may have made the space. The journal stays at Creating (the
+            // time kept in it is what the next try recognises the space by), and the next try looks for the space first.
+            Err(CreateFailed { error: e, sent: true }) if is_ambiguous(&e) => {
+                let mut ambiguous = status.clone();
+                ambiguous.step = FromFolderStep::Failed;
+                ambiguous.failed_at = Some(FromFolderStep::Creating);
+                ambiguous.message = Some(
+                    "The server did not answer in time, so it is not known whether it made the team space. Nothing was changed in your old                      folder. Ask again with the same folder and name: the agent looks for the space first."
+                        .to_owned(),
+                );
+                write_journal_started(&data, account.space, &ambiguous, started);
+                control.set_from_folder(Some(ambiguous.clone()));
+                let mut error = LocalError::from(AgentError::from(e));
+                error.message = format!("{} ({})", ambiguous.message.unwrap_or_default(), error.message);
+                return Err(error);
+            }
+            Err(CreateFailed { error: e, .. }) => {
                 // Nothing exists: the status (and the journal) of an earlier try is as it was.
                 give_back(&control, &data, account.space, before, started_before);
                 return Err(e.into());
@@ -640,7 +706,16 @@ pub(crate) async fn start(start: Start, request: FromFolderRequest) -> Result<Fr
         return Err(busy());
     }
     status.step = FromFolderStep::SettingUp;
-    write_journal(&data, account.space, &status);
+    if let Err(e) = save_journal(&data, account.space, &status) {
+        // The space exists (it is reported, never deleted), but nothing is copied without a record of it: the journal still says
+        // that the call was making it, which the next try finds the space by.
+        crate::runlog::note(format_args!("can't write the journal of making a team space from a folder: {e}"));
+        status.step = FromFolderStep::Failed;
+        status.failed_at = Some(FromFolderStep::Creating);
+        status.message = Some(journal_words(&e));
+        control.set_from_folder(Some(status));
+        return Err(journal_error(&e));
+    }
     control.set_from_folder(Some(status.clone()));
     let cancel = Arc::new(AtomicBool::new(false));
     let job = Job { control: control.clone(), data, account, spaces, status: status.clone(), scan, cancel: cancel.clone() };
@@ -671,10 +746,33 @@ fn give_back(control: &Control, data: &DataDir, personal: SpaceId, before: Optio
     control.set_from_folder(before);
 }
 
-async fn create_space(transport: &HttpTransport, name: &SpaceName, request: &FromFolderRequest) -> Result<AdminSpaceInfo, CallError> {
-    let me = transport.account_info().await?.user_id;
+/// How the space came to be known to a call.
+enum Created {
+    /// The server made it for this call.
+    Made(SpaceId),
+    /// An earlier try made it.
+    Found(SpaceId),
+}
+
+/// A creation that did not succeed: `sent` says whether the request that makes the space went out (before it, nothing can exist).
+struct CreateFailed {
+    error: CallError,
+    sent: bool,
+}
+
+/// Whether a call that went out failed without the server's answer: it may have done what was asked.
+fn is_ambiguous(e: &CallError) -> bool {
+    matches!(e, CallError::Transport(TransportError::Unavailable(_) | TransportError::Protocol(_)))
+}
+
+fn journal_error(e: &io::Error) -> LocalError {
+    LocalError::new(axum::http::StatusCode::INTERNAL_SERVER_ERROR, craft_cloud_proto::api::codes::INTERNAL, journal_words(e))
+}
+
+async fn create_space(transport: &HttpTransport, name: &SpaceName, request: &FromFolderRequest) -> Result<AdminSpaceInfo, CreateFailed> {
+    let me = transport.account_info().await.map_err(|error| CreateFailed { error, sent: false })?.user_id;
     let body = AdminCreateSpace { name: name.as_str().to_owned(), owner: me, quota_bytes: request.quota_bytes, confirm: request.confirm.clone() };
-    transport.admin_json(Method::POST, "admin/spaces", &body).await
+    transport.admin_json(Method::POST, "admin/spaces", &body).await.map_err(|error| CreateFailed { error, sent: true })
 }
 
 fn is_name_taken(e: &CallError) -> bool {
@@ -960,14 +1058,28 @@ impl Job {
         self.control.set_from_folder(Some(self.status.clone()));
     }
 
-    fn step(&mut self, step: FromFolderStep) {
+    /// [`Job::publish`] with the journal, and the failure to write it ends the job: nothing that cannot be undone follows a step the
+    /// journal does not know. (A job whose session has ended writes nothing and goes on to see that.)
+    fn checkpoint(&self) -> Result<(), Stop> {
+        if self.cancel.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if let Err(e) = save_journal(&self.data, self.account.space, &self.status) {
+            crate::runlog::note(format_args!("can't write the journal of making a team space from a folder: {e}"));
+            return Err(Stop::Failed(journal_words(&e)));
+        }
+        self.control.set_from_folder(Some(self.status.clone()));
+        Ok(())
+    }
+
+    fn step(&mut self, step: FromFolderStep) -> Result<(), Stop> {
         self.status.step = step;
         self.status.done = 0;
         self.status.total = match step {
             FromFolderStep::Copying | FromFolderStep::Syncing | FromFolderStep::Verifying | FromFolderStep::Trashing => self.scan.files.len() as u64,
             _ => 0,
         };
-        self.publish(true);
+        self.checkpoint()
     }
 
     /// The test hooks, and the session ending, at the start of a step.
@@ -1003,13 +1115,13 @@ impl Job {
         let team_folder = self.set_up(space).await?;
         let mut last: Vec<Copied> = Vec::new();
         for round in 1..=ROUNDS {
-            self.step(FromFolderStep::Copying);
+            self.step(FromFolderStep::Copying)?;
             self.gate().await?;
             let copied = self.copy(&team_folder).await?;
-            self.step(FromFolderStep::Syncing);
+            self.step(FromFolderStep::Syncing)?;
             self.gate().await?;
             self.wait_for_server(space, &copied).await?;
-            self.step(FromFolderStep::Verifying);
+            self.step(FromFolderStep::Verifying)?;
             self.gate().await?;
             if self.verify(&copied).await? {
                 last = copied;
@@ -1021,7 +1133,7 @@ impl Job {
             // The folder changed meanwhile: copy it again (a rescan finds new files; copied ones are in place).
             self.rescan().await?;
         }
-        self.step(FromFolderStep::Trashing);
+        self.step(FromFolderStep::Trashing)?;
         self.gate().await?;
         self.trash(space, last).await?;
         Ok(())
@@ -1029,7 +1141,7 @@ impl Job {
 
     /// Step 3: the team folder and its sync, with claims allowed from the personal space.
     async fn set_up(&mut self, space: SpaceId) -> Result<PathBuf, Stop> {
-        self.step(FromFolderStep::SettingUp);
+        self.step(FromFolderStep::SettingUp)?;
         self.gate().await?;
         self.spaces.claim_from(space, Some(self.account.space));
         let deadline = Instant::now() + LISTED_WITHIN;
@@ -1047,7 +1159,7 @@ impl Job {
         let info = self.spaces.sync(space, SpaceSyncRequest { on: true, folder: None, adopt: false }).await.map_err(failed)?;
         let folder = info.folder.map(PathBuf::from).ok_or_else(|| failed("the agent did not say where the team space syncs"))?;
         self.status.team_folder = Some(folder.display().to_string());
-        self.publish(true);
+        self.checkpoint()?;
         Ok(folder)
     }
 
