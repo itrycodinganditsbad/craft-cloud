@@ -65,7 +65,7 @@ pub(super) fn show(ui: &mut egui::Ui, adding: &Adding, now_ms: i64, events: &mut
 
 /// `text` as a QR code `side` points wide: dark modules on white with the standard quiet zone, whatever the theme
 /// (cameras read it that way round).
-fn qr(ui: &mut egui::Ui, text: &str, side: f32) {
+pub(super) fn qr(ui: &mut egui::Ui, text: &str, side: f32) {
     let Ok(code) = QrCode::encode_text(text, QrCodeEcc::Medium) else {
         return;
     };

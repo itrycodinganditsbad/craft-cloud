@@ -49,8 +49,23 @@ impl Backend for CountingBackend {
         self.inner.get_raw(path).await
     }
 
+    async fn get_raw_limited(&self, path: &str, max_bytes: usize) -> Result<Option<bytes::Bytes>, StoreError> {
+        if path.starts_with("chunks/") {
+            self.chunk_reads.fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner.get_raw_limited(path, max_bytes).await
+    }
+
+    async fn size_raw(&self, path: &str) -> Result<Option<u64>, StoreError> {
+        self.inner.size_raw(path).await
+    }
+
     async fn delete_raw(&self, path: &str) -> Result<(), StoreError> {
         self.inner.delete_raw(path).await
+    }
+
+    async fn list_raw(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<Vec<String>, StoreError> {
+        self.inner.list_raw(prefix, after, limit).await
     }
 }
 
@@ -161,6 +176,43 @@ async fn a_first_sync_goes_both_ways() {
     assert_eq!(a.read("from-b.txt").as_deref(), Some("hello"));
     assert!(a.path("Empty").is_dir(), "empty folders sync too");
     assert_eq!(a.files(), b.files());
+}
+
+/// Deleting a folder with files in it and restoring it from the trash: the folder and everything that was in the trash
+/// below it, also a file deleted on its own before, come back to the disk of both computers by their normal pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folder_restored_from_the_trash_comes_back_with_its_files() {
+    let server = server().await;
+    let a = Agent::signed_in(&server, "desktop").await;
+    a.write("dir1/child.txt", "deleted with the folder");
+    a.write("dir1/early.txt", "deleted first");
+    a.write("dir1/sub/deep.txt", "deep");
+    a.write("keep.txt", "stays");
+    assert_eq!(a.sync().await, Exit::Done);
+    let b = Agent::signed_in(&server, "laptop").await;
+    assert_eq!(b.sync().await, Exit::Done);
+    assert_eq!(b.files().len(), 4);
+
+    std::fs::remove_file(a.path("dir1/early.txt")).unwrap();
+    assert_eq!(a.sync().await, Exit::Done);
+    std::fs::remove_dir_all(a.path("dir1")).unwrap();
+    assert_eq!(a.sync().await, Exit::Done);
+    assert_eq!(b.sync().await, Exit::Done);
+    assert_eq!(a.files(), ["keep.txt"]);
+    assert_eq!(b.files(), ["keep.txt"]);
+
+    let ana = server.meta.user_by_name("ana").await.unwrap().unwrap();
+    let listed = server.meta.trash(ana.space, None, 200, 0).await.unwrap().entries;
+    assert_eq!(listed.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["dir1"], "the folder is listed alone");
+    let device = server.meta.list_devices(ana.id).await.unwrap().into_iter().find(|d| d.name == "desktop").unwrap().id;
+    server.meta.restore_from_trash(ana.space, device, listed[0].id, 0).await.unwrap();
+
+    for agent in [&a, &b] {
+        assert_eq!(agent.sync().await, Exit::Done);
+        assert_eq!(agent.files(), ["dir1/child.txt", "dir1/early.txt", "dir1/sub/deep.txt", "keep.txt"]);
+        assert_eq!(agent.read("dir1/sub/deep.txt").as_deref(), Some("deep"));
+        assert_eq!(agent.read("dir1/early.txt").as_deref(), Some("deleted first"));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -759,6 +811,39 @@ async fn a_failed_pass_keeps_the_deletes_the_user_was_shown() {
     a.data.save_account(&good).unwrap();
     let (exit, summary) = a.try_sync(true).await.unwrap();
     assert_eq!((exit, summary.removed_remotely), (Exit::Done, 12), "{summary:?}");
+}
+
+/// The agent tells the server what it is when it signs in and when it joins, so the account's device list shows it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn login_and_join_send_the_agents_device_details() {
+    use craft_cloud_agent::cli::JoinArgs;
+    use craft_cloud_proto::join::{Code, INVITE_CHARS, INVITE_TTL_MS, JoinString};
+    let server = server().await;
+    let ana = server.meta.user_by_name("ana").await.unwrap().unwrap();
+    async fn details(server: &Server, user: craft_cloud_meta::UserId, name: &str) -> (String, String, String) {
+        let devices = server.meta.list_devices(user).await.unwrap();
+        let device = devices.into_iter().find(|d| d.name == name).unwrap_or_else(|| panic!("no device {name}"));
+        (device.client.kind, device.client.platform, device.client.app_version)
+    }
+    let expected = ("agent".to_owned(), std::env::consts::OS.to_owned(), env!("CARGO_PKG_VERSION").to_owned());
+
+    let a = Agent::signed_in(&server, "desk").await;
+    assert_eq!(details(&server, ana.id, "desk").await, expected, "after login");
+    drop(a);
+
+    let invite = Code::generate(INVITE_CHARS).unwrap();
+    let now = i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()).unwrap();
+    server.meta.create_invite("ana", &invite.hash(), now, INVITE_TTL_MS).await.unwrap();
+    let b = Agent::new();
+    let args = JoinArgs {
+        join: JoinString::new(server.url.clone(), invite).link(),
+        folder: Some(b.folder.clone()),
+        device_name: Some("laptop".into()),
+        adopt: false,
+        autostart: false,
+    };
+    cli::join(&b.data, &args, None, &mut Vec::new()).await.unwrap();
+    assert_eq!(details(&server, ana.id, "laptop").await, expected, "after join");
 }
 
 #[cfg(unix)]
