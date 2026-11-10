@@ -9,6 +9,8 @@ pub mod audit;
 pub mod auth;
 #[cfg(feature = "sftp")]
 pub mod backup;
+#[cfg(feature = "sftp")]
+pub mod backup_auth;
 pub mod cli;
 pub mod config;
 pub mod error;

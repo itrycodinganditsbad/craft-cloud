@@ -550,6 +550,10 @@ sftp_host_key = "SHA256:…"               # the server's host key; or sftp_know
   error to the one request. Some providers allow only a few connections: lower `sftp_connections`.
 - `store estimate` and `store recompress` read every blob they look at over the network, and `recompress` writes it back:
   expect time and traffic. `store measure` asks for each object's size with one request. `verify` reads every chunk.
+- **A file server that lists too much is stopped.** A listing is bounded while it is read: more than a million entries in
+  one directory, names that add up to more than 64 MiB, a batch that repeats a name, or directories nested deeper than 16
+  levels (the layout needs four) end the operation with an error, so a broken or hostile server cannot make the process
+  use all its memory by never ending a listing.
 - The setting `min_free` is not offered for SFTP, and the server does not refuse uploads when the remote directory is
   full: the file server's own refusal comes back as an error.
 
@@ -567,12 +571,14 @@ craft-cloud-server backup --config /var/lib/craft-cloud/config.toml \
 - **What it copies.** First a consistent copy of the SQLite database (taken in one transaction with `VACUUM INTO`, so
   writes during the backup do not tear it), then every blob the backup server does not have yet. Blobs never change, so
   a repeated backup sends only what is new; a name that is already there is skipped (a blob that was damaged *there* is
-  not repaired by a repeat: check the copy with `restore` into a scratch directory and `verify`). Last, a
-  `manifest.json` with the date, the server's version, the database's hash and the counts. A backup without its
-  manifest is not offered by `restore`. The blobs are read through the store, so each is checked against its ID on the
+  not repaired by a repeat: check the copy with `restore` into a scratch directory and `verify`). The dump is sealed
+  (AES-256-GCM) before it leaves the machine. Last, `inventory.txt` (every blob of the backup, with its size) and a
+  `manifest.json` with the date, the server's version, the hashes and sizes of the dump and the inventory, and the counts,
+  carrying a MAC. A backup without its manifest is not offered by `restore`. The blobs are read through the store, so each is checked against its ID on the
   way; a blob that cannot be read stops the backup with an error that names it.
 - **Where.** `sftp://user@host[:port]/directory` (`/~/directory` for one in the account's home). Below it:
-  `chunks/` and `manifests/` as in the store, and `generations/<UTC stamp>-<id>/` with the dump (`meta.sqlite`) and the manifest.
+  `chunks/` and `manifests/` as in the store, and `generations/<UTC stamp>-<id>/` with the sealed dump (`meta.sqlite.enc`),
+  `inventory.txt` and the manifest.
   `--keep N` (default 7) keeps the newest N complete database generations and removes older ones; blobs are never removed.
   A generation is named by the second its backup began in and a random id, so backups that run at once, or in the same
   second, each write into a directory of their own and cannot damage each other's dump or manifest. Pruning happens after
@@ -589,12 +595,27 @@ craft-cloud-server backup --config /var/lib/craft-cloud/config.toml \
   key_file = "backup-key"
   host_key = "SHA256:…"
   keep = 7
+  backup_key_file = "backup.key"   # the default; see "The backup key"
   ```
 
   Command-line options win over `[backup]`. The dump is made in the system's temporary directory first; `--work-dir`
   names another place when that is small. It needs room for the database.
-- **Not copied, on purpose:** `config.toml` (it holds secrets) and `two-factor.key`. Keep copies of both apart from the
-  backup: a backup does not hold them, and without the key the two-factor secrets in a database cannot be opened.
+- **The backup key.** A backup server is somewhere you do not control, and whoever controls it could otherwise change
+  the database in a backup (an account, a device token) and recompute the hash beside it, and a restore would take
+  the forgery for the backup. So the first `backup` makes a key, 32 random bytes in `backup.key` beside `config.toml`
+  (or the file named by `[backup] backup_key_file` or `--backup-key-file`; mode 0600 on Unix, never overwritten once
+  it exists), and every backup is bound to it: the manifest's MAC covers each of its fields, the hash and size of the
+  dump and of the blob inventory, and `restore` checks it before it believes any of them. **The key must be backed up
+  separately, from the machine and from the backup server** (a password manager will do; the file is 32 bytes). **Without
+  it a backup cannot be restored**, and nothing can be done about that. The backup server can neither read the database
+  (the dump is sealed under a key derived from the backup key) nor change it unnoticed. It *can* read the blobs
+  (file contents, in the store's own format), see their number and sizes, and delete or withhold things (a restore then
+  fails; it never accepts something made up). It can also offer an older backup that was genuine: look at the
+  generation's stamp that `restore` prints. Sealing the blobs is a follow-up and not done yet. The key does not protect
+  the files on the machine itself.
+- **Not copied, on purpose:** `config.toml` (it holds secrets), `two-factor.key` and `backup.key`. Keep copies of all
+  three apart from the backup: a backup does not hold them, and without the first key the two-factor secrets in a
+  database cannot be opened.
 - **Postgres** is not dumped by this command. Run `pg_dump --format=custom` yourself (Craft Cloud does not run it for
   you) and keep the dump with the rest; the command refuses a Postgres server with a message that says so, and the
   blobs of such a server are not copied either.
@@ -621,15 +642,33 @@ craft-cloud-server backup --config /var/lib/craft-cloud/config.toml \
 
 ```sh
 craft-cloud-server restore --from sftp://backup@files.example.org/craft-cloud-backup \
-  --key-file /etc/craft-cloud/backup-key --host-key 'SHA256:…' --dir /var/lib/craft-cloud-restored
+  --key-file /etc/craft-cloud/backup-key --host-key 'SHA256:…' \
+  --backup-key-file /safe/place/backup.key --dir /var/lib/craft-cloud-restored
 ```
 
+`--key-file` is the SSH key to sign in to the backup server; `--backup-key-file` is the backup key (or give `--config` and
+let `[backup] backup_key_file` name it). A wrong or missing key is a clear error and nothing is written.
+
 The directory must be empty or missing; a directory with anything in it is refused and left alone. `restore` takes the
-newest complete generation (or the one named with `--generation`, the whole name or just its stamp like `20261107T031500Z`, the newest that began in that second), checks the database dump against the
-hash and size in its manifest and opens it, then copies the blobs. It builds everything in a directory beside the target
+newest complete generation (or the one named with `--generation`, the whole name or just its stamp like `20261107T031500Z`, the newest that began in that second), checks the manifest's MAC under
+the backup key before it trusts any field (sizes, hashes, the inventory), checks the sealed dump and the inventory against
+the hashes in it, opens the dump, then fetches exactly the blobs the inventory lists, each checked against its ID and
+its listed size; a blob that is missing, wrong, or not in the inventory never gets into the result, and the restore is
+only published when the inventory is complete. It builds everything in a directory beside the target
 (`<dir>.restore-<id>`) and moves it into place only when it is all there, so a restore that fails, or is killed, never
 leaves a database with part of its blobs at the target and a re-run is not refused. After a kill, delete the leftover
 `….restore-<id>` directory.
+
+**Limits, so a hostile or broken backup server cannot fill your disk.** The sizes in an authenticated manifest are the
+backup's own, but `restore` keeps limits of yours anyway and enforces them while the data arrives, before each blob:
+`--max-db-bytes` (default 8 GiB, the opened database), `--max-total-bytes` (default 1 TiB, database and blobs together),
+`--max-objects` (default 50 million blobs) and `--min-free-bytes` (default 1 GiB: the disk of the target must have that
+much left, looked at before the download and again before every blob). Sizes take units (`20 GiB`). Raise a limit if you
+really have a bigger backup; a restore that crosses one stops, removes what it made and says which limit.
+
+**Old backups.** A generation made before backups were authenticated (a `meta.sqlite` and no MAC) is refused, because
+nothing proves the backup server did not change it. If it is test data of your own, `--allow-unauthenticated` restores it
+(the limits apply, and the output warns). Make a new backup with this version and do not rely on the old one.
 
 **What a restore produces, whatever the server stored its blobs in.** `restore` always writes `meta.db` and a local
 disk tree `blobs/` (`chunks/ab/cd/<id>`, `manifests/ab/cd/<id>`), even if the backed-up server kept its blobs in S3 or on
