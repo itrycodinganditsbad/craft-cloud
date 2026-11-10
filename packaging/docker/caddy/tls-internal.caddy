@@ -1,0 +1,2 @@
+# A certificate from Caddy's internal CA. For tests only: browsers and agents do not trust it. No HSTS.
+tls internal
