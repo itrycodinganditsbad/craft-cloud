@@ -524,6 +524,11 @@ impl Inner {
         self.idle.lock().unwrap_or_else(PoisonError::into_inner).pop()
     }
 
+    /// Closes every pooled connection that is not in use.
+    fn drop_idle(&self) {
+        self.idle.lock().unwrap_or_else(PoisonError::into_inner).clear();
+    }
+
     fn give_back(&self, conn: Arc<Conn>) {
         self.idle.lock().unwrap_or_else(PoisonError::into_inner).push(conn);
     }
@@ -569,16 +574,23 @@ impl Inner {
     {
         let mut retried = 0u32;
         let mut stale_retried = false;
+        let mut fresh = false;
         loop {
             let mut from_idle = false;
-            match self.once(&mut op, &mut from_idle).await {
+            match self.once(&mut op, &mut from_idle, std::mem::take(&mut fresh)).await {
                 Ok(value) => return Ok(value),
                 // A pooled connection can have died while it was idle (the server closed it, a firewall forgot it). That
-                // is no reason to count a retry or to wait: one fresh connection is tried at once, whatever `retries` is.
+                // is no reason to count a retry or to wait: one connection made for the purpose is tried at once, whatever
+                // `retries` is. It is never another pooled one, which is as likely to be dead: the others are dropped.
                 Err(Fail::Transient(_)) if from_idle && !stale_retried => {
                     stale_retried = true;
+                    fresh = true;
+                    self.drop_idle();
                 }
                 Err(Fail::Transient(_)) if retried < self.retries => {
+                    if from_idle {
+                        self.drop_idle();
+                    }
                     retried = retried.saturating_add(1);
                     tokio::time::sleep(backoff(retried)).await;
                 }
@@ -587,12 +599,17 @@ impl Inner {
         }
     }
 
-    async fn once<T, Fut>(&self, op: &mut impl FnMut(Arc<Conn>) -> Fut, from_idle: &mut bool) -> Result<T, Fail>
+    /// One try of `op`. A connection comes from the pool unless `fresh` asks for a new one (which also empties the pool).
+    async fn once<T, Fut>(&self, op: &mut impl FnMut(Arc<Conn>) -> Fut, from_idle: &mut bool, fresh: bool) -> Result<T, Fail>
     where
         Fut: Future<Output = Result<T, Fail>>,
     {
         let _permit = self.permits.acquire().await.map_err(|_| Fail::Permanent("the connection pool is closed".into()))?;
-        let conn = match self.take_idle() {
+        if fresh {
+            self.drop_idle();
+        }
+        let idle = if fresh { None } else { self.take_idle() };
+        let conn = match idle {
             Some(conn) => {
                 *from_idle = true;
                 conn
@@ -628,6 +645,7 @@ impl Inner {
                         async move { remove_leftovers(&conn, leftovers).await }
                     },
                     &mut false,
+                    false,
                 )
                 .await;
         }

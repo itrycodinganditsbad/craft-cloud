@@ -668,12 +668,13 @@ craft-cloud-server backup --config /var/lib/craft-cloud/config.toml \
   manifest is not offered by `restore`. The blobs are read through the store, so each is checked against its ID on the
   way; a blob that cannot be read stops the backup with an error that names it.
 - **Where.** `sftp://user@host[:port]/directory` (`/~/directory` for one in the account's home). Below it:
-  `chunks/` and `manifests/` as in the store, and `generations/<UTC stamp>/` with the dump (`meta.sqlite`) and the manifest.
+  `chunks/` and `manifests/` as in the store, and `generations/<UTC stamp>-<id>/` with the dump (`meta.sqlite`) and the manifest.
   `--keep N` (default 7) keeps the newest N complete database generations and removes older ones; blobs are never removed.
-  A generation is named by the second its backup began in. If the backup server has that name already (a second backup
-  running at once, or a clock set back), the new backup stops with a message and changes nothing; run one backup at a
-  time. The generation just written is never removed, and one without its manifest is left alone for a day before it is
-  taken for a backup that died.
+  A generation is named by the second its backup began in and a random id, so backups that run at once, or in the same
+  second, each write into a directory of their own and cannot damage each other's dump or manifest. Pruning happens after
+  a backup's own manifest is written, and only touches generations that began in an earlier second: the one just written
+  is never removed (whatever the clock said), another backup's is left alone, and one without its manifest is left alone
+  for a day before it is taken for a backup that died. Names without the id, from the first version, are still read.
 - **Signing in.** The same rules as for an SFTP blob store: a key (`--key-file`, or `CRAFT_CLOUD_SFTP_KEY_FILE`), the
   key's passphrase from `CRAFT_CLOUD_SFTP_KEY_PASSPHRASE`, and a pinned host key (`--host-key` or `--known-hosts`) that
   the command insists on. A password in the address is refused. The settings can sit in the config instead:
@@ -720,7 +721,7 @@ craft-cloud-server restore --from sftp://backup@files.example.org/craft-cloud-ba
 ```
 
 The directory must be empty or missing; a directory with anything in it is refused and left alone. `restore` takes the
-newest complete generation (or the one named with `--generation 20261107T031500Z`), checks the database dump against the
+newest complete generation (or the one named with `--generation`, the whole name or just its stamp like `20261107T031500Z`, the newest that began in that second), checks the database dump against the
 hash and size in its manifest and opens it, then copies the blobs. It builds everything in a directory beside the target
 (`<dir>.restore-<id>`) and moves it into place only when it is all there, so a restore that fails, or is killed, never
 leaves a database with part of its blobs at the target and a re-run is not refused. After a kill, delete the leftover
