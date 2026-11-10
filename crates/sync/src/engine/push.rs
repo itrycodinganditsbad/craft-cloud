@@ -37,6 +37,9 @@ fn too_big(size: u64, limit: u64) -> String {
 
 impl<F: Fs, T: Transport> Engine<F, T> {
     pub(super) async fn push(&mut self, report: &mut Report) -> Result<(), SyncError> {
+        if self.read_only {
+            return self.push_read_only(report).await;
+        }
         let root = self.state.root.ok_or_else(|| SyncError::Corrupt("no root".into()))?;
         let (local, mut unseen) = self.scan(report)?;
         // Inside a folder that couldn't be listed, or at or below a link, nothing is known, so nothing tracked there
@@ -542,6 +545,13 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         for batch in unique.chunks(MISSING_QUERY_IDS) {
             missing.extend(self.transport.missing_chunks(batch).await?);
         }
+        // Chunks another space of the account already has may be taken from it without sending their bytes; what that does not
+        // cover is uploaded.
+        if !missing.is_empty() {
+            let asked: Vec<ChunkId> = missing.iter().copied().collect();
+            let still: BTreeSet<ChunkId> = self.transport.claim_chunks(&asked).await?.into_iter().collect();
+            missing.retain(|id| still.contains(id));
+        }
         for (id, offset, len) in &pieces {
             if missing.remove(id) && !self.send_chunk(path, id, *offset, *len, report).await? {
                 return Ok(None);
@@ -649,21 +659,36 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                         _ => None,
                     })
                     .collect();
-                if !deletes.is_empty() {
+                let dir_deletes: Vec<NodeId> = only_ops
+                    .iter()
+                    .filter_map(|op| match op {
+                        Op::Delete { node, expected: None } => Some(*node),
+                        _ => None,
+                    })
+                    .collect();
+                if !deletes.is_empty() || !dir_deletes.is_empty() {
                     self.state.sent_deletes.extend(deletes.iter().copied());
+                    self.state.sent_dir_deletes.extend(dir_deletes.iter().copied());
                     self.checkpoint()?;
                 }
+                self.guard()?;
                 let result = self.transport.commit(&only_ops).await;
                 // Applied or refused as a whole, the batch's deletes are no longer in doubt; any other answer leaves
                 // them written down.
-                if matches!(result, Ok(_) | Err(TransportError::Rejected(_))) {
+                if matches!(result, Ok(_) | Err(TransportError::Rejected(_) | TransportError::ReadOnly)) {
                     for (node, _) in &deletes {
                         self.state.sent_deletes.remove(node);
+                    }
+                    for node in &dir_deletes {
+                        self.state.sent_dir_deletes.remove(node);
                     }
                 }
                 match result {
                     Ok(_) => {
                         for (_, effect) in batch.drain(..) {
+                            if let Effect::File { id, .. } | Effect::Update { id, .. } = &effect {
+                                self.committed_files.insert(*id);
+                            }
                             self.record(effect, report);
                         }
                         if queue.is_empty()
