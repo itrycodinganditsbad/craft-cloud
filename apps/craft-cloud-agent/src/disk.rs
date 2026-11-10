@@ -298,6 +298,21 @@ pub fn fold_file_id(id: FileId) -> u64 {
     u64::from_le_bytes(first)
 }
 
+/// Which folder a path leads to: its canonical path and its ID (a link at `dir` itself is followed, as the synced root may be
+/// one). A session compares it with what it opened with, so a link that was pointed at another folder meanwhile is noticed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderIdentity {
+    pub path: PathBuf,
+    pub id: Option<u64>,
+}
+
+/// The identity of the folder `dir` leads to, or `None` if it can't be looked at (it is gone, a drive is unmounted).
+pub fn folder_identity(dir: &Path) -> Option<FolderIdentity> {
+    let path = fs::canonicalize(dir).ok()?;
+    let md = fs::metadata(&path).ok().filter(|md| md.is_dir())?;
+    Some(FolderIdentity { id: local_id(&md, &path), path })
+}
+
 /// The ID of the file or folder at `path`, whose metadata (not following links) is `md`.
 #[cfg(unix)]
 fn local_id(md: &Metadata, _path: &Path) -> Option<u64> {
