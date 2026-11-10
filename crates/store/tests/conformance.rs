@@ -911,11 +911,16 @@ iqNc2jOhYN+M91BKSLYoAAAAEGNyYWZ0LWNsb3VkLXRlc3QBAgMEBQ==
         let Some(config) = config() else { return };
         let container = std::env::var("CRAFT_CLOUD_TEST_SFTP_CONTAINER").expect("CRAFT_CLOUD_TEST_SFTP_CONTAINER names the container to restart");
         let addr = format!("{}:{}", config.host, config.port);
-        let store = Store::new(SftpBackend::connect(&SftpConfig { retries: 0, ..config }).await.unwrap());
+        let store = Store::new(SftpBackend::connect(&SftpConfig { retries: 0, connections: 4, ..config }).await.unwrap());
         let data = b"read through a connection that will die";
         let key = chunk_key(data);
         store.put(key, data).await.unwrap();
-        assert_eq!(&store.get(key).await.unwrap()[..], data);
+        // Four requests at once leave several pooled connections behind, all of which die with the server. The one request
+        // after the restart must not run into a second dead one on its free recovery attempt.
+        let (a, b, c, d) = tokio::join!(store.get(key), store.get(key), store.get(key), store.get(key));
+        for read in [a, b, c, d] {
+            assert_eq!(&read.unwrap()[..], data);
+        }
         let status = std::process::Command::new("docker").args(["restart", "-t", "1", &container]).status().unwrap();
         assert!(status.success());
         // Wait until the server answers again, so that the only thing in the way is the dead connection in the pool.
