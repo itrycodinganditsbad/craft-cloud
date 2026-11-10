@@ -112,26 +112,37 @@ impl std::fmt::Debug for DatabaseConfig {
 
 /// The URL as it may be shown: the scheme, host, port and path stay; the user name and password are replaced by
 /// `<redacted>`, and so is the whole query string and fragment (`?user=…&password=…` is a way to give credentials too).
-/// Everything up to the last `@` before the query is treated as credentials, so a password containing `@` or `/`
-/// still doesn't show. A URL with neither credentials nor a query is returned as is.
+/// Everything up to the last `@` of the authority is treated as credentials, so a password containing `@`, `/`, `?` or
+/// `#` still doesn't show. A URL with neither credentials nor a query is returned as is.
 pub fn redact_url(url: &str) -> String {
-    // As a URL reads it: the query or fragment begins at the first `?` or `#`.
-    let (base, tail) = match url.find(['?', '#']) {
-        Some(at) => (&url[..at], "?<redacted>"),
-        None => (url, ""),
+    let (head, rest) = match url.find("://") {
+        Some(scheme_end) => url.split_at(scheme_end + 3),
+        None => ("", url),
     };
-    let shown = match base.find("://") {
-        Some(scheme_end) => {
-            let authority_start = scheme_end + 3;
-            let rest = &base[authority_start..];
-            match rest.rfind('@') {
-                Some(at) => format!("{}<redacted>{}", &base[..authority_start], &rest[at..]),
-                None => base.to_owned(),
-            }
+    // The query or fragment, as a URL reads it, begins at the first `?` or `#`...
+    let cut = rest.find(['?', '#']);
+    let before = cut.map_or(rest, |at| &rest[..at]);
+    // ...and the credentials end at the last `@` before it. Unless the `?` or `#` is inside the password: then no path has
+    // begun before it, and an `@` follows it.
+    let at = if before.contains('@') {
+        before.rfind('@')
+    } else if cut.is_some() && !before.contains('/') {
+        rest.rfind('@')
+    } else {
+        None
+    };
+    let (shown, has_query) = match at {
+        Some(at) => {
+            let after = rest.get(at + 1..).unwrap_or_default();
+            let end = after.find(['?', '#']);
+            let host_and_path = after.get(..end.unwrap_or(after.len())).unwrap_or_default();
+            // Text with `=` or `&` in it after that `@` is a query, not a host: show none of it.
+            let host_and_path = if host_and_path.contains(['=', '&']) { "<redacted>" } else { host_and_path };
+            (format!("{head}<redacted>@{host_and_path}"), end.is_some())
         }
-        None => base.to_owned(),
+        None => (format!("{head}{before}"), cut.is_some()),
     };
-    format!("{shown}{tail}")
+    if has_query { format!("{shown}?<redacted>") } else { shown }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -376,6 +387,16 @@ secret_access_key = "very-secret-value"
             ("sqlite:/var/lib/meta.db?mode=rwc", "sqlite:/var/lib/meta.db?<redacted>"),
             // An `@` in the query must not make the host and the start of the query count as credentials.
             ("postgres://db/cc?password=a@qsecret", "postgres://db/cc?<redacted>"),
+            // A raw `?` or `#` in the password: it does not connect, but it must not show in a dump.
+            ("postgres://cc:pa#ss@db/cc", "postgres://<redacted>@db/cc"),
+            ("postgres://u:p?w@db/cc", "postgres://<redacted>@db/cc"),
+            ("postgres://u:p?w@db/cc?sslmode=require", "postgres://<redacted>@db/cc?<redacted>"),
+            ("postgres://u:p@w@db/cc", "postgres://<redacted>@db/cc"),
+            ("postgres://db?password=a@qsecret&x=1", "postgres://<redacted>@<redacted>"),
+            ("postgres://", "postgres://"),
+            ("postgres://?", "postgres://?<redacted>"),
+            ("postgres://@", "postgres://<redacted>@"),
+            ("not a url?token=secret", "not a url?<redacted>"),
         ] {
             let got = redact_url(url);
             assert_eq!(got, shown, "{url}");

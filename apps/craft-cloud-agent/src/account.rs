@@ -398,8 +398,9 @@ impl DataDir {
     /// can replace them. Windows has no such check here; the agent keeps to `%LOCALAPPDATA%` instead.
     pub fn create(&self) -> Result<(), AccountError> {
         let insecure = |why| AccountError::Insecure { why };
-        if self.0.is_dir() || fs::symlink_metadata(&self.0).is_ok() {
-            // (A link counts as "there", and is refused by the check.)
+        // On Unix a link counts as "there", and the check refuses it. Elsewhere only a folder does, so a file or a dangling
+        // link at the path still fails below, where the folder is made, with an error that names the path.
+        if self.0.is_dir() || (cfg!(unix) && fs::symlink_metadata(&self.0).is_ok()) {
             return craft_cloud_proto::local::private::check_private_dir(&self.0).map_err(insecure);
         }
         if let Some(parent) = self.0.parent() {
