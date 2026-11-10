@@ -139,6 +139,7 @@ public_url="https://$domain"
 version=$(sh ./workspace-version.sh)
 revision=$(git rev-parse HEAD 2>/dev/null || true)
 [ -n "$revision" ] || revision=unknown
+install_dir=$(cd ../.. && pwd)
 
 # --- .env ---------------------------------------------------------------------------------------------------------
 # A random password of 40 URL-safe characters (the database password becomes part of a database URL).
@@ -164,6 +165,7 @@ compose_file=compose.yaml
     echo "CC_IMAGE=craft-cloud:$version"
     echo "CC_VERSION=$version"
     echo "CC_REVISION=$revision"
+    echo "CC_INSTALL_DIR=$install_dir"
     if [ "$db_kind" = postgres ]; then
         echo "CC_SECRET_DB_SUPERUSER_PASSWORD=$(random_password)"
         echo "CC_SECRET_DB_PASSWORD=$(random_password)"

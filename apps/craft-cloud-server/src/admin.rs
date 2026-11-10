@@ -206,8 +206,16 @@ pub(crate) async fn server_info(state: &AppState) -> Result<AdminServerInfo, Api
     })
 }
 
-async fn server(State(state): State<Shared>) -> Result<Json<AdminServerInfo>, ApiError> {
-    Ok(Json(server_info(&state).await?))
+#[derive(serde::Serialize)]
+struct AdminServerResponse {
+    #[serde(flatten)]
+    info: AdminServerInfo,
+    update: Option<crate::updates::UpdateInfo>,
+}
+
+async fn server(State(state): State<Shared>) -> Result<Json<AdminServerResponse>, ApiError> {
+    let info = server_info(&state).await?;
+    Ok(Json(AdminServerResponse { info, update: state.update_info() }))
 }
 
 /// `GET /admin/storage`: bounded account and manifest-index counts, plus the ten largest accounts, and the room the

@@ -86,6 +86,7 @@ button.danger, button.danger[type="submit"] { background: transparent; color: va
 button.danger:hover { background: var(--bad); color: var(--bg); }
 .notice { border: 1px solid var(--line); border-left: 4px solid var(--good); background: var(--sunken); padding: 10px 14px; margin: var(--space-3) 0; }
 .notice.warning { border-left-color: var(--warn); } .notice.error { border-left-color: var(--bad); }
+.update-banner pre { max-width: 100%; overflow-x: auto; padding: 12px; background: var(--bg); border: 1px solid var(--line); }
 .muted { color: var(--muted); } code, .code { font-family: var(--mono); font-size: .9em; overflow-wrap: anywhere; }
 .secret { font: 400 1.4rem/1.5 var(--mono); letter-spacing: .05em; background: var(--sunken); border: 1px solid var(--line-strong); padding: 8px 12px; display: inline-block; user-select: all; overflow-wrap: anywhere; max-width: 100%; }
 .pager { display: flex; flex-wrap: wrap; gap: var(--space-2) 24px; margin: var(--space-3) 0; }

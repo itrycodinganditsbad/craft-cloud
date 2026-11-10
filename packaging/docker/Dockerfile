@@ -18,6 +18,8 @@ ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:08476c244888bfb42
 
 # ---- build ---------------------------------------------------------------------
 FROM ${RUST_IMAGE} AS build
+ARG CRAFT_CLOUD_REVISION=unknown
+ENV CRAFT_CLOUD_REVISION=${CRAFT_CLOUD_REVISION}
 # Docker builds often run in a small VM: keep the compiler's parallelism and memory use low.
 ENV CARGO_BUILD_JOBS=2 \
     CARGO_INCREMENTAL=0 \

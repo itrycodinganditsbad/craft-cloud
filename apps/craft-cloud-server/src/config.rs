@@ -95,6 +95,8 @@ pub enum ConfigError {
          so a TLS reverse proxy must stand in front of it"
     )]
     WebAdminNeedsProxy,
+    #[error("updates.repo = {0:?} must be owner/name with letters, digits, '-', '_' or '.'")]
+    UpdatesRepo(String),
     #[error("web_admin.{0} = {1} is out of range: {2} to {3}")]
     WebAdminRange(&'static str, u32, u32, u32),
     #[error("storage.min_free only goes with storage.refuse_when_full = true: without it nothing is refused, so the reserve would mean nothing")]
@@ -169,6 +171,9 @@ pub struct Config {
     /// The admin pages in the browser (`/web`). Off unless the section says `enabled = true`.
     #[serde(default)]
     pub web_admin: WebAdminConfig,
+    /// Optional local update status written by an external checker.
+    #[serde(default)]
+    pub updates: UpdatesConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
     /// Limits of team spaces. The section is optional.
@@ -186,6 +191,28 @@ pub struct Config {
     /// from the file.
     #[serde(skip)]
     pub dir: Option<PathBuf>,
+}
+
+/// `[updates]`: reads a local status file; the server makes no network requests.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdatesConfig {
+    #[serde(default)]
+    pub status_file: Option<PathBuf>,
+    #[serde(default)]
+    pub install_dir: Option<String>,
+    #[serde(default = "default_update_repo")]
+    pub repo: String,
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self { status_file: None, install_dir: None, repo: default_update_repo() }
+    }
+}
+
+fn default_update_repo() -> String {
+    "itrycodinganditsbad/craft-cloud".to_owned()
 }
 
 /// `[two_factor]`: where the key for two-factor secrets is.
@@ -593,6 +620,11 @@ impl Config {
             if !(low..=high).contains(&value) {
                 return Err(ConfigError::WebAdminRange(name, value, low, high));
             }
+        }
+        // The repository goes into links on the admin pages, so it is held to GitHub's name characters.
+        let repo_part = |part: &str| !part.is_empty() && part.len() <= 100 && part.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
+        if !config.updates.repo.split_once('/').is_some_and(|(owner, name)| repo_part(owner) && repo_part(name)) {
+            return Err(ConfigError::UpdatesRepo(config.updates.repo.clone()));
         }
         if !(MIN_TRASH_DAYS..=MAX_TRASH_DAYS).contains(&config.retention.trash_days) {
             return Err(ConfigError::TrashDays(config.retention.trash_days));

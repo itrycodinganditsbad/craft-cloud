@@ -60,6 +60,18 @@ fn test_box() -> SecretBox {
 }
 
 async fn start(meta: Meta, url: String, dirs: Vec<tempfile::TempDir>, pg: Option<PgGuard>, trusted: Vec<std::net::IpAddr>, web: bool) -> Web {
+    start_with_updates(meta, url, dirs, pg, trusted, web, None).await
+}
+
+async fn start_with_updates(
+    meta: Meta,
+    url: String,
+    dirs: Vec<tempfile::TempDir>,
+    pg: Option<PgGuard>,
+    trusted: Vec<std::net::IpAddr>,
+    web: bool,
+    updates: Option<craft_cloud_server::updates::UpdateSettings>,
+) -> Web {
     let blobs = tempfile::tempdir().unwrap();
     let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
     let settings = web.then(|| WebSettings::new(ORIGIN, IDLE_MS, ABSOLUTE_MS).unwrap());
@@ -70,6 +82,7 @@ async fn start(meta: Meta, url: String, dirs: Vec<tempfile::TempDir>, pg: Option
         .with_two_factor(Some(test_box()))
         .with_public_url(Some(ORIGIN.to_owned()))
         .with_web_admin(settings)
+        .with_updates(updates.unwrap_or_default())
         .with_clock(Arc::new(move || match ticking.load(Ordering::SeqCst) {
             0 => craft_cloud_server::state::now_ms(),
             frozen => frozen,
@@ -1493,6 +1506,56 @@ async fn overview_shows_server_health_and_account_usage_rows(s: &Web) {
     for label in ["Usage stored", "Physical", "Files", "Effective quota", "Trash estimate (overlapping)", "History estimate (overlapping)"] {
         assert!(page.contains(&format!("<dt>{label}</dt>")), "missing {label}: {page}");
     }
+}
+
+#[tokio::test]
+async fn update_banner_only_appears_for_a_valid_newer_release() {
+    let run = async |contents: Option<&str>, configured: bool, unreadable: bool| {
+        let db = tempfile::tempdir().unwrap();
+        let status_dir = tempfile::tempdir().unwrap();
+        let status_file = status_dir.path().join("status.json");
+        if unreadable {
+            std::fs::create_dir(&status_file).unwrap();
+        } else if let Some(contents) = contents {
+            std::fs::write(&status_file, contents).unwrap();
+        }
+        let url = format!("sqlite:{}", db.path().join("meta.db").display());
+        let meta = Meta::open(&url).await.unwrap();
+        let updates = configured.then(|| craft_cloud_server::updates::UpdateSettings {
+            status_file: Some(status_file),
+            install_dir: "/srv/craft & cloud".into(),
+            repo: "owner/repo".into(),
+        });
+        let server = start_with_updates(meta, url, vec![db, status_dir], None, vec![], true, updates).await;
+        server.add_admin("root").await;
+        let admin = server.sign_in("root").await;
+        let page = server.get("/web", Some(&admin.token)).await;
+        assert_eq!(page.status(), StatusCode::OK);
+        assert!(
+            page.headers()
+                .get("content-security-policy")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("script-src 'none'"))
+        );
+        page.text().await.unwrap()
+    };
+
+    let mut parts = env!("CARGO_PKG_VERSION").split('.').map(|part| part.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
+    if parts.len() < 3 {
+        parts.resize(3, 0);
+    }
+    parts[2] += 1;
+    let newer = format!("v{}.{}.{}", parts[0], parts[1], parts[2]);
+    let fixture = format!(r#"{{"channel":"release","latest":"{newer}","checked_at":"2026-11-10T00:00:00Z"}}"#);
+    let shown = run(Some(&fixture), true, false).await;
+    assert!(shown.contains(&format!("Update available: {newer}")), "{shown}");
+    assert!(shown.contains("cd /srv/craft &amp; cloud &amp;&amp; ./packaging/docker/update.sh"), "{shown}");
+    let equal = format!(r#"{{"channel":"release","latest":"{}","checked_at":"today"}}"#, env!("CARGO_PKG_VERSION"));
+    assert!(!run(Some(&equal), true, false).await.contains("Update available:"));
+    assert!(!run(Some("not json"), true, false).await.contains("Update available:"));
+    assert!(!run(None, true, false).await.contains("Update available:"));
+    assert!(!run(None, true, true).await.contains("Update available:"));
+    assert!(!run(Some(&fixture), false, false).await.contains("Update available:"));
 }
 
 async fn old_sessions_are_cleaned_up_at_sign_in(s: &Web) {

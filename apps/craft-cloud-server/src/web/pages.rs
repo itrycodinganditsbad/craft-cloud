@@ -344,6 +344,9 @@ pub(super) async fn overview(State(state): State<Shared>, request: Request) -> R
     let server = crate::admin::server_info(&state).await?;
     let storage = state.meta.admin_storage_overview().await?;
     let mut body = heading("Overview");
+    if let Some(update) = state.update_info().filter(|update| update.available) {
+        body.push_str(&update_banner(&state.updates, &update));
+    }
     body.push_str(&server_health(&server));
     body.push_str("<div class=\"stats\" aria-label=\"Server counts and storage\">");
     body.push_str(&super::html::stat(&counts.users.to_string(), "Accounts"));
@@ -376,6 +379,27 @@ pub(super) async fn overview(State(state): State<Shared>, request: Request) -> R
         link("/web/storage", "View storage details")
     ));
     Ok(ok_page(&authed.ctx(), "Overview", &body))
+}
+
+fn update_banner(settings: &crate::updates::UpdateSettings, update: &crate::updates::UpdateInfo) -> String {
+    let summary = if update.channel == "branch" {
+        format!("Newer commit available: {} (you run {})", &update.latest[..7], &update.current[..7])
+    } else {
+        format!("Update available: {} (you run {})", update.latest, update.current)
+    };
+    let command = format!("cd {} && ./packaging/docker/update.sh", settings.install_dir);
+    let repo = settings.repo.split('/').map(super::html::url_encode).collect::<Vec<_>>().join("/");
+    let href = if update.channel == "branch" {
+        format!("https://github.com/{repo}/compare/{}...{}", update.current, update.latest)
+    } else {
+        format!("https://github.com/{repo}/releases/tag/{}", super::html::url_encode(&update.latest))
+    };
+    format!(
+        "<section class=\"notice warning update-banner\"><p>{}</p><p>{}</p><pre><code>{}</code></pre><p>This script backs up first, then pulls, rebuilds and restarts. Read the release notes first.</p></section>",
+        super::html::esc(&summary),
+        super::html::link(&href, "View update details"),
+        super::html::esc(&command)
+    )
 }
 
 // ---- users ----

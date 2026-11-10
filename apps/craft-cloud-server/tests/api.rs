@@ -2838,6 +2838,7 @@ async fn the_server_overview_shows_counters_only(s: &Server) {
         "store_ok",
         "store_check_ms",
         "refusing_uploads",
+        "update",
     ]
     .into_iter()
     .map(String::from)
@@ -4460,6 +4461,8 @@ async fn the_server_overview_says_how_the_server_is() {
         async move { client.get(url).bearer_auth(root).send().await.unwrap().json::<serde_json::Value>().await.unwrap() }
     };
     let info = overview(root.clone()).await;
+    assert!(info.get("update").is_some(), "update field is always present, even when checks are off");
+    assert!(info["update"].is_null());
     assert!(info["started_ms"].as_i64().unwrap() >= before - 1000 && info["started_ms"].as_i64().unwrap() <= craft_cloud_server::state::now_ms());
     assert_eq!(
         (info["database_ok"].as_bool(), info["store_ok"].as_bool(), info["refusing_uploads"].as_bool()),
