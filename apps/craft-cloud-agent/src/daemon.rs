@@ -140,13 +140,17 @@ fn pass_end(result: &Result<PassSummary, AgentError>, recheck_in: Option<Duratio
 /// Which pauses look again by themselves: a folder or marker that is missing (a drive not mounted yet), folders
 /// that lie inside one another, or another agent on the folder can be put right at any moment and checking is
 /// harmless, so every minute; a server that speaks another protocol or refuses requests is fixed by an update, and an
-/// account whose storage on the server is full by the admin allowing more, so every ten minutes; a revoked device,
+/// account whose storage on the server is full by the admin allowing more, a space that turned read-only for the account by an owner raising its role, so every ten minutes; a revoked device,
 /// damaged or newer saved files, another account's state and damaged data from the server never fix themselves, so
 /// the loop waits until it is stopped.
 fn recheck_for(e: &AgentError) -> Recheck {
     match e {
         AgentError::Root(_) | AgentError::DataInFolder { .. } | AgentError::Lock(_) => Recheck::Soon,
-        AgentError::Server(craft_cloud_sync::TransportError::Protocol(_) | craft_cloud_sync::TransportError::QuotaExceeded { .. }) => Recheck::Slowly,
+        AgentError::Server(
+            craft_cloud_sync::TransportError::Protocol(_)
+            | craft_cloud_sync::TransportError::QuotaExceeded { .. }
+            | craft_cloud_sync::TransportError::ReadOnly,
+        ) => Recheck::Slowly,
         _ => Recheck::Never,
     }
 }
@@ -994,7 +998,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                     None => stop_open = false,
                 },
                 command = commands.recv(), if commands_open => match command {
-                    Some(Command::Login(_, reply) | Command::Join(_, reply)) => {
+                    Some(Command::Login(_, reply) | Command::Join(_, reply) | Command::LoginSecondFactor(_, reply)) => {
                         let _ = reply.send(Err(crate::cli::already_signed_in(&account)));
                     }
                     // Signed out on the server first (an unreachable server changes nothing, and syncing goes on); then
@@ -1178,7 +1182,7 @@ async fn wait_needing_you(
                         let _ = reply.send(Err(e));
                     }
                 },
-                Some(Command::Login(_, reply) | Command::Join(_, reply) | Command::Pause(reply) | Command::Resume(reply)) => {
+                Some(Command::Login(_, reply) | Command::Join(_, reply) | Command::LoginSecondFactor(_, reply) | Command::Pause(reply) | Command::Resume(reply)) => {
                     let _ = reply.send(Err(AgentError::NeedsYou(reason.to_owned())));
                 }
                 Some(Command::Quit(reply)) => {
@@ -1227,6 +1231,20 @@ async fn wait_for_sign_in(
                         return SignedOut::SignedIn;
                     }
                 }
+                Some(Command::LoginSecondFactor(request, reply)) => {
+                    let args = LoginArgs {
+                        url: request.server.clone(),
+                        user: request.user.clone(),
+                        folder: request.folder.as_ref().map(std::path::PathBuf::from),
+                        device_name: request.device_name.clone(),
+                        adopt: request.adopt,
+                    };
+                    let factor = crate::http::Factor { totp_code: request.totp_code.clone(), recovery_code: request.recovery_code.clone() };
+                    let result = crate::cli::login_second_factor_locked(data, &args, &request.challenge, &factor).await;
+                    if signed_in(result, "signed in", control, reply, out) {
+                        return SignedOut::SignedIn;
+                    }
+                }
                 Some(Command::Join(request, reply)) => {
                     let args = JoinArgs {
                         join: request.join.clone(),
@@ -1236,7 +1254,9 @@ async fn wait_for_sign_in(
                         // The caller asks for it with `POST /v1/autostart` once joined.
                         autostart: false,
                     };
-                    let result = crate::cli::join_locked(data, &args, request.password.as_deref()).await;
+                    let factor = (request.totp_code.is_some() || request.recovery_code.is_some())
+                        .then(|| crate::http::Factor { totp_code: request.totp_code.clone(), recovery_code: request.recovery_code.clone() });
+                    let result = crate::cli::join_locked(data, &args, request.password.as_deref(), factor.as_ref()).await;
                     if signed_in(result, "joined", control, reply, out) {
                         return SignedOut::SignedIn;
                     }
@@ -1325,6 +1345,7 @@ fn summary_to_show(summary: &PassSummary, last_held: &mut Option<String>) -> (Op
 fn summary_worth_showing(s: &PassSummary) -> bool {
     s.downloaded + s.uploaded + s.removed_locally + s.removed_remotely + s.moved_locally + s.moved_remotely + s.created_dirs + s.refused > 0
         || !s.conflict_copies.is_empty()
+        || !s.restored.is_empty()
         || !s.skipped.is_empty()
         || !s.held_deletes.is_empty()
         || s.needs_approval()

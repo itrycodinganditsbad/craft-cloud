@@ -111,6 +111,11 @@ pub struct PassSummary {
     pub created_dirs: usize,
     pub conflict_copies: Vec<String>,
     pub refused: usize,
+    /// Whether the pass ran in read-only mode: the space is read-only for this account (a viewer), nothing was sent,
+    /// and what is only here is listed in `skipped` with the reason.
+    pub read_only: bool,
+    /// Files and folders deleted here that the server still has, put back (read-only mode only).
+    pub restored: Vec<String>,
     /// Entries that didn't sync, with the reason.
     pub skipped: Vec<(String, String)>,
     /// Deletions on the server waiting for approval.
@@ -142,6 +147,8 @@ impl PassSummary {
             created_dirs: report.created_dirs.len(),
             conflict_copies: paths(&report.conflict_copies),
             refused: report.refused.len(),
+            read_only: report.read_only,
+            restored: paths(&report.restored),
             skipped: report.skipped.clone(),
             pending_deletes: paths(&report.pending_deletes),
             pending_local_deletes: paths(&report.pending_local_deletes),

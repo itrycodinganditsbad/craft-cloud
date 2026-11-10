@@ -33,11 +33,11 @@ use jiff::tz::TimeZone;
 
 use crate::account::{ACCOUNT_SCHEMA, Account, AccountError, DataDir, LastPass, LoopState, Outcome, PassSummary, STATE_SCHEMA, SavedState};
 use crate::disk::{AGENT_DIR, DiskFs, create_private_dir};
-use crate::http::{self, DeviceToken, HttpTransport, JoinError, ReachError, ServerUrl};
+use crate::http::{self, CallError, DeviceToken, Factor, HttpTransport, JoinError, LoginStep, ReachError, Refusal, ServerUrl};
 use crate::lock::{self, DATA_LOCK, FOLDER_LOCK, Lock, LockError};
 use crate::root::{self, RootError, RootMarker};
 use crate::settle::Stability;
-use craft_cloud_proto::api::LoginResponse;
+use craft_cloud_proto::api::{LoginResponse, TwoFactorChallenge};
 use craft_cloud_proto::join::JoinString;
 
 #[derive(Debug, Parser)]
@@ -248,7 +248,7 @@ impl AgentError {
             | AgentError::Lock(LockError::Busy(_) | LockError::NotAFile(_))
             | AgentError::Revoked
             | AgentError::OtherAccountState(_)
-            | AgentError::Server(TransportError::Protocol(_) | TransportError::QuotaExceeded { .. })
+            | AgentError::Server(TransportError::Protocol(_) | TransportError::QuotaExceeded { .. } | TransportError::ReadOnly)
             | AgentError::Sync(SyncError::Corrupt(_))
             | AgentError::Account(AccountError::Newer { .. } | AccountError::Damaged { .. })
             | AgentError::NeedsYou(_) => Exit::NeedsYou,
@@ -336,6 +336,24 @@ pub enum AgentError {
         .0.display()
     )]
     FolderHasFiles(PathBuf),
+    /// `login`: the account has two-factor sign-in. The challenge goes back with a code from its authenticator app (or a
+    /// recovery code) to finish the sign-in. For `join` the challenge is empty: the same join goes again with the code.
+    #[error("this account has two-factor sign-in: a code from its authenticator app (or a recovery code) is needed")]
+    TwoFactorRequired(TwoFactorChallenge),
+    /// The code or recovery code was wrong (the server's message). Never a revoked device.
+    #[error("{0}")]
+    TwoFactorInvalid(String),
+    /// Too many wrong codes: the second factor is locked for a while (`retry_after_secs`, the server's `Retry-After`).
+    #[error("{message}")]
+    TwoFactorLocked { message: String, retry_after_secs: Option<u64> },
+    /// The second step of a sign-in found its challenge gone (it works five minutes and takes five tries, and a password
+    /// change ends it): the sign-in starts again.
+    #[error("this sign-in step has run out (it works for five minutes and takes five tries): sign in again")]
+    ChallengeGone,
+    /// The server refused a call of the account (a wrong password, a conflict, a lock, a limit): its status, code and
+    /// message as it said them, and its `Retry-After`. Never a revoked device (that is a 401, [`AgentError::Revoked`]).
+    #[error("{message}")]
+    Refused { status: u16, code: String, message: String, retry_after_secs: Option<u64> },
     /// Something found as `run` started that only a person can put right (the message says what); the agent waits,
     /// serving the local API, until it is.
     #[error("{0}")]
@@ -350,6 +368,61 @@ impl From<TransportError> for AgentError {
             other => AgentError::Server(other),
         }
     }
+}
+
+impl From<CallError> for AgentError {
+    /// For a signed-in call of the account: the server's refusal with its status, code and message; anything else as sync's
+    /// transport errors are (a 401 is a revoked device, offline is offline).
+    fn from(e: CallError) -> Self {
+        match e {
+            CallError::Refused(Refusal { status, error, message, retry_after_secs, .. }) => {
+                AgentError::Refused { status, code: error, message, retry_after_secs }
+            }
+            CallError::Transport(t) => t.into(),
+        }
+    }
+}
+
+/// What a refusal said, as the transport error the sign-in used to see for it (a refusal with a code of its own is handled
+/// before this), so that messages and exits of the first step don't change.
+fn legacy(refusal: &Refusal) -> TransportError {
+    if refusal.status == 429 {
+        TransportError::Unavailable(format!("the server is busy: {}", refusal.message))
+    } else {
+        TransportError::Protocol(format!("the server or a proxy refused the request (HTTP {}): {}", refusal.status, refusal.message))
+    }
+}
+
+/// A wait in words, for a lock: "about 14 minutes".
+fn wait_in_words(secs: u64) -> String {
+    match secs {
+        0..=90 => format!("{secs} seconds"),
+        91..=5_400 => format!("about {} minutes", secs.div_ceil(60)),
+        _ => format!("about {} hours", secs.div_ceil(3_600)),
+    }
+}
+
+/// The errors of a sign-in's second step and of a join with a code, from what the server said.
+fn factor_error(e: CallError) -> AgentError {
+    match e {
+        CallError::Refused(r) if r.error == craft_cloud_proto::api::codes::TWO_FACTOR_INVALID => AgentError::TwoFactorInvalid(r.message),
+        CallError::Refused(r) if r.error == craft_cloud_proto::api::codes::TWO_FACTOR_LOCKED => locked(r.message, r.retry_after_secs),
+        CallError::Refused(r) if r.error == craft_cloud_proto::api::codes::TWO_FACTOR_REQUIRED => {
+            AgentError::TwoFactorRequired(r.two_factor.unwrap_or(TwoFactorChallenge { challenge: String::new(), expires_ms: 0 }))
+        }
+        // The challenge doesn't work any more: not a revoked device (nothing is signed in yet).
+        CallError::Transport(TransportError::Unauthorized) => AgentError::ChallengeGone,
+        CallError::Refused(r) => legacy(&r).into(),
+        CallError::Transport(t) => t.into(),
+    }
+}
+
+fn locked(message: String, retry_after_secs: Option<u64>) -> AgentError {
+    let message = match retry_after_secs {
+        Some(secs) => format!("{message} (try again in {})", wait_in_words(secs)),
+        None => message,
+    };
+    AgentError::TwoFactorLocked { message, retry_after_secs }
 }
 
 impl From<SyncError> for AgentError {
@@ -384,15 +457,40 @@ pub async fn run(cli: Cli, input: &mut impl BufRead, out: &mut impl Write) -> Re
                 return Err(already_signed_in(&account));
             }
             let password = read_password(input)?;
-            match login(&data, &args, &password, out).await {
+            let mut through_agent = false;
+            let first = match login(&data, &args, &password, out).await {
                 // `run` holds the data folder: it signs in, through its local API.
-                Err(AgentError::Lock(LockError::Busy(path))) => login_through_agent(&data, &args, password, out).await.map_err(|e| match e {
-                    AgentError::Local(craft_cloud_app::Error::NotRunning(_)) => AgentError::Lock(LockError::Busy(path)),
-                    other => other,
-                })?,
-                other => {
-                    other?;
+                Err(AgentError::Lock(LockError::Busy(path))) => {
+                    through_agent = true;
+                    login_through_agent(&data, &args, password, out).await.map_err(|e| match e {
+                        AgentError::Local(craft_cloud_app::Error::NotRunning(_)) => AgentError::Lock(LockError::Busy(path)),
+                        other => other,
+                    })
                 }
+                other => other.map(|_| ()),
+            };
+            match first {
+                // An account with two-factor sign-in: the code comes from standard input, like the password (never from the
+                // command line), and a wrong one may be typed again twice.
+                Err(AgentError::TwoFactorRequired(challenge)) => {
+                    let mut tries = 0;
+                    loop {
+                        let factor = read_factor(input, out)?;
+                        let done = if through_agent {
+                            second_step_through_agent(&data, &args, &challenge, &factor, out).await
+                        } else {
+                            login_second_factor(&data, &args, &challenge, &factor, out).await.map(|_| ())
+                        };
+                        match done {
+                            Err(AgentError::TwoFactorInvalid(message)) if tries < MAX_CODE_TRIES - 1 => {
+                                tries += 1;
+                                say!(out, "{message}")?;
+                            }
+                            other => break other?,
+                        }
+                    }
+                }
+                other => other?,
             }
             Ok(Exit::Done)
         }
@@ -440,11 +538,13 @@ pub async fn run(cli: Cli, input: &mut impl BufRead, out: &mut impl Write) -> Re
                 return Err(already_signed_in(&account));
             }
             let mut password: Option<String> = None;
+            let mut factor: Option<Factor> = None;
+            let mut wrong_codes = 0;
             loop {
-                let joined = match join(&data, &args, password.as_deref(), out).await {
+                let joined = match join_with(&data, &args, password.as_deref(), factor.as_ref(), out).await {
                     // `run` holds the data folder: it joins, through its local API.
                     Err(AgentError::Lock(LockError::Busy(path))) => {
-                        join_through_agent(&data, &args, password.clone(), out).await.map_err(|e| match e {
+                        join_through_agent(&data, &args, password.clone(), factor.clone(), out).await.map_err(|e| match e {
                             AgentError::Local(craft_cloud_app::Error::NotRunning(_)) => AgentError::Lock(LockError::Busy(path)),
                             other => other,
                         })
@@ -453,6 +553,13 @@ pub async fn run(cli: Cli, input: &mut impl BufRead, out: &mut impl Write) -> Re
                 };
                 match joined {
                     Err(AgentError::PasswordRequired) if password.is_none() => password = Some(new_password(input, out)?),
+                    // The code was not used up: the same join goes again with the second factor.
+                    Err(AgentError::TwoFactorRequired(_)) if factor.is_none() => factor = Some(read_factor(input, out)?),
+                    Err(AgentError::TwoFactorInvalid(message)) if wrong_codes < MAX_CODE_TRIES - 1 => {
+                        wrong_codes += 1;
+                        say!(out, "{message}")?;
+                        factor = Some(read_factor(input, out)?);
+                    }
                     other => break other?,
                 }
             }
@@ -572,8 +679,29 @@ fn new_password(input: &mut impl BufRead, out: &mut impl Write) -> Result<String
     Ok(first)
 }
 
+/// Wrong codes the command line takes before it gives up (the server's challenge takes five).
+const MAX_CODE_TRIES: u32 = 3;
+
+/// A code from the authenticator app, or a recovery code: one line on standard input (never an argument).
+fn read_factor(input: &mut impl BufRead, out: &mut impl Write) -> Result<Factor, AgentError> {
+    say!(out, "This account has two-factor sign-in. Type the code from your authenticator app (or a recovery code):")?;
+    out.flush().map_err(io_at(Path::new("standard output")))?;
+    let mut line = String::new();
+    input.take(200).read_line(&mut line).map_err(|e| AgentError::Usage(format!("can't read the code from standard input: {e}")))?;
+    if line.trim().is_empty() {
+        return Err(AgentError::Usage("no code on standard input".into()));
+    }
+    Ok(Factor::typed(&line))
+}
+
 /// `join` while `run` runs: the running agent joins.
-async fn join_through_agent(data: &DataDir, args: &JoinArgs, password: Option<String>, out: &mut impl Write) -> Result<(), AgentError> {
+async fn join_through_agent(
+    data: &DataDir,
+    args: &JoinArgs,
+    password: Option<String>,
+    factor: Option<Factor>,
+    out: &mut impl Write,
+) -> Result<(), AgentError> {
     let folder = args.folder.as_ref().map(|f| std::path::absolute(f).map_err(io_at(f))).transpose()?;
     let request = craft_cloud_app::JoinRequest {
         join: args.join.clone(),
@@ -581,6 +709,8 @@ async fn join_through_agent(data: &DataDir, args: &JoinArgs, password: Option<St
         device_name: args.device_name.clone(),
         adopt: args.adopt,
         password,
+        totp_code: factor.as_ref().and_then(|f| f.totp_code.clone()),
+        recovery_code: factor.and_then(|f| f.recovery_code),
     };
     let data_path = data.path().to_owned();
     let status = blocking(move || craft_cloud_app::Client::connect_in(&data_path)?.join(&request)).await.map_err(local_error)?;
@@ -713,8 +843,22 @@ pub(crate) async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, cr
 /// The local API's refusals as the errors the CLI has for them.
 pub(crate) fn local_error(e: AgentError) -> AgentError {
     use craft_cloud_proto::local::codes;
+    // A refusal that carries the challenge or the wait of a lock.
+    if let AgentError::Local(inner @ craft_cloud_app::Error::RefusedWith { .. }) = &e {
+        let message = inner.to_string();
+        return match inner.code() {
+            Some(codes::TWO_FACTOR_REQUIRED) => {
+                AgentError::TwoFactorRequired(inner.challenge().cloned().unwrap_or(TwoFactorChallenge { challenge: String::new(), expires_ms: 0 }))
+            }
+            Some(codes::TWO_FACTOR_LOCKED) => locked(message, inner.retry_after_secs()),
+            _ => AgentError::Usage(message),
+        };
+    }
     match e {
-        AgentError::Local(craft_cloud_app::Error::Refused { code, message }) => match code.as_str() {
+        AgentError::Local(craft_cloud_app::Error::Refused { code, message, .. }) => match code.as_str() {
+            codes::TWO_FACTOR_INVALID => AgentError::TwoFactorInvalid(message),
+            codes::TWO_FACTOR_EXPIRED => AgentError::ChallengeGone,
+            codes::TWO_FACTOR_REQUIRED => AgentError::TwoFactorRequired(TwoFactorChallenge { challenge: String::new(), expires_ms: 0 }),
             codes::WRONG_PASSWORD => AgentError::WrongPassword,
             codes::NOT_SIGNED_IN => AgentError::NotSignedIn,
             codes::OFFLINE => AgentError::Offline(message),
@@ -740,6 +884,36 @@ async fn login_through_agent(data: &DataDir, args: &LoginArgs, password: String,
     };
     let data_path = data.path().to_owned();
     let status = blocking(move || craft_cloud_app::Client::connect_in(&data_path)?.login(&request)).await.map_err(local_error)?;
+    say!(
+        out,
+        "signed in as {} on {} (through the running agent, which syncs {} now)",
+        status.account.unwrap_or_default(),
+        status.server.unwrap_or_default(),
+        status.folder.unwrap_or_default()
+    )
+}
+
+/// The second step of `login` while `run` runs: the running agent finishes the sign-in.
+async fn second_step_through_agent(
+    data: &DataDir,
+    args: &LoginArgs,
+    challenge: &TwoFactorChallenge,
+    factor: &Factor,
+    out: &mut impl Write,
+) -> Result<(), AgentError> {
+    let folder = args.folder.as_ref().map(|f| std::path::absolute(f).map_err(io_at(f))).transpose()?;
+    let request = craft_cloud_app::SecondFactorLoginRequest {
+        server: args.url.clone(),
+        user: args.user.clone(),
+        folder: folder.map(|f| f.display().to_string()),
+        device_name: args.device_name.clone(),
+        adopt: args.adopt,
+        challenge: challenge.challenge.clone(),
+        totp_code: factor.totp_code.clone(),
+        recovery_code: factor.recovery_code.clone(),
+    };
+    let data_path = data.path().to_owned();
+    let status = blocking(move || craft_cloud_app::Client::connect_in(&data_path)?.login_second_factor(&request)).await.map_err(local_error)?;
     say!(
         out,
         "signed in as {} on {} (through the running agent, which syncs {} now)",
@@ -1095,11 +1269,44 @@ pub(crate) async fn login_locked(data: &DataDir, args: &LoginArgs, password: &st
     let server = ServerUrl::parse(&args.url).map_err(|e| AgentError::Usage(e.to_string()))?;
     let prepared = prepare(data, args.folder.as_deref(), args.device_name.as_deref(), args.adopt)?;
     ask_server(&server, |_, message| AgentError::Offline(message)).await?;
-    let signed_in = match http::login(&server, &args.user, password, &prepared.device_name).await {
-        Err(TransportError::Unauthorized) => return Err(AgentError::WrongPassword),
-        other => other?,
+    let signed_in = match http::login_step(&server, &args.user, password, &prepared.device_name).await {
+        Ok(LoginStep::Device(signed_in)) => signed_in,
+        // An account with two-factor sign-in: no device yet. The caller asks for the code and finishes with
+        // [`login_second_factor_locked`], which needs nothing of this call but its arguments.
+        Ok(LoginStep::SecondFactor(challenge)) => return Err(AgentError::TwoFactorRequired(challenge)),
+        Err(CallError::Transport(TransportError::Unauthorized)) => return Err(AgentError::WrongPassword),
+        Err(CallError::Refused(refusal)) => return Err(legacy(&refusal).into()),
+        Err(CallError::Transport(e)) => return Err(e.into()),
     };
     set_up(data, &server, signed_in, prepared).await
+}
+
+/// The second step of a sign-in: the folder's checks again (the agent keeps nothing between the steps), then the challenge and
+/// the second factor make the device, and the folder is set up as after [`login`]. Prints nothing.
+pub(crate) async fn login_second_factor_locked(data: &DataDir, args: &LoginArgs, challenge: &str, factor: &Factor) -> Result<Account, AgentError> {
+    if let Some(account) = data.load_account()? {
+        return Err(already_signed_in(&account));
+    }
+    let server = ServerUrl::parse(&args.url).map_err(|e| AgentError::Usage(e.to_string()))?;
+    let prepared = prepare(data, args.folder.as_deref(), args.device_name.as_deref(), args.adopt)?;
+    ask_server(&server, |_, message| AgentError::Offline(message)).await?;
+    let signed_in = http::second_factor(&server, challenge, factor).await.map_err(factor_error)?;
+    set_up(data, &server, signed_in, prepared).await
+}
+
+/// [`login_second_factor_locked`] for the command line: holds the data folder and says it signed in.
+pub async fn login_second_factor(
+    data: &DataDir,
+    args: &LoginArgs,
+    challenge: &TwoFactorChallenge,
+    factor: &Factor,
+    out: &mut impl Write,
+) -> Result<Account, AgentError> {
+    let _data_lock = hold_data(data)?;
+    let account = login_second_factor_locked(data, args, &challenge.challenge, factor).await?;
+    say!(out, "signed in as {} on {} (device \"{}\")", account.username, account.server, account.device_name)?;
+    say!(out, "syncing {}; run `craft-cloud-agent sync` to sync it", account.folder.display())?;
+    Ok(account)
 }
 
 /// Joins with a join string (an invite or an add-a-computer code), creates a device and sets up the folder, as
@@ -1107,8 +1314,20 @@ pub(crate) async fn login_locked(data: &DataDir, args: &LoginArgs, password: &st
 /// name, what the server speaks); a failure after it (the folder is set up for another space) removes the new device
 /// again, and says the code is used up. `password`: the new account's, for an invite that needs one.
 pub async fn join(data: &DataDir, args: &JoinArgs, password: Option<&str>, out: &mut impl Write) -> Result<Account, AgentError> {
+    join_with(data, args, password, None, out).await
+}
+
+/// [`join`] with the second factor of an account that has two-factor sign-in (without one, such an account answers
+/// [`AgentError::TwoFactorRequired`] and the code is not used up).
+pub async fn join_with(
+    data: &DataDir,
+    args: &JoinArgs,
+    password: Option<&str>,
+    factor: Option<&Factor>,
+    out: &mut impl Write,
+) -> Result<Account, AgentError> {
     let _data_lock = hold_data(data)?;
-    let account = join_locked(data, args, password).await?;
+    let account = join_locked(data, args, password, factor).await?;
     say!(out, "joined as {} on {} (device \"{}\")", account.username, account.server, account.device_name)?;
     say!(out, "syncing {}; run `craft-cloud-agent run` to keep it in sync", account.folder.display())?;
     Ok(account)
@@ -1116,7 +1335,7 @@ pub async fn join(data: &DataDir, args: &JoinArgs, password: Option<&str>, out: 
 
 /// [`join`] for a caller that holds the data folder's lock already: the `run` loop, joining for the local API.
 /// Prints nothing.
-pub(crate) async fn join_locked(data: &DataDir, args: &JoinArgs, password: Option<&str>) -> Result<Account, AgentError> {
+pub(crate) async fn join_locked(data: &DataDir, args: &JoinArgs, password: Option<&str>, factor: Option<&Factor>) -> Result<Account, AgentError> {
     if let Some(account) = data.load_account()? {
         return Err(already_signed_in(&account));
     }
@@ -1125,8 +1344,13 @@ pub(crate) async fn join_locked(data: &DataDir, args: &JoinArgs, password: Optio
     let prepared = prepare(data, args.folder.as_deref(), args.device_name.as_deref(), args.adopt)?;
     let unreachable = |server: &ServerUrl, message| AgentError::Unreachable { server: server.to_string(), message };
     ask_server(&server, unreachable).await?;
-    let signed_in = match http::join(&server, join.code.as_str(), &prepared.device_name, password).await {
+    let signed_in = match http::join_with_factor(&server, join.code.as_str(), &prepared.device_name, password, factor).await {
         Ok(signed_in) => signed_in,
+        Err(JoinError::TwoFactorRequired) => {
+            return Err(AgentError::TwoFactorRequired(TwoFactorChallenge { challenge: String::new(), expires_ms: 0 }));
+        }
+        Err(JoinError::TwoFactorInvalid(message)) => return Err(AgentError::TwoFactorInvalid(message)),
+        Err(JoinError::TwoFactorLocked { message, retry_after_secs }) => return Err(locked(message, retry_after_secs)),
         Err(JoinError::InvalidCode) => return Err(AgentError::InvalidCode),
         Err(JoinError::PasswordRequired) => return Err(AgentError::PasswordRequired),
         Err(JoinError::WeakPassword(message)) => return Err(AgentError::WeakPassword(message)),
@@ -1568,6 +1792,15 @@ pub(crate) fn print_summary(out: &mut impl Write, s: &PassSummary) -> Result<(),
     } else {
         say!(out, "synced: {}", done.join(", "))?;
     }
+    if s.read_only {
+        say!(out, "this space is read-only for you: nothing is uploaded, and what you change here stays on this computer")?;
+    }
+    if !s.restored.is_empty() {
+        say!(out, "deleted here, downloaded again (the space is read-only for you):")?;
+        for path in &s.restored {
+            say!(out, "  {path}")?;
+        }
+    }
     if !s.conflict_copies.is_empty() {
         say!(out, "conflict copies (both versions kept):")?;
         for path in &s.conflict_copies {
@@ -1920,6 +2153,9 @@ mod tests {
             (SyncError::Transport(TransportError::Protocol("a refusal naming no operation".into())), Exit::NeedsYou),
             // Only with no room left at all: a file that doesn't fit while others still may is skipped instead.
             (SyncError::Transport(TransportError::QuotaExceeded { used: 10, limit: 10 }), Exit::NeedsYou),
+            // The engine keeps a read-only space read-only by itself; one that gets this far (another caller of the
+            // transport) is a state the user is told about, not retried.
+            (SyncError::Transport(TransportError::ReadOnly), Exit::NeedsYou),
             (SyncError::Io { path: "an interrupted download".into(), source: std::io::Error::other("x") }, Exit::Failed),
             (SyncError::Corrupt("chunk x of a.txt is damaged".into()), Exit::NeedsYou),
             (SyncError::Checkpoint(std::io::Error::other("disk full")), Exit::Failed),
@@ -1935,7 +2171,8 @@ mod tests {
                     | TransportError::Unauthorized
                     | TransportError::Unavailable(_)
                     | TransportError::Protocol(_)
-                    | TransportError::QuotaExceeded { .. },
+                    | TransportError::QuotaExceeded { .. }
+                    | TransportError::ReadOnly,
                 )
                 | SyncError::Io { .. }
                 | SyncError::Corrupt(_)

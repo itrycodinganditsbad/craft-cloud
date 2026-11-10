@@ -11,13 +11,15 @@ pub const MAX_WAITERS_PER_SPACE: usize = 16;
 
 pub struct Notifier {
     spaces: Mutex<HashMap<SpaceId, watch::Sender<u64>>>,
+    /// Counts the changes to a space's members, roles and life cycle, for the waiters to re-check their access.
+    members: Mutex<HashMap<SpaceId, watch::Sender<u64>>>,
     waiters: Mutex<HashMap<SpaceId, usize>>,
     shutdown: watch::Sender<bool>,
 }
 
 impl Default for Notifier {
     fn default() -> Self {
-        Self { spaces: Mutex::default(), waiters: Mutex::default(), shutdown: watch::channel(false).0 }
+        Self { spaces: Mutex::default(), members: Mutex::default(), waiters: Mutex::default(), shutdown: watch::channel(false).0 }
     }
 }
 
@@ -66,6 +68,22 @@ impl Notifier {
     pub fn subscribe(&self, space: SpaceId) -> watch::Receiver<u64> {
         let mut spaces = self.spaces.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         spaces.entry(space).or_insert_with(|| watch::channel(0).0).subscribe()
+    }
+
+    /// A receiver that sees every later [`Notifier::members_changed`] for the space.
+    pub fn subscribe_members(&self, space: SpaceId) -> watch::Receiver<u64> {
+        let mut members = self.members.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        members.entry(space).or_insert_with(|| watch::channel(0).0).subscribe()
+    }
+
+    /// Tells the space's waiting long-polls that its members, a role or its life cycle (archived) changed, so each looks
+    /// at its own access again at once. A space nobody watches is a no-op. Another server process on the same database is
+    /// not told: its waiters notice at the end of their wait (at most a minute).
+    pub fn members_changed(&self, space: SpaceId) {
+        let members = self.members.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(sender) = members.get(&space) {
+            sender.send_modify(|count| *count = count.wrapping_add(1));
+        }
     }
 
     /// Raises the space's sequence to `seq` and wakes its subscribers. Lower values are ignored, and a

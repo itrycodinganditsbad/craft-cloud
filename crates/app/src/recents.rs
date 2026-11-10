@@ -75,7 +75,7 @@ type Socket = WebSocket<TcpStream>;
 
 fn refused(event: Wire) -> Error {
     match event {
-        Wire::Error { code, message, .. } => Error::Refused { code, message },
+        Wire::Error { code, message, .. } => Error::Refused { code, message, name_taken: None },
         other => Error::Protocol(format!("unexpected {other:?}")),
     }
 }
@@ -110,7 +110,7 @@ fn open(client: &Client, app: &str, follow: bool) -> Result<(Socket, (Vec<Recent
             let status = response.status().as_u16();
             let body = response.into_body().unwrap_or_default();
             return Err(match serde_json::from_slice::<ErrorBody>(&body) {
-                Ok(body) => Error::Refused { code: body.error, message: body.message },
+                Ok(body) => Error::Refused { code: body.error, message: body.message, name_taken: body.name_taken },
                 Err(_) => Error::Protocol(format!("HTTP {status}")),
             });
         }
@@ -142,7 +142,7 @@ fn open(client: &Client, app: &str, follow: bool) -> Result<(Socket, (Vec<Recent
 fn unavailable(e: &Error) -> bool {
     match e {
         Error::NotRunning(_) | Error::Io(_) => true,
-        Error::Refused { code, .. } => code == codes::NOT_SIGNED_IN,
+        Error::Refused { code, .. } | Error::RefusedWith { code, .. } => code == codes::NOT_SIGNED_IN,
         Error::Version(_) | Error::Protocol(_) => false,
     }
 }
@@ -332,7 +332,7 @@ impl Link {
                 }
                 Ok(Some(Wire::Error { id: None, code, message })) => {
                     if code == codes::NOT_SIGNED_IN {
-                        break Error::Refused { code, message };
+                        break Error::Refused { code, message, name_taken: None };
                     }
                 }
                 Ok(None) => {}

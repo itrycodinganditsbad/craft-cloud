@@ -32,6 +32,8 @@ use crate::transport::{Transport, TransportError};
 
 mod apply;
 mod push;
+mod readonly;
+pub use readonly::{READ_ONLY_EDITED, READ_ONLY_NEW};
 
 /// Names that never sync (matched against the raw name, ignoring ASCII case): exact names, `prefix*` and `*suffix`.
 pub const DEFAULT_IGNORES: &[&str] = &[".craft-cloud", ".DS_Store", "Thumbs.db", "desktop.ini", "~$*", "*.tmp", "*.part", ".~lock.*"];
@@ -204,6 +206,11 @@ pub struct Report {
     pub held_nodes: Vec<NodeId>,
     /// Operations the server refused this pass; they are retried next pass.
     pub refused: Vec<Conflict>,
+    /// Whether the pass ran in read-only mode (see [`Engine::set_read_only`]): nothing was sent to the server.
+    pub read_only: bool,
+    /// Files and folders deleted here that the server still has, put back this pass (read-only mode only: a delete
+    /// there can't go up, so the server's copy comes back, and the report says so).
+    pub restored: Vec<RelPath>,
 }
 
 impl Report {
@@ -216,6 +223,7 @@ impl Report {
             && self.moved_remotely.is_empty()
             && self.created_dirs.is_empty()
             && self.conflict_copies.is_empty()
+            && self.restored.is_empty()
             && self.refused.is_empty())
     }
 }
@@ -366,6 +374,18 @@ pub struct Engine<F: Fs, T: Transport> {
     /// Since when each such file has waited, across passes (a monotonic clock: on Linux and macOS it stops while the
     /// machine sleeps; on Windows it may not).
     unknown_since: HashMap<NodeId, std::time::Instant>,
+    /// Whether this space is read-only for the account (a viewer): the engine downloads and applies the server's changes
+    /// and never sends anything (see [`Engine::set_read_only`]).
+    read_only: bool,
+    /// The files only here that the last read-only pass listed (path and reason); a pass lists them again only when this
+    /// changes. Cleared when the mode ends.
+    local_only_listed: BTreeSet<(String, &'static str)>,
+    /// What read-only mode last found out about tracked files of the same size as the agreed content: whether they hold
+    /// something else, by the file's size, time and ID and the agreed content, so an unchanged file is read once.
+    read_only_verdicts: BTreeMap<RelPath, (FileMeta, FileHash, bool)>,
+    /// The files whose new content a commit of the running push took, so a push cut short by a refusal reports as uploaded
+    /// only those (content sent for the rest was not committed).
+    committed_files: BTreeSet<NodeId>,
 }
 
 /// What Craft apps saved from live documents, as the agent learnt it from them (`craft_cloud_proto::SaveRecord`).
@@ -442,7 +462,34 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             attached: BTreeSet::new(),
             deferred: BTreeSet::new(),
             unknown_since: HashMap::new(),
+            read_only: false,
+            local_only_listed: BTreeSet::new(),
+            read_only_verdicts: BTreeMap::new(),
+            committed_files: BTreeSet::new(),
         })
+    }
+
+    /// Puts the engine in or out of read-only mode, for a space where the account's role is `viewer` (known from
+    /// `GET /spaces`, or from a `403 read_only` the engine learns by itself).
+    ///
+    /// In read-only mode a pass applies the server's changes as usual and sends nothing: a local edit is kept and never
+    /// overwritten (when the server's version of the file changes too, the server's lands under the original name and the
+    /// edit stays as a conflict copy), a new local file stays local, and a file or folder deleted here is downloaded again
+    /// (reported in [`Report::restored`]). Everything kept here is listed in [`Report::skipped`] with the reason. While in
+    /// this mode each pass asks the server for the role (`GET /space`): once it is `editor` or better the mode ends, and
+    /// the next push uploads the local files as ordinary new files and edits. An engine not told anything learns the mode
+    /// from the first write the server refuses, then makes no further write.
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+        if !read_only {
+            self.local_only_listed.clear();
+            self.read_only_verdicts.clear();
+        }
+    }
+
+    /// Whether the engine is in read-only mode ([`Engine::set_read_only`]).
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Where the engine learns what Craft apps saved from live documents: a version uploaded with content an app
@@ -544,6 +591,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         report.skipped.extend(self.fs.notices());
         // Before anything can fail (an offline server, a download), so a pass that fails still leaves it behind.
         self.learn_dir_ids()?;
+        self.learn_role().await;
         let mode = match self.pull().await? {
             Mode::Normal if self.state.reconcile_pending => Mode::Reconcile,
             mode => mode,
@@ -552,11 +600,40 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         self.state.reconcile_pending = false;
         self.discard_stale_downloads();
         self.checkpoint()?;
-        self.push(&mut report).await?;
+        // A first write the server refuses ends the push with nothing stored: the engine switches to read-only mode and
+        // the same pass goes on in it, so the local changes are reported as kept and nothing is retried.
+        self.committed_files.clear();
+        match self.push(&mut report).await {
+            Err(SyncError::Transport(TransportError::ReadOnly)) => {
+                self.read_only = true;
+                // What the refused push did before the refusal stays in the report: batches committed before the role
+                // changed, and conflict copies already moved aside. Content sent for files no commit took is not
+                // reported as uploaded (it stays here, and is listed as kept).
+                let committed: BTreeSet<RelPath> = self.committed_files.iter().filter_map(|id| self.state.base_path(*id)).collect();
+                report.uploaded.retain(|path| committed.contains(path));
+                self.push(&mut report).await?;
+            }
+            other => other?,
+        }
+        report.read_only = self.read_only;
         self.approval = Approval::None;
         self.release.clear();
         self.attach_late_saves().await;
         Ok(report)
+    }
+
+    /// While in read-only mode, asks the server for the account's role: once it may write again (a viewer made an editor),
+    /// the mode ends and this pass pushes. An answer that doesn't come or doesn't say changes nothing: the pull that follows
+    /// meets the same trouble, and a missing role (a server from before team spaces) never refuses a write.
+    async fn learn_role(&mut self) {
+        if !self.read_only {
+            return;
+        }
+        if let Ok(space) = self.transport.space().await
+            && space.role.is_some_and(|role| role >= craft_cloud_proto::api::SpaceRole::Editor)
+        {
+            self.set_read_only(false);
+        }
     }
 
     /// Save records that came after their version went up (an app saved while the agent was away, and told it once
@@ -565,7 +642,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// content the record names, and none yet. Sent once per version per run; an older server (`NotFound`) is let be,
     /// anything else tried again next pass.
     async fn attach_late_saves(&mut self) {
-        if self.saves.is_none() {
+        if self.saves.is_none() || self.read_only {
             return;
         }
         let mut late = Vec::new();
@@ -609,6 +686,11 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                     if node.deleted {
                         self.state.remote.remove(&node.id);
                     } else {
+                        // A folder this machine asked to delete (the answer never recorded) that the server reports
+                        // changed and live: noted here, judged in `apply_remote` once the files it held are settled.
+                        if self.state.sent_dir_deletes.contains(&node.id) {
+                            self.state.live_dirs.insert(node.id);
+                        }
                         self.state.remote.insert(node.id, RemoteNode::from_state(&node));
                     }
                 }
@@ -672,6 +754,10 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             }
         }
         let (epoch, seq) = first.ok_or_else(|| SyncError::Corrupt("empty listing".into()))?;
+        // A folder this machine asked to delete (the answer never recorded) that the listing has live is never pushed as
+        // deleted from that stale request: a listing can't tell a delete that never arrived from one followed by a
+        // restore, so the folder is let go and arrives as the server has it (the conservative side of a doubt).
+        self.state.live_dirs.extend(self.state.sent_dir_deletes.iter().filter(|id| remote.contains_key(*id)).copied());
         self.state.remote = remote;
         self.state.epoch = Some(epoch);
         self.state.seq = seq;

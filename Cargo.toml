@@ -6,7 +6,7 @@ members = ["crates/*", "apps/*", "xtask"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.94"
+rust-version = "1.95"
 repository = "https://github.com/itrycodinganditsbad/craft-cloud"
 
 [workspace.lints.rust]
@@ -28,6 +28,13 @@ craft-cloud-agent = { path = "apps/craft-cloud-agent" }
 craft-cloud-app = { path = "crates/app" }
 craft-cloud-kit = { path = "crates/kit" }
 craft-cloud-egui = { path = "crates/egui" }
+# Two-factor sign-in: AES-256-GCM for the stored TOTP secrets (RustCrypto, pure Rust), and HMAC-SHA-1 for the codes
+# themselves (authenticator apps speak SHA-1). `subtle` compares codes in constant time, `zeroize` wipes secrets.
+aes-gcm = "0.10.3"
+hmac = "0.13"
+sha1 = "0.11"
+subtle = "2.6"
+zeroize = "1.9"
 argon2 = "0.6"
 async-trait = "0.1.89"
 # `ws`: the server's live service and the agent's local API are WebSockets (tokio-tungstenite, MIT).
