@@ -682,6 +682,31 @@ restored files, run `craft-cloud-server verify --config …`, and, as for any re
 `serve` (see "Restoring a backup"). The blobs of the backup are a superset of what the restored database names: ones
 uploaded after the dump are not referenced and only take up room until a future garbage collection.
 
+## Google Drive, Dropbox, OneDrive (via rclone)
+
+Craft Cloud has no native backend for consumer cloud drives. Their sign-in tokens expire, their APIs limit the request
+rate, they have no atomic rename, and listings are only eventually consistent, while the blob store needs the behaviour of
+S3 or SFTP. So the store (`[storage]`) is `disk`, `s3` or `sftp` and nothing else. Do not put the live store on
+`rclone serve s3` or `rclone serve sftp` in front of a drive: the latency and the consistency are wrong for it, and that
+setup is not supported.
+
+A **backup** to such a drive is fine, in one of three ways:
+
+- **A. restic with the rclone backend.** Run `craft-cloud-server backup` to a local directory first (or dump the database
+  yourself), then, for example,
+  `restic -r rclone:gdrive:craft-cloud-backup backup /var/backups/craft-cloud/dump /var/lib/craft-cloud/blobs`.
+  restic encrypts everything it uploads, blobs included.
+- **B. The built-in backup to a local directory or an SFTP server, then `rclone sync`** to a `crypt` remote that wraps
+  the drive (`rclone config` makes it). The built-in backup seals the database dump, but not the blob contents, so the
+  `crypt` remote is what keeps the drive provider from reading your files.
+- **C. A bridge.** Run `rclone serve sftp` on a trusted machine, over a `crypt` remote on the drive, and give
+  `backup --to sftp://user@bridge/dir` that machine as the target. Host-key pinning (`--host-key` or `--known-hosts`)
+  and the SSH key (`--key-file`) apply as for any SFTP target.
+
+In every case the backup key (see "The backup key") must be kept separately, apart from the machine and from the drive:
+without it a built-in backup cannot be restored. Unless you use restic or a `crypt` remote, the drive provider can read
+the blob contents.
+
 ## Restoring a backup
 
 With the server stopped, restore the database and the chunk storage from the backup (and the two-factor key file, if
