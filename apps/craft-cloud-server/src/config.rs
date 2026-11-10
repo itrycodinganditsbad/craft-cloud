@@ -449,6 +449,12 @@ pub struct BackupConfig {
     /// How many database generations stay on the backup server (default 7).
     #[serde(default)]
     pub keep: Option<u32>,
+    /// The backup key: 32 random bytes that authenticate and seal the backups, so a backup server that has been taken over
+    /// cannot forge one. Made by the first `backup` if it is not there, and never overwritten. A relative path is relative
+    /// to the directory of `config.toml`; default `backup.key` beside it. Keep a copy apart from this machine: without it a
+    /// backup cannot be restored.
+    #[serde(default)]
+    pub backup_key_file: Option<PathBuf>,
 }
 
 /// A size in bytes written as `"1 TiB"`: a whole number or one with one decimal, then B, KB, MB, GB, TB (powers of 1000)

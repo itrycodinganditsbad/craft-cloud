@@ -171,7 +171,9 @@ pub enum Command {
     /// Copy the database and the blob store to an SFTP server: a consistent dump of the SQLite database, and every blob the
     /// server there does not have yet (blobs never change, so a repeated backup sends only what is new), then a manifest.
     /// Safe while the server runs. The server's host key must be pinned (`--host-key` or `--known-hosts`); the sign-in is by
-    /// key. The config file and the two-factor key are not copied: keep them apart. Postgres is dumped with `pg_dump`.
+    /// key. The database dump is sealed and the manifest carries a MAC under the backup key, which the first backup makes
+    /// (`backup.key` beside the config): keep a copy of it apart, because without it nothing can be restored. The config file
+    /// and the two-factor key are not copied: keep them apart. Postgres is dumped with `pg_dump`.
     Backup {
         /// Path to config.toml.
         #[arg(long)]
@@ -191,13 +193,18 @@ pub enum Command {
         /// Database generations kept on the backup server (default 7). The blobs are never removed.
         #[arg(long)]
         keep: Option<u32>,
+        /// The backup key file (made if missing). Or `[backup] backup_key_file`; default `backup.key` beside the config.
+        #[arg(long)]
+        backup_key_file: Option<PathBuf>,
         /// Where the database dump is made before it is sent (default: the system's temporary directory). Needs room for the database.
         #[arg(long)]
         work_dir: Option<PathBuf>,
     },
     /// Rebuild a data directory from a backup on an SFTP server: the newest complete generation (or `--generation`), checked
     /// against its manifest. The directory must be empty or missing. Writes `meta.db` and `blobs/`; the config file and the
-    /// two-factor key come from where you kept them. Run `verify` and `reset-epoch --all` before starting the server.
+    /// two-factor key come from where you kept them. Needs the backup key (`--backup-key-file`): the manifest's MAC is
+    /// checked before anything in it is believed, and a wrong or missing key restores nothing. Run `verify` and
+    /// `reset-epoch --all` before starting the server.
     Restore {
         /// Where from: sftp://user@host[:port]/directory.
         #[arg(long)]
@@ -214,6 +221,28 @@ pub enum Command {
         /// A generation's stamp (like 20261107T031500Z) instead of the newest.
         #[arg(long)]
         generation: Option<String>,
+        /// The backup key the backup was made with.
+        #[arg(long)]
+        backup_key_file: Option<PathBuf>,
+        /// A config.toml to take `[backup] backup_key_file` and the sign-in settings from.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Restore a generation from before backups were authenticated. Only for test data: whoever controls the backup
+        /// server could have changed such a generation.
+        #[arg(long)]
+        allow_unauthenticated: bool,
+        /// The most the database may be once opened (default 8 GiB), for example "20 GiB".
+        #[arg(long, value_parser = parse_size)]
+        max_db_bytes: Option<u64>,
+        /// The most the whole restore may write, database and blobs (default 1 TiB).
+        #[arg(long, value_parser = parse_size)]
+        max_total_bytes: Option<u64>,
+        /// The most blobs a restore fetches (default 50000000).
+        #[arg(long)]
+        max_objects: Option<u64>,
+        /// Free space to leave on the target's disk, checked before and during the restore (default 1 GiB).
+        #[arg(long, value_parser = parse_size)]
+        min_free_bytes: Option<u64>,
     },
     /// Look at and tune how blobs are stored: recompress them at a higher level, estimate what that would save.
     Store {
@@ -438,6 +467,11 @@ pub enum CliError {
     Inconsistent(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// A size such as `20 GiB` for a command-line limit.
+fn parse_size(text: &str) -> Result<u64, String> {
+    crate::config::Capacity::parse(text).map(|capacity| capacity.0)
 }
 
 /// Opens the database a config names, and nothing else: for the commands that never touch a blob. A server whose blobs
@@ -810,28 +844,67 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
                 Err(CliError::Inconsistent(format!("{} manifest(s) could not be indexed", report.unreadable.len())))
             }
         }
-        Command::Backup { config, to, key_file, host_key, known_hosts, keep, work_dir } => {
+        Command::Backup { config, to, key_file, host_key, known_hosts, keep, backup_key_file, work_dir } => {
             #[cfg(feature = "sftp")]
             {
                 let config = Config::load(&config_path(config)?)?;
-                let options = crate::backup::RemoteOptions { url: to, key_file, host_key, known_hosts };
+                let options = crate::backup::RemoteOptions { url: to, key_file, host_key, known_hosts, backup_key_file };
                 crate::backup::backup(&config, &options, keep, work_dir.as_deref(), out).await
             }
             #[cfg(not(feature = "sftp"))]
             {
-                let _ = (config, to, key_file, host_key, known_hosts, keep, work_dir);
+                let _ = (config, to, key_file, host_key, known_hosts, keep, backup_key_file, work_dir);
                 Err(no_sftp())
             }
         }
-        Command::Restore { from, dir, key_file, host_key, known_hosts, generation } => {
+        Command::Restore {
+            from,
+            dir,
+            key_file,
+            host_key,
+            known_hosts,
+            generation,
+            backup_key_file,
+            config,
+            allow_unauthenticated,
+            max_db_bytes,
+            max_total_bytes,
+            max_objects,
+            min_free_bytes,
+        } => {
             #[cfg(feature = "sftp")]
             {
-                let options = crate::backup::RemoteOptions { url: Some(from), key_file, host_key, known_hosts };
-                crate::backup::restore(&options, &dir, generation.as_deref(), out).await
+                let config = match config {
+                    Some(path) => Some(Config::load(&path)?),
+                    None => None,
+                };
+                let options = crate::backup::RemoteOptions { url: Some(from), key_file, host_key, known_hosts, backup_key_file };
+                let defaults = crate::backup::RestoreLimits::default();
+                let limits = crate::backup::RestoreLimits {
+                    max_db_bytes: max_db_bytes.unwrap_or(defaults.max_db_bytes),
+                    max_total_bytes: max_total_bytes.unwrap_or(defaults.max_total_bytes),
+                    max_objects: max_objects.unwrap_or(defaults.max_objects),
+                    min_free_bytes: min_free_bytes.unwrap_or(defaults.min_free_bytes),
+                };
+                crate::backup::restore(&options, config.as_ref(), limits, allow_unauthenticated, &dir, generation.as_deref(), out).await
             }
             #[cfg(not(feature = "sftp"))]
             {
-                let _ = (from, dir, key_file, host_key, known_hosts, generation);
+                let _ = (
+                    from,
+                    dir,
+                    key_file,
+                    host_key,
+                    known_hosts,
+                    generation,
+                    backup_key_file,
+                    config,
+                    allow_unauthenticated,
+                    max_db_bytes,
+                    max_total_bytes,
+                    max_objects,
+                    min_free_bytes,
+                );
                 Err(no_sftp())
             }
         }
