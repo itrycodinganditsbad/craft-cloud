@@ -39,6 +39,7 @@ services:
       STORAGE_KIND: disk
     volumes:
       - ./secrets-init.sh:/secrets-init.sh:ro
+      - ./make-key.sh:/make-key.sh:ro
       - ./render-config.sh:/render-config.sh:ro
       - ./config.toml.in:/config.toml.in:ro
       - secrets:/out
