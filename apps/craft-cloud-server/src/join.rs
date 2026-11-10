@@ -4,11 +4,18 @@
 //! - **One answer for every code that doesn't work**: wrong, expired, used, malformed, or a pairing whose maker has
 //!   signed out are all `404 invalid_code` with the same message, so an answer never says which.
 //! - **Failed redeems are limited per client address** (behind trusted proxies, as sign-ins are): [`JOINS_PER_IP`]
-//!   in a minute, then `429 rate_limited`, even for a code that works. Only `invalid_code` counts. A successful
-//!   redeem doesn't, and neither does `password_required` or `weak_password`: they are only answered for a real,
-//!   unused invite, so they tell a guesser nothing a success wouldn't. Every try is counted before the code is
-//!   looked at, and given back once it turns out not to be `invalid_code`, so tries sent at the same moment are held
-//!   to the limit as well.
+//!   in a minute, then `429 rate_limited`, even for a code that works. `invalid_code` and `two_factor_invalid` count. A
+//!   successful redeem doesn't, and neither does `password_required`, `weak_password` or `two_factor_required`: they are
+//!   only answered for a real, unused invite, so they tell a guesser nothing a success wouldn't. Every try is counted
+//!   before the code is looked at, and given back once it turns out not to be one of those two, so tries sent at the same
+//!   moment are held to the limit as well.
+//! - **An account with two-factor sign-in** needs its second factor (`totp_code`, or `recovery_code`) to redeem an invite or
+//!   a password reset code, unless the reset code was made to turn it off. Without it the answer is `401
+//!   two_factor_required` and the code is **not** used up: the same body is sent again with the factor (there is no
+//!   challenge for `/join`, so the answer's `challenge` is empty). A wrong factor is `401 two_factor_invalid`, leaves the
+//!   code as it was and counts against the account (and its lock) and, with the client address, against the
+//!   second-factor limiter. A pairing code needs no second factor: only a signed-in device can make one, and turning
+//!   two-factor sign-in on signs the account's other devices out.
 //! - **An invite to a new account** must carry a password (the server's password rules), hashed with Argon2id under
 //!   the same server-wide slots as sign-ins; it becomes the account's in the transaction that creates the device.
 //! - **Codes are never logged**, and neither are tokens or passwords; the database keeps only codes' hashes.
@@ -21,16 +28,17 @@ use axum::extract::rejection::PathRejection;
 use axum::extract::{ConnectInfo, Extension, Path, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::IntoResponse;
-use craft_cloud_meta::DeviceAuth;
+use craft_cloud_meta::{CHALLENGE_TTL_MS, DeviceAuth, DeviceClient, MetaError};
 use craft_cloud_proto::api::{JoinRequest, LoginResponse, PairingCreated, PairingStatus, codes};
 use craft_cloud_proto::join::{Code, PAIRING_CHARS, PAIRING_TTL_MS};
 use uuid::Uuid;
 
-use crate::api::{PASSWORD_RETRY_SECS, SMALL_JSON_BYTES, check_device_name, read_json};
+use crate::api::{PASSWORD_RETRY_SECS, SMALL_JSON_BYTES, check_device_name, device_client, read_json};
 use crate::auth::{check_password_rules, hash_password, new_token};
 use crate::error::ApiError;
 use crate::ratelimit::{client_ip, ip_key};
 use crate::state::AppState;
+use crate::two_factor::{Prepared, ProofInput, SECOND_FACTORS_PER_IP, parse_proof};
 
 /// Failed redeems one client address may make in a minute.
 pub const JOINS_PER_IP: u32 = 10;
@@ -82,22 +90,50 @@ pub async fn join(
 ) -> Result<Json<LoginResponse>, ApiError> {
     let req: JoinRequest = read_json(&state, request, SMALL_JSON_BYTES).await?;
     check_device_name(&req.device_name)?;
+    // Checked before the try is counted, as the device name is: a body that is refused for it costs nothing.
+    let client = device_client(req.client_kind.as_deref(), req.platform.as_deref(), req.app_version.as_deref())?;
+    let proof = parse_proof(req.totp_code.clone(), req.recovery_code.clone())?;
     // tokio's clock: the system's monotonic clock in the server, the simulated one in a simulation.
     let now = tokio::time::Instant::now().into_std();
     let key = ip_key(client_ip(peer, &headers, &state.trusted_proxies));
     // Counted before the redeem, so tries made at the same moment are held to the limit too; given back unless the
     // code didn't work.
     let Some(counted) = state.joins.count(&key, JOINS_PER_IP, now) else {
-        return Err(ApiError::rate_limited("too many tries with codes that don't work; wait a minute", None));
+        return Err(limited("too many tries with codes that don't work; wait a minute", state.joins.retry_after(&key, now)));
     };
-    let result = redeem(&state, &req).await;
-    if !result.as_ref().is_err_and(|e| e.code == codes::INVALID_CODE) {
+    // A second factor is also counted against the address's second-factor limiter: wrong ones stay counted.
+    let second = match proof {
+        Some(_) => match state.second_factors.count(&key, SECOND_FACTORS_PER_IP, now) {
+            Some(counted) => Some(counted),
+            None => {
+                state.joins.refund(&key, counted);
+                return Err(limited("too many wrong codes from this address; wait a few minutes", state.second_factors.retry_after(&key, now)));
+            }
+        },
+        None => None,
+    };
+    let result = redeem(&state, &req, &client, proof).await;
+    // Wrong codes (of the invite or of the second factor) stay counted; everything else is given back.
+    if !result.as_ref().is_err_and(|e| e.code == codes::INVALID_CODE || e.code == codes::TWO_FACTOR_INVALID) {
         state.joins.refund(&key, counted);
+    }
+    if let Some(second) = second
+        && !result.as_ref().is_err_and(|e| e.code == codes::TWO_FACTOR_INVALID)
+    {
+        state.second_factors.refund(&key, second);
     }
     result.map(Json)
 }
 
-async fn redeem(state: &AppState, req: &JoinRequest) -> Result<LoginResponse, ApiError> {
+/// The answer for a join a limiter refuses: the same for every code (a real invite, a locked account's, a made-up one), with the
+/// time until the limiter's window ends in `Retry-After`, so that the refusal tells a guesser nothing about codes or locks.
+/// A lock is only told to a request the limiters let through (and counted), as at sign-in.
+fn limited(message: &'static str, window: std::time::Duration) -> ApiError {
+    let secs = u32::try_from(window.as_secs().saturating_add(1)).unwrap_or(u32::MAX).max(1);
+    ApiError::rate_limited(message, Some(secs))
+}
+
+async fn redeem(state: &AppState, req: &JoinRequest, client: &DeviceClient, proof: Option<ProofInput>) -> Result<LoginResponse, ApiError> {
     let code = Code::parse_any(&req.code).ok_or_else(ApiError::invalid_code)?;
     let code_hash = code.hash();
     let now_ms = state.now_ms();
@@ -110,8 +146,22 @@ async fn redeem(state: &AppState, req: &JoinRequest) -> Result<LoginResponse, Ap
         Some(false) | None => None,
     };
     let (token, token_hash) = new_token()?;
-    let redeemed = state.meta.redeem(&code_hash, &req.device_name, &token_hash, new_password_hash.as_deref(), now_ms).await?;
-    tracing::info!(device = %redeemed.device, "device joined with a code");
+    let prepared = proof.map(|proof| proof.prepare(state, now_ms));
+    let second_factor = prepared.as_ref().map(Prepared::proof);
+    let redeemed = state
+        .meta
+        .redeem_with_second_factor(&code_hash, &req.device_name, client, &token_hash, new_password_hash.as_deref(), second_factor.as_ref(), now_ms)
+        .await
+        .map_err(|e| match e {
+            // No challenge row for a join: the answer only says that the same code goes again with the second factor.
+            MetaError::TwoFactorRequired => ApiError::two_factor_required(String::new(), now_ms.saturating_add(CHALLENGE_TTL_MS)),
+            e => ApiError::from(e).on_public_route(),
+        })?;
+    // A reset code signed the account's other devices out: their live connections end now, not at their next request.
+    for device in &redeemed.revoked {
+        state.live.revoke(*device);
+    }
+    tracing::info!(device = %redeemed.device, revoked = redeemed.revoked.len(), "device joined with a code");
     Ok(LoginResponse { device: redeemed.device, token })
 }
 

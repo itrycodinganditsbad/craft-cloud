@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use craft_cloud_proto::live::MAX_UPDATE_BYTES;
-use loro::{ExportMode, IdSpan, LoroDoc, VersionVector};
+use loro::{ExportMode, IdSpan, LoroDoc};
 
 /// Why an update or a stored document was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -271,17 +271,39 @@ impl LiveCopy {
     }
 
     /// A snapshot of the document as it was at `version` (its history up to there, and the state then; nothing
-    /// later). `Invalid` if this copy doesn't hold every operation `version` names.
+    /// later). `Invalid` if this copy doesn't hold every operation `version` names, if those operations need others
+    /// past `version`, or if the document is shallow (Loro can't take a historical snapshot of one).
+    ///
+    /// Built by replaying the history up to `version` into a fresh document and taking its snapshot: Loro's own
+    /// `SnapshotAt` checks the document out at `version`, which on a long text history can need many GiB.
     pub fn snapshot_at(&self, version: &Version) -> Result<Vec<u8>, UpdateError> {
-        self.guard(|doc| {
+        let updates = self.guard(|doc| {
             let have = doc.oplog_vv();
             if version.iter().any(|(peer, end)| *end > 0 && have.get(peer).is_none_or(|h| h < end)) {
                 return Err(UpdateError::Invalid("the copy doesn't hold that version"));
             }
-            let vv: VersionVector = version.iter().filter(|(_, end)| **end > 0).map(|(peer, end)| (*peer, *end)).collect();
-            let frontiers = doc.vv_to_frontiers(&vv);
-            doc.export(ExportMode::SnapshotAt { version: std::borrow::Cow::Owned(frontiers) }).map_err(|e| UpdateError::Malformed(e.to_string()))
-        })
+            if doc.is_shallow() {
+                return Err(UpdateError::Invalid("a shallow document has no historical snapshot"));
+            }
+            let spans: Vec<_> = version.iter().filter(|(_, end)| **end > 0).map(|(peer, end)| IdSpan::new(*peer, 0, *end)).collect();
+            doc.export(ExportMode::updates_in_range(spans)).map_err(|e| UpdateError::Malformed(e.to_string()))
+        })?;
+        let copy = Self::new(self.peer());
+        let result = (|| {
+            copy.import_any_size(&updates)?;
+            let want: Version = version.iter().filter(|(_, end)| **end > 0).map(|(peer, end)| (*peer, *end)).collect();
+            if copy.version()? != want {
+                return Err(UpdateError::Invalid("the version is not causally complete"));
+            }
+            copy.snapshot()
+        })();
+        if copy.is_poisoned() {
+            // Dropping a poisoned Loro document panics again; this one is only a scratch copy, so it is let go of.
+            // A panic in it says nothing about this document, so it isn't reported as one.
+            std::mem::forget(copy);
+            return Err(UpdateError::Malformed("the historical snapshot couldn't be built".into()));
+        }
+        result
     }
 
     /// The changes (Loro commits: peer, first and end counter) of this document that `has` doesn't wholly hold, in
@@ -644,5 +666,47 @@ mod tests {
         assert_eq!(log.at(2), Some(at2));
         assert!(log.at(3).is_some());
         assert_eq!(version_of(&snapshot).unwrap().get(&1), Some(&8));
+    }
+
+    #[test]
+    fn historical_snapshot_preserves_large_text_and_accepts_later_updates() {
+        let source = LoroDoc::new();
+        source.set_peer_id(1).unwrap();
+        let copy = LiveCopy::new(9);
+        let text = "a".repeat(200_000);
+        let first = text_update(&source, 0, &text);
+        copy.import(&first).unwrap();
+        let version = copy.version().unwrap();
+        let later = text_update(&source, text.len(), "later");
+        copy.import(&later).unwrap();
+        let snapshot = copy.snapshot_at(&version).unwrap();
+        let fresh = LiveCopy::load(&snapshot, 5).unwrap();
+        assert_eq!(fresh.doc.get_text("text").to_string(), text);
+        fresh.import(&later).unwrap();
+        assert_eq!(fresh.doc.get_text("text").to_string(), format!("{text}later"));
+    }
+
+    /// A version whose operations depend on others past it (peer 2 typed after more of peer 1 than the version
+    /// holds) has no snapshot of its own: refused, never silently widened.
+    #[test]
+    fn a_historical_snapshot_of_a_version_that_needs_later_operations_is_refused() {
+        let (x, y) = (LoroDoc::new(), LoroDoc::new());
+        x.set_peer_id(1).unwrap();
+        y.set_peer_id(2).unwrap();
+        let first = text_update(&x, 0, "ab");
+        let second = text_update(&x, 2, "cd");
+        y.import(&first).unwrap();
+        y.import(&second).unwrap();
+        let from_y = text_update(&y, 4, "e");
+        let copy = LiveCopy::new(9);
+        for update in [&first, &second, &from_y] {
+            copy.import(update).unwrap();
+        }
+        let partial: Version = [(1, 2), (2, 1)].into_iter().collect();
+        assert!(matches!(copy.snapshot_at(&partial), Err(UpdateError::Invalid(_))));
+        assert!(!copy.is_poisoned());
+        let whole = copy.version().unwrap();
+        let snapshot = copy.snapshot_at(&whole).unwrap();
+        assert_eq!(LiveCopy::load(&snapshot, 5).unwrap().doc.get_text("text").to_string(), "abcde");
     }
 }
