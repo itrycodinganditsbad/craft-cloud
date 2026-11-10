@@ -44,6 +44,35 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             self.state.base.remove(&id);
         }
         self.state.sent_deletes.clear();
+        // The same for folders, whose deletes carry no version. A folder this machine asked to delete (the answer never
+        // recorded) that the server reports live is let go like a file whose delete went through (it was brought back
+        // after the delete, or changed by another machine first), and arrives as it is on the server, not deleted a
+        // second time. A folder the server no longer has went through, so it is let go too, once it is gone from here
+        // as well. This is settled deepest first, after the files above: a restored folder is only judged once the
+        // folders of this machine's own delete below it are settled, or a tombstoned subfolder still tracked in it
+        // would keep it and the next push would delete it again. A folder the feed did not mention was never touched:
+        // its delete is sent again. One that still has tracked nodes in it stays.
+        let live_dirs = std::mem::take(&mut self.state.live_dirs);
+        let mut asked: Vec<(usize, NodeId)> =
+            std::mem::take(&mut self.state.sent_dir_deletes).into_iter().map(|id| (self.state.base_path(id).map_or(0, |p| p.depth()), id)).collect();
+        asked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (_, id) in asked {
+            let is_dir = matches!(self.state.base.get(&id).map(|e| &e.kind), Some(BaseKind::Dir { .. }));
+            if !is_dir || self.state.base.values().any(|e| e.parent == Some(id)) {
+                continue;
+            }
+            let released = if live_dirs.contains(&id) {
+                true
+            } else if self.state.remote.contains_key(&id) {
+                false
+            } else {
+                // Deleted on the server; nothing of it is left here when its place is empty.
+                self.state.base_path(id).is_some_and(|path| matches!(self.stat(&path), Ok(None)))
+            };
+            if released {
+                self.state.base.remove(&id);
+            }
+        }
         // Changed or new remote nodes, parents first.
         let mut work: Vec<(usize, NodeId)> =
             self.state.remote.keys().filter(|id| **id != root).filter_map(|id| Some((self.state.remote_path(*id)?.depth(), *id))).collect();

@@ -80,6 +80,11 @@ pub struct Faults {
     pub every: AtomicU64,
     /// Make the next commit apply on the server but report failure, as if its reply was lost.
     pub lose_commit_reply: AtomicBool,
+    /// Fail the next commit before it reaches the server.
+    pub fail_next_commit: AtomicBool,
+    /// Make the next read of the change feed answer `ResyncRequired`, as if the server's history had been cut short:
+    /// the machine then lists the tree again.
+    pub resync_next_changes: AtomicBool,
     /// Make every commit come back refused, naming an operation the batch doesn't have.
     pub bad_conflict_index: AtomicBool,
     /// The machine died (see `MemFs::die_after`): every call fails.
@@ -94,6 +99,8 @@ pub struct Faults {
     /// The next this many chunk uploads are answered as stored but never stored, as by a proxy that answered for
     /// the server and lost them.
     pub lose_chunks: AtomicU64,
+    /// Every chunk upload is refused as by a server that is full itself (`TransportError::ServerFull`).
+    pub server_full: AtomicBool,
     calls: AtomicU64,
 }
 
@@ -158,6 +165,9 @@ impl Transport for Local {
 
     async fn changes(&self, since: u64, after: Option<PageCursor>) -> Result<ChangeSet, TransportError> {
         self.faults.check()?;
+        if self.faults.resync_next_changes.swap(false, Ordering::Relaxed) {
+            return Err(TransportError::ResyncRequired);
+        }
         self.meta.changes(self.space, since, after, self.page).await.map_err(meta_err)
     }
 
@@ -169,6 +179,9 @@ impl Transport for Local {
     async fn put_chunk(&self, id: &ChunkId, data: Bytes) -> Result<(), TransportError> {
         self.faults.check()?;
         self.faults.chunk_uploads.fetch_add(1, Ordering::Relaxed);
+        if self.faults.server_full.load(Ordering::Relaxed) {
+            return Err(TransportError::ServerFull);
+        }
         // One engine drives a transport at a time, so a load and a store are enough.
         if let Some(left) = self.faults.lose_chunks.load(Ordering::Relaxed).checked_sub(1) {
             self.faults.lose_chunks.store(left, Ordering::Relaxed);
@@ -207,6 +220,9 @@ impl Transport for Local {
 
     async fn commit(&self, ops: &[Op]) -> Result<CommitResponse, TransportError> {
         self.faults.check()?;
+        if self.faults.fail_next_commit.swap(false, Ordering::Relaxed) {
+            return Err(TransportError::Unavailable("injected before commit".into()));
+        }
         if self.faults.bad_conflict_index.load(Ordering::Relaxed) {
             return Err(TransportError::Rejected(vec![Conflict { op: ops.len() + 5, kind: ConflictKind::NoSuchNode }]));
         }

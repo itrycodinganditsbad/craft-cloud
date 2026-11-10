@@ -326,7 +326,13 @@ pub enum LoopState {
     /// The last pass failed for a reason that may pass by itself; the next try is at `next_try_ms`.
     Retrying { next_try_ms: i64, message: String },
     /// Stopped until the user does something; looked at again by itself at `next_check_ms`, if set.
-    Paused { reason: String, next_check_ms: Option<i64> },
+    Paused {
+        reason: String,
+        next_check_ms: Option<i64>,
+        /// The cause as the local API's `reason_code` says it, where there is one (`server_full`, `quota_exceeded`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason_code: Option<String>,
+    },
     /// Stopping after the running pass.
     Stopping,
     /// The loop ended.

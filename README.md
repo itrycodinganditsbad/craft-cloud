@@ -35,7 +35,7 @@ that is signed in, and enter its code on the new one.
 ## Documentation
 
 - [Installing the Craft Cloud app](docs/install.md) on Windows, macOS and Linux
-- [Running the server](docs/server.md): reverse proxy, Postgres and S3, accounts, invites, backups
+- [Running the server](docs/server.md): reverse proxy, Postgres and S3, accounts, invites, backups, Docker
 - [The agent on the command line](docs/agent.md): `login`, `run`, `sync`, `join`, start at login
 - [Development](docs/development.md): how it fits together, building, testing, the sync engine's rules
 - [The app kit](docs/kit.md): how a Craft app makes its documents live
