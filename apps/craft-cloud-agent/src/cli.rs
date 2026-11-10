@@ -33,11 +33,11 @@ use jiff::tz::TimeZone;
 
 use crate::account::{ACCOUNT_SCHEMA, Account, AccountError, DataDir, LastPass, LoopState, Outcome, PassSummary, STATE_SCHEMA, SavedState};
 use crate::disk::{AGENT_DIR, DiskFs, create_private_dir};
-use crate::http::{self, DeviceToken, HttpTransport, JoinError, ReachError, ServerUrl};
+use crate::http::{self, CallError, DeviceToken, Factor, HttpTransport, JoinError, LoginStep, ReachError, Refusal, ServerUrl};
 use crate::lock::{self, DATA_LOCK, FOLDER_LOCK, Lock, LockError};
 use crate::root::{self, RootError, RootMarker};
 use crate::settle::Stability;
-use craft_cloud_proto::api::LoginResponse;
+use craft_cloud_proto::api::{LoginResponse, TwoFactorChallenge};
 use craft_cloud_proto::join::JoinString;
 
 #[derive(Debug, Parser)]
@@ -73,6 +73,10 @@ pub enum Command {
         /// still wait). With `=<set>` (the set the list was printed with): only if that set is the one waiting.
         #[arg(long, value_name = "SET", num_args = 0..=1, require_equals = true, value_parser = set_name)]
         approve_deletes: Option<Option<String>>,
+        /// With `--approve-deletes`: approve the waiting deletions of this team space (its ID or its name) instead of the
+        /// personal space's. The running agent carries them out.
+        #[arg(long, value_name = "SPACE", requires = "approve_deletes")]
+        space: Option<String>,
     },
     /// Keep the folder in sync until stopped (Ctrl-C): sync whenever something changes here or on the server, and
     /// at least every 10 minutes. Ctrl-C lets a running pass finish; a second Ctrl-C stops at once. Exits 0 at once,
@@ -248,7 +252,9 @@ impl AgentError {
             | AgentError::Lock(LockError::Busy(_) | LockError::NotAFile(_))
             | AgentError::Revoked
             | AgentError::OtherAccountState(_)
-            | AgentError::Server(TransportError::Protocol(_) | TransportError::QuotaExceeded { .. })
+            | AgentError::Server(
+                TransportError::Protocol(_) | TransportError::QuotaExceeded { .. } | TransportError::ServerFull | TransportError::ReadOnly,
+            )
             | AgentError::Sync(SyncError::Corrupt(_))
             | AgentError::Account(AccountError::Newer { .. } | AccountError::Damaged { .. })
             | AgentError::NeedsYou(_) => Exit::NeedsYou,
@@ -336,6 +342,24 @@ pub enum AgentError {
         .0.display()
     )]
     FolderHasFiles(PathBuf),
+    /// `login`: the account has two-factor sign-in. The challenge goes back with a code from its authenticator app (or a
+    /// recovery code) to finish the sign-in. For `join` the challenge is empty: the same join goes again with the code.
+    #[error("this account has two-factor sign-in: a code from its authenticator app (or a recovery code) is needed")]
+    TwoFactorRequired(TwoFactorChallenge),
+    /// The code or recovery code was wrong (the server's message). Never a revoked device.
+    #[error("{0}")]
+    TwoFactorInvalid(String),
+    /// Too many wrong codes: the second factor is locked for a while (`retry_after_secs`, the server's `Retry-After`).
+    #[error("{message}")]
+    TwoFactorLocked { message: String, retry_after_secs: Option<u64> },
+    /// The second step of a sign-in found its challenge gone (it works five minutes and takes five tries, and a password
+    /// change ends it): the sign-in starts again.
+    #[error("this sign-in step has run out (it works for five minutes and takes five tries): sign in again")]
+    ChallengeGone,
+    /// The server refused a call of the account (a wrong password, a conflict, a lock, a limit): its status, code and
+    /// message as it said them, and its `Retry-After`. Never a revoked device (that is a 401, [`AgentError::Revoked`]).
+    #[error("{message}")]
+    Refused { status: u16, code: String, message: String, retry_after_secs: Option<u64> },
     /// Something found as `run` started that only a person can put right (the message says what); the agent waits,
     /// serving the local API, until it is.
     #[error("{0}")]
@@ -350,6 +374,61 @@ impl From<TransportError> for AgentError {
             other => AgentError::Server(other),
         }
     }
+}
+
+impl From<CallError> for AgentError {
+    /// For a signed-in call of the account: the server's refusal with its status, code and message; anything else as sync's
+    /// transport errors are (a 401 is a revoked device, offline is offline).
+    fn from(e: CallError) -> Self {
+        match e {
+            CallError::Refused(Refusal { status, error, message, retry_after_secs, .. }) => {
+                AgentError::Refused { status, code: error, message, retry_after_secs }
+            }
+            CallError::Transport(t) => t.into(),
+        }
+    }
+}
+
+/// What a refusal said, as the transport error the sign-in used to see for it (a refusal with a code of its own is handled
+/// before this), so that messages and exits of the first step don't change.
+fn legacy(refusal: &Refusal) -> TransportError {
+    if refusal.status == 429 {
+        TransportError::Unavailable(format!("the server is busy: {}", refusal.message))
+    } else {
+        TransportError::Protocol(format!("the server or a proxy refused the request (HTTP {}): {}", refusal.status, refusal.message))
+    }
+}
+
+/// A wait in words, for a lock: "about 14 minutes".
+fn wait_in_words(secs: u64) -> String {
+    match secs {
+        0..=90 => format!("{secs} seconds"),
+        91..=5_400 => format!("about {} minutes", secs.div_ceil(60)),
+        _ => format!("about {} hours", secs.div_ceil(3_600)),
+    }
+}
+
+/// The errors of a sign-in's second step and of a join with a code, from what the server said.
+fn factor_error(e: CallError) -> AgentError {
+    match e {
+        CallError::Refused(r) if r.error == craft_cloud_proto::api::codes::TWO_FACTOR_INVALID => AgentError::TwoFactorInvalid(r.message),
+        CallError::Refused(r) if r.error == craft_cloud_proto::api::codes::TWO_FACTOR_LOCKED => locked(r.message, r.retry_after_secs),
+        CallError::Refused(r) if r.error == craft_cloud_proto::api::codes::TWO_FACTOR_REQUIRED => {
+            AgentError::TwoFactorRequired(r.two_factor.unwrap_or(TwoFactorChallenge { challenge: String::new(), expires_ms: 0 }))
+        }
+        // The challenge doesn't work any more: not a revoked device (nothing is signed in yet).
+        CallError::Transport(TransportError::Unauthorized) => AgentError::ChallengeGone,
+        CallError::Refused(r) => legacy(&r).into(),
+        CallError::Transport(t) => t.into(),
+    }
+}
+
+fn locked(message: String, retry_after_secs: Option<u64>) -> AgentError {
+    let message = match retry_after_secs {
+        Some(secs) => format!("{message} (try again in {})", wait_in_words(secs)),
+        None => message,
+    };
+    AgentError::TwoFactorLocked { message, retry_after_secs }
 }
 
 impl From<SyncError> for AgentError {
@@ -384,19 +463,45 @@ pub async fn run(cli: Cli, input: &mut impl BufRead, out: &mut impl Write) -> Re
                 return Err(already_signed_in(&account));
             }
             let password = read_password(input)?;
-            match login(&data, &args, &password, out).await {
+            let mut through_agent = false;
+            let first = match login(&data, &args, &password, out).await {
                 // `run` holds the data folder: it signs in, through its local API.
-                Err(AgentError::Lock(LockError::Busy(path))) => login_through_agent(&data, &args, password, out).await.map_err(|e| match e {
-                    AgentError::Local(craft_cloud_app::Error::NotRunning(_)) => AgentError::Lock(LockError::Busy(path)),
-                    other => other,
-                })?,
-                other => {
-                    other?;
+                Err(AgentError::Lock(LockError::Busy(path))) => {
+                    through_agent = true;
+                    login_through_agent(&data, &args, password, out).await.map_err(|e| match e {
+                        AgentError::Local(craft_cloud_app::Error::NotRunning(_)) => AgentError::Lock(LockError::Busy(path)),
+                        other => other,
+                    })
                 }
+                other => other.map(|_| ()),
+            };
+            match first {
+                // An account with two-factor sign-in: the code comes from standard input, like the password (never from the
+                // command line), and a wrong one may be typed again twice.
+                Err(AgentError::TwoFactorRequired(challenge)) => {
+                    let mut tries = 0;
+                    loop {
+                        let factor = read_factor(input, out)?;
+                        let done = if through_agent {
+                            second_step_through_agent(&data, &args, &challenge, &factor, out).await
+                        } else {
+                            login_second_factor(&data, &args, &challenge, &factor, out).await.map(|_| ())
+                        };
+                        match done {
+                            Err(AgentError::TwoFactorInvalid(message)) if tries < MAX_CODE_TRIES - 1 => {
+                                tries += 1;
+                                say!(out, "{message}")?;
+                            }
+                            other => break other?,
+                        }
+                    }
+                }
+                other => other?,
             }
             Ok(Exit::Done)
         }
-        Command::Sync { approve_deletes } => Ok(sync(&data, Approve::from_flag(approve_deletes), out).await?.0),
+        Command::Sync { approve_deletes, space: Some(space) } => approve_team_deletes(&data, &space, &Approve::from_flag(approve_deletes), out),
+        Command::Sync { approve_deletes, space: None } => Ok(sync(&data, Approve::from_flag(approve_deletes), out).await?.0),
         Command::Run { .. } => {
             let (stop, stops) = tokio::sync::mpsc::unbounded_channel();
             let signals = tokio::spawn(forward_stop_signals(stop));
@@ -440,11 +545,13 @@ pub async fn run(cli: Cli, input: &mut impl BufRead, out: &mut impl Write) -> Re
                 return Err(already_signed_in(&account));
             }
             let mut password: Option<String> = None;
+            let mut factor: Option<Factor> = None;
+            let mut wrong_codes = 0;
             loop {
-                let joined = match join(&data, &args, password.as_deref(), out).await {
+                let joined = match join_with(&data, &args, password.as_deref(), factor.as_ref(), out).await {
                     // `run` holds the data folder: it joins, through its local API.
                     Err(AgentError::Lock(LockError::Busy(path))) => {
-                        join_through_agent(&data, &args, password.clone(), out).await.map_err(|e| match e {
+                        join_through_agent(&data, &args, password.clone(), factor.clone(), out).await.map_err(|e| match e {
                             AgentError::Local(craft_cloud_app::Error::NotRunning(_)) => AgentError::Lock(LockError::Busy(path)),
                             other => other,
                         })
@@ -453,6 +560,13 @@ pub async fn run(cli: Cli, input: &mut impl BufRead, out: &mut impl Write) -> Re
                 };
                 match joined {
                     Err(AgentError::PasswordRequired) if password.is_none() => password = Some(new_password(input, out)?),
+                    // The code was not used up: the same join goes again with the second factor.
+                    Err(AgentError::TwoFactorRequired(_)) if factor.is_none() => factor = Some(read_factor(input, out)?),
+                    Err(AgentError::TwoFactorInvalid(message)) if wrong_codes < MAX_CODE_TRIES - 1 => {
+                        wrong_codes += 1;
+                        say!(out, "{message}")?;
+                        factor = Some(read_factor(input, out)?);
+                    }
                     other => break other?,
                 }
             }
@@ -572,8 +686,29 @@ fn new_password(input: &mut impl BufRead, out: &mut impl Write) -> Result<String
     Ok(first)
 }
 
+/// Wrong codes the command line takes before it gives up (the server's challenge takes five).
+const MAX_CODE_TRIES: u32 = 3;
+
+/// A code from the authenticator app, or a recovery code: one line on standard input (never an argument).
+fn read_factor(input: &mut impl BufRead, out: &mut impl Write) -> Result<Factor, AgentError> {
+    say!(out, "This account has two-factor sign-in. Type the code from your authenticator app (or a recovery code):")?;
+    out.flush().map_err(io_at(Path::new("standard output")))?;
+    let mut line = String::new();
+    input.take(200).read_line(&mut line).map_err(|e| AgentError::Usage(format!("can't read the code from standard input: {e}")))?;
+    if line.trim().is_empty() {
+        return Err(AgentError::Usage("no code on standard input".into()));
+    }
+    Ok(Factor::typed(&line))
+}
+
 /// `join` while `run` runs: the running agent joins.
-async fn join_through_agent(data: &DataDir, args: &JoinArgs, password: Option<String>, out: &mut impl Write) -> Result<(), AgentError> {
+async fn join_through_agent(
+    data: &DataDir,
+    args: &JoinArgs,
+    password: Option<String>,
+    factor: Option<Factor>,
+    out: &mut impl Write,
+) -> Result<(), AgentError> {
     let folder = args.folder.as_ref().map(|f| std::path::absolute(f).map_err(io_at(f))).transpose()?;
     let request = craft_cloud_app::JoinRequest {
         join: args.join.clone(),
@@ -581,6 +716,8 @@ async fn join_through_agent(data: &DataDir, args: &JoinArgs, password: Option<St
         device_name: args.device_name.clone(),
         adopt: args.adopt,
         password,
+        totp_code: factor.as_ref().and_then(|f| f.totp_code.clone()),
+        recovery_code: factor.and_then(|f| f.recovery_code),
     };
     let data_path = data.path().to_owned();
     let status = blocking(move || craft_cloud_app::Client::connect_in(&data_path)?.join(&request)).await.map_err(local_error)?;
@@ -713,8 +850,22 @@ pub(crate) async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, cr
 /// The local API's refusals as the errors the CLI has for them.
 pub(crate) fn local_error(e: AgentError) -> AgentError {
     use craft_cloud_proto::local::codes;
+    // A refusal that carries the challenge or the wait of a lock.
+    if let AgentError::Local(inner @ craft_cloud_app::Error::RefusedWith { .. }) = &e {
+        let message = inner.to_string();
+        return match inner.code() {
+            Some(codes::TWO_FACTOR_REQUIRED) => {
+                AgentError::TwoFactorRequired(inner.challenge().cloned().unwrap_or(TwoFactorChallenge { challenge: String::new(), expires_ms: 0 }))
+            }
+            Some(codes::TWO_FACTOR_LOCKED) => locked(message, inner.retry_after_secs()),
+            _ => AgentError::Usage(message),
+        };
+    }
     match e {
-        AgentError::Local(craft_cloud_app::Error::Refused { code, message }) => match code.as_str() {
+        AgentError::Local(craft_cloud_app::Error::Refused { code, message, .. }) => match code.as_str() {
+            codes::TWO_FACTOR_INVALID => AgentError::TwoFactorInvalid(message),
+            codes::TWO_FACTOR_EXPIRED => AgentError::ChallengeGone,
+            codes::TWO_FACTOR_REQUIRED => AgentError::TwoFactorRequired(TwoFactorChallenge { challenge: String::new(), expires_ms: 0 }),
             codes::WRONG_PASSWORD => AgentError::WrongPassword,
             codes::NOT_SIGNED_IN => AgentError::NotSignedIn,
             codes::OFFLINE => AgentError::Offline(message),
@@ -740,6 +891,36 @@ async fn login_through_agent(data: &DataDir, args: &LoginArgs, password: String,
     };
     let data_path = data.path().to_owned();
     let status = blocking(move || craft_cloud_app::Client::connect_in(&data_path)?.login(&request)).await.map_err(local_error)?;
+    say!(
+        out,
+        "signed in as {} on {} (through the running agent, which syncs {} now)",
+        status.account.unwrap_or_default(),
+        status.server.unwrap_or_default(),
+        status.folder.unwrap_or_default()
+    )
+}
+
+/// The second step of `login` while `run` runs: the running agent finishes the sign-in.
+async fn second_step_through_agent(
+    data: &DataDir,
+    args: &LoginArgs,
+    challenge: &TwoFactorChallenge,
+    factor: &Factor,
+    out: &mut impl Write,
+) -> Result<(), AgentError> {
+    let folder = args.folder.as_ref().map(|f| std::path::absolute(f).map_err(io_at(f))).transpose()?;
+    let request = craft_cloud_app::SecondFactorLoginRequest {
+        server: args.url.clone(),
+        user: args.user.clone(),
+        folder: folder.map(|f| f.display().to_string()),
+        device_name: args.device_name.clone(),
+        adopt: args.adopt,
+        challenge: challenge.challenge.clone(),
+        totp_code: factor.totp_code.clone(),
+        recovery_code: factor.recovery_code.clone(),
+    };
+    let data_path = data.path().to_owned();
+    let status = blocking(move || craft_cloud_app::Client::connect_in(&data_path)?.login_second_factor(&request)).await.map_err(local_error)?;
     say!(
         out,
         "signed in as {} on {} (through the running agent, which syncs {} now)",
@@ -986,7 +1167,7 @@ fn hold_folder(folder: &Path) -> Result<Lock, AgentError> {
 }
 
 /// Whether `folder` holds anything besides the agent's own folder.
-fn has_files(folder: &Path) -> Result<bool, AgentError> {
+pub(crate) fn has_files(folder: &Path) -> Result<bool, AgentError> {
     for entry in std::fs::read_dir(folder).map_err(io_at(folder))? {
         let entry = entry.map_err(io_at(folder))?;
         if entry.file_name() != AGENT_DIR {
@@ -1023,7 +1204,7 @@ fn resolved(path: &Path) -> PathBuf {
 
 /// Whether one of the two paths lies inside the other (or they are the same), as the OS resolves them. Names are
 /// compared ignoring case on Windows and macOS, whose filesystems usually do.
-fn nested(a: &Path, b: &Path) -> bool {
+pub(crate) fn nested(a: &Path, b: &Path) -> bool {
     let (a, b) = (folded(&resolved(a)), folded(&resolved(b)));
     a.starts_with(&b) || b.starts_with(&a)
 }
@@ -1060,7 +1241,7 @@ fn check_private_place(data: &DataDir, local_app_data: Option<&Path>) -> Result<
 
 /// Refuses a synced folder and a data folder that lie inside one another: the data folder holds the device token,
 /// which would then be synced (or the synced folder would sync the agent's own state).
-fn check_apart(data: &DataDir, folder: &Path) -> Result<(), AgentError> {
+pub(crate) fn check_apart(data: &DataDir, folder: &Path) -> Result<(), AgentError> {
     if nested(data.path(), folder) {
         return Err(AgentError::DataInFolder { data: resolved(data.path()), folder: resolved(folder) });
     }
@@ -1095,11 +1276,44 @@ pub(crate) async fn login_locked(data: &DataDir, args: &LoginArgs, password: &st
     let server = ServerUrl::parse(&args.url).map_err(|e| AgentError::Usage(e.to_string()))?;
     let prepared = prepare(data, args.folder.as_deref(), args.device_name.as_deref(), args.adopt)?;
     ask_server(&server, |_, message| AgentError::Offline(message)).await?;
-    let signed_in = match http::login(&server, &args.user, password, &prepared.device_name).await {
-        Err(TransportError::Unauthorized) => return Err(AgentError::WrongPassword),
-        other => other?,
+    let signed_in = match http::login_step(&server, &args.user, password, &prepared.device_name).await {
+        Ok(LoginStep::Device(signed_in)) => signed_in,
+        // An account with two-factor sign-in: no device yet. The caller asks for the code and finishes with
+        // [`login_second_factor_locked`], which needs nothing of this call but its arguments.
+        Ok(LoginStep::SecondFactor(challenge)) => return Err(AgentError::TwoFactorRequired(challenge)),
+        Err(CallError::Transport(TransportError::Unauthorized)) => return Err(AgentError::WrongPassword),
+        Err(CallError::Refused(refusal)) => return Err(legacy(&refusal).into()),
+        Err(CallError::Transport(e)) => return Err(e.into()),
     };
     set_up(data, &server, signed_in, prepared).await
+}
+
+/// The second step of a sign-in: the folder's checks again (the agent keeps nothing between the steps), then the challenge and
+/// the second factor make the device, and the folder is set up as after [`login`]. Prints nothing.
+pub(crate) async fn login_second_factor_locked(data: &DataDir, args: &LoginArgs, challenge: &str, factor: &Factor) -> Result<Account, AgentError> {
+    if let Some(account) = data.load_account()? {
+        return Err(already_signed_in(&account));
+    }
+    let server = ServerUrl::parse(&args.url).map_err(|e| AgentError::Usage(e.to_string()))?;
+    let prepared = prepare(data, args.folder.as_deref(), args.device_name.as_deref(), args.adopt)?;
+    ask_server(&server, |_, message| AgentError::Offline(message)).await?;
+    let signed_in = http::second_factor(&server, challenge, factor).await.map_err(factor_error)?;
+    set_up(data, &server, signed_in, prepared).await
+}
+
+/// [`login_second_factor_locked`] for the command line: holds the data folder and says it signed in.
+pub async fn login_second_factor(
+    data: &DataDir,
+    args: &LoginArgs,
+    challenge: &TwoFactorChallenge,
+    factor: &Factor,
+    out: &mut impl Write,
+) -> Result<Account, AgentError> {
+    let _data_lock = hold_data(data)?;
+    let account = login_second_factor_locked(data, args, &challenge.challenge, factor).await?;
+    say!(out, "signed in as {} on {} (device \"{}\")", account.username, account.server, account.device_name)?;
+    say!(out, "syncing {}; run `craft-cloud-agent sync` to sync it", account.folder.display())?;
+    Ok(account)
 }
 
 /// Joins with a join string (an invite or an add-a-computer code), creates a device and sets up the folder, as
@@ -1107,8 +1321,20 @@ pub(crate) async fn login_locked(data: &DataDir, args: &LoginArgs, password: &st
 /// name, what the server speaks); a failure after it (the folder is set up for another space) removes the new device
 /// again, and says the code is used up. `password`: the new account's, for an invite that needs one.
 pub async fn join(data: &DataDir, args: &JoinArgs, password: Option<&str>, out: &mut impl Write) -> Result<Account, AgentError> {
+    join_with(data, args, password, None, out).await
+}
+
+/// [`join`] with the second factor of an account that has two-factor sign-in (without one, such an account answers
+/// [`AgentError::TwoFactorRequired`] and the code is not used up).
+pub async fn join_with(
+    data: &DataDir,
+    args: &JoinArgs,
+    password: Option<&str>,
+    factor: Option<&Factor>,
+    out: &mut impl Write,
+) -> Result<Account, AgentError> {
     let _data_lock = hold_data(data)?;
-    let account = join_locked(data, args, password).await?;
+    let account = join_locked(data, args, password, factor).await?;
     say!(out, "joined as {} on {} (device \"{}\")", account.username, account.server, account.device_name)?;
     say!(out, "syncing {}; run `craft-cloud-agent run` to keep it in sync", account.folder.display())?;
     Ok(account)
@@ -1116,7 +1342,7 @@ pub async fn join(data: &DataDir, args: &JoinArgs, password: Option<&str>, out: 
 
 /// [`join`] for a caller that holds the data folder's lock already: the `run` loop, joining for the local API.
 /// Prints nothing.
-pub(crate) async fn join_locked(data: &DataDir, args: &JoinArgs, password: Option<&str>) -> Result<Account, AgentError> {
+pub(crate) async fn join_locked(data: &DataDir, args: &JoinArgs, password: Option<&str>, factor: Option<&Factor>) -> Result<Account, AgentError> {
     if let Some(account) = data.load_account()? {
         return Err(already_signed_in(&account));
     }
@@ -1125,8 +1351,13 @@ pub(crate) async fn join_locked(data: &DataDir, args: &JoinArgs, password: Optio
     let prepared = prepare(data, args.folder.as_deref(), args.device_name.as_deref(), args.adopt)?;
     let unreachable = |server: &ServerUrl, message| AgentError::Unreachable { server: server.to_string(), message };
     ask_server(&server, unreachable).await?;
-    let signed_in = match http::join(&server, join.code.as_str(), &prepared.device_name, password).await {
+    let signed_in = match http::join_with_factor(&server, join.code.as_str(), &prepared.device_name, password, factor).await {
         Ok(signed_in) => signed_in,
+        Err(JoinError::TwoFactorRequired) => {
+            return Err(AgentError::TwoFactorRequired(TwoFactorChallenge { challenge: String::new(), expires_ms: 0 }));
+        }
+        Err(JoinError::TwoFactorInvalid(message)) => return Err(AgentError::TwoFactorInvalid(message)),
+        Err(JoinError::TwoFactorLocked { message, retry_after_secs }) => return Err(locked(message, retry_after_secs)),
         Err(JoinError::InvalidCode) => return Err(AgentError::InvalidCode),
         Err(JoinError::PasswordRequired) => return Err(AgentError::PasswordRequired),
         Err(JoinError::WeakPassword(message)) => return Err(AgentError::WeakPassword(message)),
@@ -1206,6 +1437,7 @@ async fn set_up(data: &DataDir, server: &ServerUrl, signed_in: LoginResponse, pr
             space: marker.space,
             root: marker.root,
             token,
+            spaces: Vec::new(),
         };
         data.remove_state()?;
         data.save_account(&account)?;
@@ -1339,6 +1571,12 @@ fn approve_for_loop(data: &DataDir, approve: &Approve, out: &mut impl Write) -> 
     if !data.load_status()?.is_some_and(|s| s.running(now_ms())) {
         return Ok(None);
     }
+    approve_waiting(data, approve, out).map(|(exit, summary, _)| Some((exit, summary)))
+}
+
+/// The approval itself, for the state in `data` (the data folder, or a team space's folder in it): the rules of
+/// [`approve_for_loop`] without asking whether a loop runs. The `bool` is whether an approval was handed over.
+pub(crate) fn approve_waiting(data: &DataDir, approve: &Approve, out: &mut impl Write) -> Result<(Exit, PassSummary, bool), AgentError> {
     let waiting = data.load_state()?.last_pass.and_then(|l| l.summary).map(|s| s.pending_only()).unwrap_or_default();
     // The set of deletes held behind a link goes only when named.
     if let Approve::Set(named) = approve
@@ -1353,7 +1591,7 @@ fn approve_for_loop(data: &DataDir, approve: &Approve, out: &mut impl Write) -> 
         for (path, links) in &waiting.held_deletes {
             say!(out, "  delete on the server: {} (held while any of {} is a link)", path, links.join(", "))?;
         }
-        return Ok(Some((Exit::Done, waiting)));
+        return Ok((Exit::Done, waiting, true));
     }
     // The bare flag never releases a hold: say how to, rather than "nothing was waiting".
     let held = waiting.held_set().filter(|_| *approve == Approve::Listed);
@@ -1364,22 +1602,22 @@ fn approve_for_loop(data: &DataDir, approve: &Approve, out: &mut impl Write) -> 
         if let Approve::Set(named) = approve
             && waiting.approvable()
         {
-            return wrong_set(data, named, &waiting, out).map(Some);
+            return wrong_set(data, named, &waiting, out).map(|(exit, summary)| (exit, summary, false));
         }
         if held.is_none() {
             say!(out, "nothing was waiting for approval")?;
         }
-        return Ok(Some((Exit::Done, waiting)));
+        return Ok((Exit::Done, waiting, false));
     };
     if let Approve::Set(named) = approve {
         if *named != set {
-            return wrong_set(data, named, &waiting, out).map(Some);
+            return wrong_set(data, named, &waiting, out).map(|(exit, summary)| (exit, summary, false));
         }
     } else if data.load_shown()?.is_none_or(|shown| shown.set != set) {
         print_waiting(out, &waiting)?;
         data.save_shown(&set, now_ms())?;
         say!(out, "nothing approved: these deletions changed since `status` listed them (or it didn't); check them, then run this again")?;
-        return Ok(Some((Exit::NeedsApproval, waiting)));
+        return Ok((Exit::NeedsApproval, waiting, false));
     }
     data.give_approval(&set, &waiting.pending_nodes, now_ms())?;
     say!(out, "the running agent will carry out these deletions (set {set}):")?;
@@ -1389,19 +1627,82 @@ fn approve_for_loop(data: &DataDir, approve: &Approve, out: &mut impl Write) -> 
     for path in &waiting.pending_local_deletes {
         say!(out, "  delete here: {path}")?;
     }
-    Ok(Some((Exit::Done, waiting)))
+    Ok((Exit::Done, waiting, true))
+}
+
+/// `sync --approve-deletes --space <ID or name>`: the waiting deletions of a team space go to the running agent, by the
+/// rules of [`approve_for_loop`] (the space's own `state.json`, `shown.json` and `approval.json` in `spaces/<id>/`). A team
+/// space syncs only while `run` runs, so without a running agent there is nobody to hand the approval to.
+fn approve_team_deletes(data: &DataDir, space: &str, approve: &Approve, out: &mut impl Write) -> Result<Exit, AgentError> {
+    let account = data.load_account()?.ok_or(AgentError::NotSignedIn)?;
+    let setting = find_team_space(&account.spaces, space)?;
+    if !data.load_status()?.is_some_and(|s| s.running(now_ms())) {
+        return Err(AgentError::Usage(
+            "team spaces sync only while `craft-cloud-agent run` is running; there is no running agent to approve for".into(),
+        ));
+    }
+    approve_team(data, setting, approve, out).map(|(exit, _, _)| exit)
+}
+
+/// The team space the user means by its ID or its name (as the server last called it, ignoring case).
+fn find_team_space<'a>(spaces: &'a [crate::account::SpaceSetting], text: &str) -> Result<&'a crate::account::SpaceSetting, AgentError> {
+    let text = text.trim();
+    if let Ok(id) = text.parse::<craft_cloud_proto::SpaceId>() {
+        return spaces.iter().find(|s| s.space == id).ok_or_else(|| AgentError::Usage(format!("no team space {id} on this computer")));
+    }
+    let mut named = spaces.iter().filter(|s| s.name.as_deref().is_some_and(|n| n.to_lowercase() == text.to_lowercase()));
+    match (named.next(), named.next()) {
+        (Some(only), None) => Ok(only),
+        (Some(_), Some(_)) => Err(AgentError::Usage("several team spaces have that name; give the space's ID".into())),
+        (None, _) => Err(AgentError::Usage("no team space of that name or ID on this computer".into())),
+    }
+}
+
+/// The approval of a team space's waiting deletions (see [`approve_waiting`]), for the state saved for its folder: a state
+/// made for another folder has nothing waiting. The `bool` is whether an approval was handed over.
+pub(crate) fn approve_team(
+    data: &DataDir,
+    setting: &crate::account::SpaceSetting,
+    approve: &Approve,
+    out: &mut impl Write,
+) -> Result<(Exit, PassSummary, bool), AgentError> {
+    let state = data.space_dir(setting.space);
+    let (saved, set_aside) = state.load_state_for(setting.space, &setting.folder, None, setting.generation)?;
+    if set_aside || saved.state.space.is_none() {
+        say!(out, "nothing was waiting for approval")?;
+        return Ok((Exit::Done, PassSummary::default(), false));
+    }
+    approve_waiting(&state, approve, out)
 }
 
 /// A signed-in folder ready for passes: its account, the engine on the real disk and the HTTP API, and the folder's
 /// lock. The caller holds the data folder's lock for as long as the session lives. One-off `sync` opens one for one
 /// pass; the `run` loop keeps one for many (so the stability window's looks carry over between passes).
 pub struct Session {
+    /// Where `state.json` is: the data folder, or a team space's own folder in it (`spaces/<id>/`).
     data: DataDir,
+    /// The agent's data folder (the synced folder must lie apart from it).
+    root: DataDir,
+    /// The space is a team space: the transport is bound to it, and the server must speak team spaces.
+    bound: bool,
     account: Account,
     engine: Engine<DiskFs, HttpTransport>,
     /// The last pass's outcome, also written with every checkpoint (so it is shared with the checkpoint closure).
     last_pass: std::sync::Arc<std::sync::Mutex<Option<LastPass>>>,
     _folder_lock: Lock,
+    /// A team space's folder as `state.json` records it (canonical); `None` for the personal space.
+    state_folder: Option<PathBuf>,
+    /// The ID of that folder (see [`SavedState::folder_id`]).
+    state_folder_id: Option<u64>,
+    /// The folder the session was opened on (a team space's), to notice a link that leads elsewhere later.
+    opened_on: Option<crate::disk::FolderIdentity>,
+    /// Set when the folder was found to lead elsewhere during a pass: the engine's state took in part of that other folder.
+    poisoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The server's stamp of the account's membership of a team space that `state.json` records (see
+    /// [`SavedState::joined_ms`]); `None` for the personal space.
+    joined_ms: Option<i64>,
+    /// The generation of the space's setting that `state.json` is made under (see [`crate::account::SpaceSetting::generation`]).
+    generation: u64,
     /// The stability window's looks, shared with the `run` loop (`None`: a one-off `sync` trusts every file).
     stability: Option<Stability>,
     /// When the earliest look at a file still changing is due, after the last pass (if it finished).
@@ -1420,10 +1721,55 @@ impl Session {
             data.clean_tmp()?;
         }
         let account = data.load_account()?.ok_or(AgentError::NotSignedIn)?;
-        check_apart(data, &account.folder)?;
+        Self::open_in(data, data, account, false, (None, 0), stability)
+    }
+
+    /// Opens a team space's folder for passes: as [`Session::open`], with the space's own state in `spaces/<id>/`, its
+    /// root marker, and a transport bound to the space (every request names it, every answer must echo it). `account`
+    /// is the signed-in account; the space's folder and root are `setting`'s. `joined_ms` is the server's current stamp of
+    /// the account's membership, which a saved state must have been made under.
+    pub fn open_team(
+        data: &DataDir,
+        account: &Account,
+        setting: &crate::account::SpaceSetting,
+        joined_ms: Option<i64>,
+        stability: Option<Stability>,
+    ) -> Result<Self, AgentError> {
+        let root = setting
+            .root
+            .ok_or_else(|| AgentError::NeedsYou("the server hasn't said where this team space starts yet; it is asked again soon".into()))?;
+        let state = data.space_dir(setting.space);
+        state.create()?;
+        state.clean_tmp()?;
+        let team = Account { folder: setting.folder.clone(), space: setting.space, root, spaces: Vec::new(), ..account.clone() };
+        Self::open_in(data, &state, team, true, (joined_ms, setting.generation), stability)
+    }
+
+    fn open_in(
+        root_data: &DataDir,
+        data: &DataDir,
+        account: Account,
+        bound: bool,
+        (joined_ms, generation): (Option<i64>, u64),
+        stability: Option<Stability>,
+    ) -> Result<Self, AgentError> {
+        check_apart(root_data, &account.folder)?;
         root::check(&account.folder, &RootMarker { space: account.space, root: account.root })?;
         let folder_lock = hold_folder(&account.folder)?;
-        let mut saved = data.load_state()?;
+        // A team space's state is used only for the folder it was made for; otherwise the folder starts afresh (a first sync:
+        // what is there and what the server has are merged, and nothing is deleted on either side).
+        // One look at the folder decides both which state is used and what the session later compares the folder with.
+        let opened_on = bound.then(|| crate::disk::folder_identity(&account.folder)).flatten();
+        let (mut saved, set_aside) =
+            if bound { data.load_state_with(account.space, opened_on.as_ref(), joined_ms, generation)? } else { (data.load_state()?, false) };
+        if set_aside {
+            crate::runlog::note(format_args!(
+                "the saved state of team space {} was made for another folder, membership or generation: starting afresh, nothing is deleted",
+                account.space
+            ));
+        }
+        let state_folder = opened_on.as_ref().map(|i| i.path.clone());
+        let state_folder_id = opened_on.as_ref().and_then(|i| i.id);
         if saved.state.space.is_some_and(|s| s != account.space) {
             return Err(AgentError::OtherAccountState(data.path().join(crate::account::STATE_FILE)));
         }
@@ -1436,24 +1782,96 @@ impl Session {
         }
         fs.clean_tmp().map_err(io_at(&fs.tmp_dir()))?;
         let transport = HttpTransport::new(account.server.clone(), &account.token)?;
+        let transport = if bound { transport.bound_to(account.space)? } else { transport };
         let config = Config::new(account.device_name.clone(), account.device);
         let mut engine = Engine::new(fs, transport, std::mem::take(&mut saved.state), config, conflict_stamp)?;
         // What Craft apps saved from live documents (their local API's `saved`): see `live::saves`.
-        engine.set_save_records(std::sync::Arc::new(crate::live::saves::SaveBook::new(data.path(), account.space)));
+        engine.set_save_records(std::sync::Arc::new(crate::live::saves::SaveBook::new(root_data.path(), account.space)));
         // `state.json` is also written at the pass's checkpoints, so a crash or a kill loses at most what the pass did
         // since the last one (the last pass's outcome stays as it was until this one ends).
         let last_pass = std::sync::Arc::new(std::sync::Mutex::new(saved.last_pass));
-        let (checkpoint_data, checkpoint_last) = (data.clone(), last_pass.clone());
+        let (checkpoint_data, checkpoint_last, checkpoint_folder) = (data.clone(), last_pass.clone(), state_folder.clone());
+        // A team folder that was pointed at another folder during a pass is noticed before the engine saves its state and before
+        // every commit: the pass stops without sending or saving anything of what it saw there. What the pass has taken in
+        // since was about the other folder, so the session is finished with even if the link is pointed back (see
+        // `Session::folder_moved`).
+        let poisoned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let still_there: std::sync::Arc<dyn Fn() -> std::io::Result<()> + Send + Sync> = {
+            let (folder, identity, poisoned) = (account.folder.clone(), opened_on.clone(), poisoned.clone());
+            std::sync::Arc::new(move || {
+                if let Some(then) = &identity
+                    && let Some(now) = crate::disk::folder_identity(&folder)
+                    && *then != now
+                {
+                    poisoned.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Err(std::io::Error::other("the folder leads somewhere else than when the session opened"));
+                }
+                Ok(())
+            })
+        };
+        let guard_check = still_there.clone();
+        engine.on_guard(move || guard_check());
+        // The folder's nonce is rewritten at every checkpoint and at the end of a pass, and recorded in the state saved with it.
+        let checkpoint_folder_path = account.folder.clone();
         engine.on_checkpoint(move |state| {
+            still_there()?;
+            let folder_nonce = if bound { Some(root::rotate_nonce(&checkpoint_folder_path)?) } else { None };
             let last_pass = checkpoint_last.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-            let saved = SavedState { schema: STATE_SCHEMA, state: state.clone(), last_pass, paused: false };
+            let saved = SavedState {
+                schema: STATE_SCHEMA,
+                state: state.clone(),
+                last_pass,
+                paused: false,
+                folder: checkpoint_folder.clone(),
+                folder_id: state_folder_id,
+                folder_nonce,
+                joined_ms,
+                generation,
+            };
             checkpoint_data.save_state(&saved).map_err(|e| std::io::Error::other(e.to_string()))
         });
-        Ok(Self { data: data.clone(), account, engine, last_pass, _folder_lock: folder_lock, stability, recheck_in: None })
+        Ok(Self {
+            data: data.clone(),
+            root: root_data.clone(),
+            bound,
+            account,
+            engine,
+            last_pass,
+            _folder_lock: folder_lock,
+            opened_on,
+            poisoned,
+            state_folder,
+            state_folder_id,
+            joined_ms,
+            generation,
+            stability,
+            recheck_in: None,
+        })
+    }
+
+    /// The server's stamp of the account's membership that this session's state was opened under (team spaces only).
+    pub fn joined_ms(&self) -> Option<i64> {
+        self.joined_ms
+    }
+
+    /// A team space's folder now leads to another folder than the one the session was opened on (a link was pointed
+    /// elsewhere, or the folder was replaced): what the session remembers is not about this folder. A folder that can't be
+    /// looked at is not "moved" (the pass says what is wrong with it).
+    pub fn folder_moved(&self) -> bool {
+        if self.poisoned.load(std::sync::atomic::Ordering::SeqCst) {
+            return true;
+        }
+        let now = self.bound.then(|| crate::disk::folder_identity(&self.account.folder)).flatten();
+        matches!((&self.opened_on, now), (Some(then), Some(now)) if *then != now)
     }
 
     pub fn account(&self) -> &Account {
         &self.account
+    }
+
+    /// Tells the engine the account is a viewer here (or not): see `Engine::set_read_only`.
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.engine.set_read_only(read_only);
     }
 
     /// The engine's state (its `seq` is where the change feed was read to).
@@ -1479,7 +1897,7 @@ impl Session {
     /// saved, whether the pass finished or not. The folder and its marker are checked first: the folder may have
     /// gone since the session opened (a drive unmounted while the loop runs).
     pub async fn pass(&mut self, approve: Vec<NodeId>) -> Result<PassSummary, AgentError> {
-        check_apart(&self.data, &self.account.folder)?;
+        check_apart(&self.root, &self.account.folder)?;
         root::check(&self.account.folder, &RootMarker { space: self.account.space, root: self.account.root })?;
         if !approve.is_empty() {
             self.engine.approve_deletes_of(approve);
@@ -1488,7 +1906,15 @@ impl Session {
         // The server is asked what it speaks before every pass (it may have been updated since the last one); a
         // mismatch fails the pass like any other server answer, so it is saved and shown by `status`.
         let compatible = match http::info(&self.account.server).await {
-            Ok(info) => http::check_compatible(&info),
+            Ok(info) => http::check_compatible(&info).and_then(|()| {
+                // A team space is only ever asked of a server that does team spaces: no `craft-space` header goes to an
+                // older one.
+                if self.bound && info.protocol_max < crate::spaces::TEAM_PROTOCOL {
+                    Err(TransportError::Protocol(crate::spaces::NEEDS_UPDATE.into()))
+                } else {
+                    Ok(())
+                }
+            }),
             Err(e) => Err(e),
         };
         let started = self.stability.as_ref().map(Stability::now);
@@ -1521,9 +1947,31 @@ impl Session {
                 (Outcome::Failed(failure_message(e)), previous.map(|s| s.pending_only()).filter(|s| s.needs_approval() || !s.held_deletes.is_empty()))
             }
         };
+        // A folder that leads elsewhere than at the start (also one that was pointed back since): what the engine holds may
+        // be about the other folder, so nothing is saved. The pass thread drops the session and removes the state.
+        if self.folder_moved() {
+            self.poisoned.store(true, std::sync::atomic::Ordering::SeqCst);
+            result?;
+            return Err(AgentError::Usage("the folder of this space leads somewhere else now; the next pass starts afresh there".into()));
+        }
         let last = LastPass { finished_ms: now_ms(), outcome, summary: summary.clone() };
         *self.last_pass.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(last.clone());
-        let saved = SavedState { schema: STATE_SCHEMA, state: self.engine.state().clone(), last_pass: Some(last), paused: false };
+        let folder_nonce = if self.bound {
+            Some(root::rotate_nonce(&self.account.folder).map_err(|source| AgentError::Io { path: self.account.folder.clone(), source })?)
+        } else {
+            None
+        };
+        let saved = SavedState {
+            schema: STATE_SCHEMA,
+            state: self.engine.state().clone(),
+            last_pass: Some(last),
+            paused: false,
+            folder: self.state_folder.clone(),
+            folder_id: self.state_folder_id,
+            folder_nonce,
+            joined_ms: self.joined_ms,
+            generation: self.generation,
+        };
         self.data.save_state(&saved)?;
         result?;
         Ok(summary.unwrap_or_default())
@@ -1567,6 +2015,15 @@ pub(crate) fn print_summary(out: &mut impl Write, s: &PassSummary) -> Result<(),
         say!(out, "in sync: nothing to do")?;
     } else {
         say!(out, "synced: {}", done.join(", "))?;
+    }
+    if s.read_only {
+        say!(out, "this space is read-only for you: nothing is uploaded, and what you change here stays on this computer")?;
+    }
+    if !s.restored.is_empty() {
+        say!(out, "deleted here, downloaded again (the space is read-only for you):")?;
+        for path in &s.restored {
+            say!(out, "  {path}")?;
+        }
     }
     if !s.conflict_copies.is_empty() {
         say!(out, "conflict copies (both versions kept):")?;
@@ -1708,8 +2165,8 @@ fn describe_loop(state: &LoopState) -> String {
         LoopState::Idle => "idle, waiting for changes".into(),
         LoopState::Syncing => "syncing".into(),
         LoopState::Retrying { next_try_ms, message } => format!("offline, retrying at {}: {message}", show_time(*next_try_ms)),
-        LoopState::Paused { reason, next_check_ms: Some(at) } => format!("paused: {reason} (looked at again at {})", show_time(*at)),
-        LoopState::Paused { reason, next_check_ms: None } => {
+        LoopState::Paused { reason, next_check_ms: Some(at), .. } => format!("paused: {reason} (looked at again at {})", show_time(*at)),
+        LoopState::Paused { reason, next_check_ms: None, .. } => {
             format!("paused: {reason} (stop it with Ctrl-C, put this right, then start `craft-cloud-agent run` again)")
         }
         LoopState::Stopping => "stopping after the running pass".into(),
@@ -1761,6 +2218,8 @@ pub(crate) async fn revoke_device(account: &Account) -> Result<(), AgentError> {
 pub(crate) fn forget_account(data: &DataDir) -> Result<(), AgentError> {
     data.remove_account()?;
     data.remove_state()?;
+    // The team spaces' states too: one kept would be reused if the same folder is chosen after a later sign-in.
+    data.remove_space_states()?;
     Ok(())
 }
 
@@ -1824,23 +2283,47 @@ mod tests {
     }
 
     #[test]
+    fn a_team_space_is_found_by_its_id_or_its_name() {
+        use crate::account::SpaceSetting;
+        let setting = |name: &str| SpaceSetting {
+            space: craft_cloud_proto::SpaceId::generate(),
+            folder: PathBuf::from("/x"),
+            sync: true,
+            name: Some(name.into()),
+            root: None,
+            generation: 0,
+        };
+        let (studio, plans, twin) = (setting("Studio"), setting("Plans"), setting("plans"));
+        let spaces = vec![studio.clone(), plans.clone()];
+        assert_eq!(find_team_space(&spaces, &studio.space.to_string()).unwrap().space, studio.space);
+        assert_eq!(find_team_space(&spaces, " STUDIO ").unwrap().space, studio.space, "a name, whatever the case");
+        assert!(matches!(find_team_space(&spaces, "Nothing"), Err(AgentError::Usage(_))));
+        assert!(matches!(find_team_space(&spaces, &craft_cloud_proto::SpaceId::generate().to_string()), Err(AgentError::Usage(_))));
+        let spaces = vec![studio, plans, twin];
+        assert!(matches!(find_team_space(&spaces, "Plans"), Err(AgentError::Usage(m)) if m.contains("ID")), "two of that name: the ID is needed");
+    }
+
+    #[test]
     fn the_cli_parses() {
         let cli = Cli::try_parse_from(["craft-cloud-agent", "login", "https://c.example", "--user", "ana", "--adopt", "--data-dir", "d"]).unwrap();
         assert_eq!(cli.data_dir.as_deref(), Some(Path::new("d")));
         assert!(matches!(cli.command, Command::Login(LoginArgs { adopt: true, ref user, .. }) if user == "ana"));
         let cli = Cli::try_parse_from(["craft-cloud-agent", "sync", "--approve-deletes"]).unwrap();
-        let Command::Sync { approve_deletes } = cli.command else { panic!("{:?}", cli.command) };
+        let Command::Sync { approve_deletes, .. } = cli.command else { panic!("{:?}", cli.command) };
         assert_eq!(Approve::from_flag(approve_deletes), Approve::Listed);
         let cli = Cli::try_parse_from(["craft-cloud-agent", "sync", "--approve-deletes=3F9A0b1c2d3e"]).unwrap();
-        let Command::Sync { approve_deletes } = cli.command else { panic!("{:?}", cli.command) };
+        let Command::Sync { approve_deletes, .. } = cli.command else { panic!("{:?}", cli.command) };
         assert_eq!(Approve::from_flag(approve_deletes), Approve::Set("3f9a0b1c2d3e".into()));
         let cli = Cli::try_parse_from(["craft-cloud-agent", "sync"]).unwrap();
-        let Command::Sync { approve_deletes } = cli.command else { panic!("{:?}", cli.command) };
+        let Command::Sync { approve_deletes, .. } = cli.command else { panic!("{:?}", cli.command) };
         assert_eq!(Approve::from_flag(approve_deletes), Approve::Nothing);
         for empty in ["--approve-deletes=", "--approve-deletes= "] {
             let e = Cli::try_parse_from(["craft-cloud-agent", "sync", empty]).unwrap_err();
             assert_eq!(e.kind(), clap::error::ErrorKind::ValueValidation, "{empty:?} is a usage error: {e}");
         }
+        let cli = Cli::try_parse_from(["craft-cloud-agent", "sync", "--approve-deletes", "--space", "Studio"]).unwrap();
+        assert!(matches!(cli.command, Command::Sync { space: Some(ref space), .. } if space == "Studio"));
+        assert!(Cli::try_parse_from(["craft-cloud-agent", "sync", "--space", "Studio"]).is_err(), "--space needs --approve-deletes");
         assert!(Cli::try_parse_from(["craft-cloud-agent", "login", "https://c.example"]).is_err(), "--user is required");
     }
 
@@ -1920,6 +2403,11 @@ mod tests {
             (SyncError::Transport(TransportError::Protocol("a refusal naming no operation".into())), Exit::NeedsYou),
             // Only with no room left at all: a file that doesn't fit while others still may is skipped instead.
             (SyncError::Transport(TransportError::QuotaExceeded { used: 10, limit: 10 }), Exit::NeedsYou),
+            // The engine keeps a read-only space read-only by itself; one that gets this far (another caller of the
+            // transport) is a state the user is told about, not retried.
+            (SyncError::Transport(TransportError::ReadOnly), Exit::NeedsYou),
+            // The server itself refuses uploads: nothing fits, whatever the file.
+            (SyncError::Transport(TransportError::ServerFull), Exit::NeedsYou),
             (SyncError::Io { path: "an interrupted download".into(), source: std::io::Error::other("x") }, Exit::Failed),
             (SyncError::Corrupt("chunk x of a.txt is damaged".into()), Exit::NeedsYou),
             (SyncError::Checkpoint(std::io::Error::other("disk full")), Exit::Failed),
@@ -1935,7 +2423,9 @@ mod tests {
                     | TransportError::Unauthorized
                     | TransportError::Unavailable(_)
                     | TransportError::Protocol(_)
-                    | TransportError::QuotaExceeded { .. },
+                    | TransportError::QuotaExceeded { .. }
+                    | TransportError::ServerFull
+                    | TransportError::ReadOnly,
                 )
                 | SyncError::Io { .. }
                 | SyncError::Corrupt(_)

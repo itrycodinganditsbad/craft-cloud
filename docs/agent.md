@@ -18,13 +18,20 @@ printf '%s\n' 'your password' | ./target/release/craft-cloud-agent login https:/
   often, at least every 5 minutes. When the server can't be reached it tries again with growing pauses, up to 5 minutes.
   If something needs you (the folder or its marker is missing, the device was signed out) it pauses and
   `status` says why; a missing folder or marker is looked at again every minute, and syncing goes on by
-  itself once it is back. Ctrl-C lets a running pass finish and stops; a second Ctrl-C stops at once.
+  itself once it is back. When the server itself is full (its admin turned on `refuse_when_full` and the server's disk
+  or capacity is used up) the agent pauses with "The server is full; the admin needs to free space or raise its
+  capacity" (never the account's storage message, which means the account's own quota) and looks again every 10
+  minutes; nothing is lost, and syncing goes on once the admin has freed space. Ctrl-C lets a running pass finish and stops; a second Ctrl-C stops at once.
 - While `run` runs, `sync --approve-deletes` from another terminal hands the approval to it: exactly the
   deletions `status` listed. If more came since, it lists them instead, approves nothing and exits 2; check
   the list and run it again. Every list of waiting deletions comes with its set (`set 3f9a…`), also in
   `run`'s output: `sync --approve-deletes=<set>` approves exactly that set if it is the one waiting, without
   `status` first, and otherwise shows the waiting set, approves nothing and exits 2. A plain `sync` says the
   agent is already running.
+- A team space's held deletions are approved with `sync --approve-deletes[=<set>] --space <id or name>` (the same rules,
+  with the space's own list and `spaces/<id>/approval.json`; it needs the running agent), or by the local API's
+  `POST /v1/spaces/{id}/approve-deletes`. Each computer approves its own side: deletions made on one computer wait for
+  its approval, and again on the others when they arrive.
 - A delete held back because a link appeared that may be the file, moved with its folder ("held while … is a
   link", or "held while any of … is a link" when several links appeared with that name), comes with a set of
   its own. If you really deleted the file and none of the links listed is it, `sync --approve-deletes=<set>`
@@ -59,9 +66,25 @@ printf '%s\n' 'your password' | ./target/release/craft-cloud-agent login https:/
   and `--adopt` as for `login`) signs it in. An admin's invite (`user invite`, in [`server.md`](server.md)) works the same way; for a new
   account, `join` asks for its password twice on standard input. A code that doesn't work says so, without saying
   why: make a new one.
+- An account with two-factor sign-in (turned on in the app's Security page; see "Two-factor sign-in" in
+  [`server.md`](server.md)) asks for a second step at `login` and at `join`: after the password, the command prints
+  `This account has two-factor sign-in. Type the code from your authenticator app (or a recovery code):` and reads one line
+  from standard input, so a script gives the password line and then the code line. The code is never an argument and
+  is never stored; a wrong one may be typed again twice (the server itself allows five wrong codes per sign-in). Six digits
+  are a code from the app; anything else is taken as a recovery code, which works once. Too many wrong codes lock the
+  account's second step for a while: the command says how long, and the lock does not sign anything out. For a `join` that
+  needs a code the invite isn't used up until the code is right. A running agent (`run`) does the same through its local
+  API; the Craft Cloud app asks for the code in its own window.
+- Rolling this out: update the server first, then the agents and the app. An agent from before two-factor sign-in can't
+  complete a sign-in for an account that has it, and it reports that as a wrong password; update the agent, nothing is
+  broken. The app on a server that doesn't know two-factor sign-in says so on its Security page instead of failing.
 - Through the running agent: `pause` and `resume` syncing (a pause holds across restarts; recents keep working),
   `quit` the agent, and `devices` to list the account's machines (`devices remove <id>` takes one out; to take this
   machine out, use `logout`).
+- The desktop reads storage through the authenticated local API, `GET /v1/usage`. It asks the server for every
+  request and returns `AccountUsage` unchanged. Signed out, it returns `409 not_signed_in`; when the server cannot be
+  reached, it returns `503 offline`. The desktop shows trash and old-version values as overlapping estimates and
+  never adds them to stored bytes.
 - Recent files, per app, shared by every machine of the account (through the running agent, as an app
   sees them):
 
@@ -85,3 +108,202 @@ printf '%s\n' 'your password' | ./target/release/craft-cloud-agent login https:/
   The first machine to open a file makes it a live document from the file's content (UTF-8 text only); the others
   join it. Changes go to every machine that has it open as they are made, and edits made offline merge when the
   machine is back. `doc` never writes the file: what it shows is the live document.
+
+## The local API's admin calls
+
+For the Craft Cloud app's admin pages the running agent passes the server's admin API on (`/api/v1/admin/…`, see
+[`server.md`](server.md), "Managing accounts over HTTP") under `/v1/admin/…`, with the signed-in device's token. They
+have the same checks as every local call (the `Host`, no `Origin`, the token in `Authorization: Bearer`), bodies of at
+most 8 KiB, and need the agent to be signed in (`not_signed_in` otherwise).
+
+| Local call | Server call | Body, answer |
+| --- | --- | --- |
+| `GET /v1/admin/server` | `GET /admin/server` | the server's counters and kinds, and its health (`started_ms`, `database_ok`, `store_ok`, `store_check_ms`, `refusing_uploads`, all optional); a member is refused `forbidden` |
+| `GET /v1/admin/storage` | `GET /admin/storage` | bounded storage overview: totals, quota counts, top ten accounts, manifest-index counts, and the room the server has (optional fields) |
+| `PUT /v1/admin/storage/compression` | `PUT /admin/storage/compression` | `{level, password, totp_code?, recovery_code?}` → the compression part of the overview; the zstd level (1 to 19) new blobs are written at |
+| `GET /v1/admin/users?cursor&limit&query` | `GET /admin/users` | a page of accounts by username; `next` is the cursor of the following page; `query` finds a username containing it |
+| `POST /v1/admin/users` | `POST /admin/users` | `{username, role, password, totp_code?, recovery_code?}` → the account and its invite code |
+| `PATCH /v1/admin/users/{id}` | `PATCH /admin/users/{id}` | `{role?, quota_bytes?, password, totp_code?, recovery_code?}` → the account (`null` removes the quota) |
+| `POST /v1/admin/users/{id}/disable`, `…/enable` | the same | `{password}` → 204 |
+| `DELETE /v1/admin/users/{id}` | the same | `{password}` → 202 |
+| `POST /v1/admin/users/{id}/invite`, `…/password-reset` | the same | `{password}` (a reset code: also `totp_code?`, `recovery_code?`, `reset_two_factor?`) → `{code, join_url?, expires_ms}` |
+| `DELETE /v1/admin/users/{id}/invite` | the same | `{password}` → 204 |
+| `GET /v1/admin/users/{id}/devices` | the same | every device of the account |
+| `GET /v1/admin/users/{id}/usage` | `GET /admin/users/{id}/usage` | the account's stored bytes, effective quota, and labeled trash/history estimates; unknown or removed account is `not_found` |
+| `DELETE /v1/admin/users/{id}/devices/{device_id}` | the same | `{password}` → 204 |
+| `POST /v1/admin/users/{id}/reset-two-factor` | the same | `{password, totp_code?, recovery_code?}` → 204: takes the account's two-factor sign-in away and signs its computers out |
+| `GET /v1/account` | `GET /account` | the signed-in account: `role`, `two_factor_enabled` (how the app finds out whether to show its admin pages) |
+| `GET /v1/account/activity?cursor&before_ms&limit` | the same | the account's own security events, newest first, any account (`user` and `action` are not read) |
+| `GET /v1/admin/audit?cursor&before_ms&limit&user&action` | `GET /admin/audit` | the whole log, newest first; `user` an account ID, `action` an event name or a prefix like `auth.` of the closed list; a cursor is passed back as it came |
+| `GET /v1/admin/audit/export?before_ms&user&action` | `GET /admin/audit/export` | the log as NDJSON, **streamed** through (chunked): event lines, then a last line `{"complete":true,"exported":n}` or `{"truncated":true,"exported":n}` |
+
+- **The server decides.** The agent checks no role and makes no decision of its own; it reads each body as the shared
+  type, writes it to the server again and answers what the server answered, with the server's HTTP status, error code and
+  message. A wrong password stays `403 wrong_password`, a member's call `403 forbidden`, a disabled admin's
+  `403 account_disabled`, the last enabled admin's demotion `409 last_admin`, too many tries `429 rate_limited` with the
+  server's `Retry-After` header. The one status the agent does not pass on is the server's `401`: on a signed-in route it
+  says this device was revoked, and the local API answers it as every other call does (`409 needs_you`); a local `401` always means a wrong token.
+- **The confirmation is not kept.** Every change carries the acting admin's current password in its body, from the app
+  through the agent to the server. The agent holds it only for the length of the request, never writes or logs it, and
+  the `Debug` output of every body hides it. The codes the server makes (an invite, a password reset code) are shown by
+  the app once and kept by neither side.
+- **A second factor** joins the confirmation when the admin's account has two-factor sign-in: `totp_code` (a code from the
+  authenticator app) or `recovery_code`, in the same body as the password, passed on as typed fields and never kept. The server
+  answers a missing or wrong one `403 two_factor_invalid` and too many `429 two_factor_locked` with the wait (the body's
+  `retry_after_secs` and the `Retry-After` header); neither is a revoked device, so the agent stays signed in. A password reset
+  code takes the whole `AdminPasswordReset` (the same fields and `reset_two_factor`, which makes redeeming the code turn the
+  account's two-factor sign-in off).
+- **The audit export is never held whole.** The agent passes the server's stream through chunk by chunk; a client that
+  reads it (`craft-cloud-app`'s `admin_audit_export`) counts it as whole only with the server's `complete` line and the number
+  of events it says, and takes a stream that ends without it (a broken connection, a server that failed in the middle) for a
+  failed export. `truncated` is a good export of the newest events that is not the whole log. Filters and limits are checked
+  before anything is sent: an `action` outside the closed list is `400 invalid`, as is a `limit` of 0 or over 200 (100 for an
+  account's own activity).
+## Local API: file history
+
+The local API exposes server history to desktop clients. Paths are relative to the synced folder and resolve through
+the agent's saved sync state; unknown or unsynced paths return `404 not_found`, paths outside the root return
+`400 invalid`, and folders return `400 invalid`.
+
+| Method and path | Request | Success |
+|---|---|---|
+| `GET /v1/files/history?path=<relative-path>&cursor=<opaque>&limit=<count>` | Query parameters; `cursor` and `limit` optional | `200` with `{versions, next}`; newest first |
+| `POST /v1/files/restore` | `{"path":"Notes/todo.txt","version":"…","expected_version":"…"}` | `200` with the new version, its parent, sequence and epoch |
+
+Restore requires the file's current version to match `expected_version`; otherwise the API answers `409 conflict`.
+The agent does not write restored bytes directly. Its normal change feed picks up the new server version and syncs it
+to disk.
+
+## Local API: trash
+
+Trash items are addressed by their server node ID because deleted nodes are absent from the agent's sync tree. The
+agent validates that each ID has the expected UUID form before forwarding it. List responses may include `path`, a
+display hint formed from a currently synced parent folder and the item's name; it is `null` when that parent is not
+live on this machine. A missing hint does not fail the request.
+
+| Method and path | Request | Success |
+|---|---|---|
+| `GET /v1/trash?cursor=<opaque>&limit=<count>` | Optional paging query parameters | `200` with `{items, next}`, newest deletion first |
+| `POST /v1/trash/restore` | `{"id":"<node-id>"}` | `200` with restored node, parent, name, rename flag, version (for files), sequence and epoch |
+| `POST /v1/trash/remove` | `{"id":"<node-id>"}` | `204` |
+
+A successful restore asks the agent for a normal sync pass; it never writes files directly. Removing an item only
+marks it out of the trash. It cannot be restored from the trash afterward, but stored space is not freed yet. Server
+HTTP status and error code are preserved; a server `401 unauthorized` becomes local `409 needs_you`.
+
+## Local API: conflict copies and folder sizes
+
+Both calls answer from the agent's saved sync state (`state.json`) alone. They do not ask the server, do not wait for a
+pass (the state file is replaced atomically and read without a lock), and show what the last finished pass recorded.
+Signed out they answer `409 not_signed_in`, like `GET /v1/usage`. Paths are relative to the synced folder and `/`-separated.
+
+| Method and path | Success |
+|---|---|
+| `GET /v1/conflicts` | `200` with `{copies, truncated}` |
+| `GET /v1/usage/folders` | `200` with `{total_bytes, total_files, folders, other?, kinds}` |
+
+**Conflict copies.** `copies` holds `{path, original_path?, device?, at?, at_utc, at_ms?, size, mtime_ms}`, newest first (by
+the minute in the name, then its counter), at most 1000; `truncated` is true when older ones were left out. A synced
+file is listed when its name is one the engine makes (`name (conflict, <device>, YYYY-MM-DD HH-MM[Z][, n]).ext`, see
+`docs/design/sync.md`) **and** a file with the original's name sits beside it, or when the last finished pass reported
+it as a copy it made. For a reported copy whose name does not follow the pattern, `original_path`, `device` and `at` are
+left out. `at` is `YYYY-MM-DD HH:MM` in the local time of the computer that made the copy; `at_utc` says it is UTC (that
+computer could not read its offset), and only then is `at_ms` given, since a local time has no offset in the name.
+`size` and `mtime_ms` are the copy's as this computer last synced it. Notes:
+
+- A user's own file can match the pattern and have a sibling of that name, so the list can show a file that is not a
+  conflict copy. The name cannot tell; the desktop words it as "looks like a conflict copy".
+- A copy whose original was deleted or renamed since is missed, unless the last pass made it. Copies of folders are not
+  listed. A stem shortened to fit the 255-byte name limit has no sibling under its shortened name, so such a copy
+  shows only while the last pass reported it.
+- Copies are kept (a conflict keeps both versions); this call only lists them. Removing a copy is deleting the file.
+
+**Folder sizes.** `total_bytes` and `folders[].bytes` are **local logical bytes**: the sizes of the files this computer
+has synced, as the last pass recorded them. They are not the server's stored bytes (`GET /v1/usage`), which count each
+chunk once and include history and trash. `folders` has one entry `{name, bytes, files}` per top-level folder (the first
+path component; the files directly in the synced folder count under `""`), the largest first (by bytes, then name), at
+most 50. When there are more, `other` is `{folders, bytes, files}` for the rest. `kinds` always lists all eight classes
+in the order `image`, `video`, `audio`, `document`, `model_3d`, `archive`, `code`, `other` with `{kind, bytes, files}`;
+the class comes from the file's extension (case-insensitive; no extension or an unlisted one is `other`; `code` includes
+markup and plain text). Only files count, so empty folders add nothing.
+## Team spaces
+
+The running agent syncs the personal space as ever, and any team space the person turns on. Everything below is off for
+a server that speaks HTTP protocol 1 (before team spaces): the agent asks that server about its version only, sends no
+`craft-space` header, and lists no team space.
+
+- **Which spaces.** `GET /spaces` is asked at the start, then every two long-poll waits, and at once after an invitation is
+  accepted or declined here or a space answers `404`. A failed look changes nothing.
+- **Folders.** A team space syncs to `Craft Cloud Shared/<name>/`, a folder beside the personal one (so synced folders never
+  nest). The name is the space's name with what a file name can't hold made `_`; a name that is taken, by another space or
+  by a folder that is already there, gets ` (2)`, ` (3)`. The folder is chosen when the space is first seen and kept when
+  the space is renamed on the server. Each folder has its own root marker (`.craft-cloud/root.json`).
+- **State.** `account.json` gains `spaces: [{space, folder, sync, name, root}]` (left out while there are none, so a data
+  folder from before team spaces is not rewritten). Each synced team space keeps `spaces/<space id>/state.json` in the
+  data folder; the personal space's files stay where they were. The state records the space and the canonical folder it
+  was made for, and is used for that pair only: for any other folder (the space moved, or turned off and on elsewhere,
+  and back) the space starts afresh as a first sync, merging the folder with the space and deleting nothing on either
+  side. The same goes when the server's stamp of the account's membership (`joined_ms` in `GET /spaces`, new each time
+  someone is removed and invited again) differs from the one the state was made under, which also covers an agent that was
+  not running while access was lost and regained; a server that gives no stamp is not compared. Turning a space off
+  forgets its state, so turning it on again, in the same folder or another, is a first sync too. Moving a space that
+  syncs, or turning it off, ends its session and waits for its running pass before anything else changes; the agent goes
+  on meanwhile (other spaces, the local API, stopping), and the call is answered when the session is closed (after 50
+  seconds at most). A pass that was queued behind another pass when its space was closed (or the agent began to stop) is
+  not run. Another change of the same space meanwhile is refused with `409` ("this space is being changed, try again in a
+  moment"). Turning on a space that has no session or pass here does not wait for another space's pass; if the space's own
+  last pass has not ended after 50 seconds the answer is "this space is still finishing its last pass, try again in a
+  moment". If the agent stops while a space is being turned off, the space stays off. Signing out removes the team spaces' states too; their folders, markers and files stay.
+- **A state is trusted only when nothing doubtful happened to it.** Each team space's setting in `account.json` has a
+  `generation` (left out while 0), and `state.json` records the generation it was made under; a state under another
+  generation is not used. The generation is raised and saved before a state is retired (turning the space off, losing
+  access) and before a new folder's marker is written, so a state that survives its removal, or a crash between the marker
+  and the removal, is never trusted again. If the state cannot be removed (something holds the file), turning the space off
+  fails with that error instead of reporting success. Before every pass the session also compares the folder's canonical path
+  and ID with those it opened on: a link or junction pointed at another folder meanwhile ends the session, drops the state and
+  starts the space afresh there as a first sync. It does the same just before the pass sends deletions, and a saved state also
+  records the folder's ID, so a folder restored from a backup at the same path is not the folder the state was made for. If a
+  raised generation cannot be saved, it is saved again at the next look at the list and that space is not started meanwhile (its state says why); other spaces go on.
+- **A first sync merges, and says what that means.** Without a saved state, nothing is known to have been deleted, so
+  nothing is deleted on either side. A file that teammates deleted on the server meanwhile, and that is still in the
+  folder, is uploaded again. A file that exists on both sides with different content is not overwritten: the local one is
+  moved aside as a conflict copy and the server's version takes its path (the local file no longer sits at its path). A
+  file only here goes up, a file only on the server comes down, and equal files are adopted.
+- **Off by default.** An accepted space does not sync until `POST /v1/spaces/{id}/sync` with `{"on": true}` (optionally
+  `folder`, an absolute path that lies outside every synced folder and the data folder, and `adopt` for a folder that already
+  has files: what differs from the space's becomes conflict copies, nothing is deleted).
+- **One engine per space.** Each synced space has its own session (state, root, marker, guards), scheduler, folder watcher
+  and long-poll, over a transport bound to the space. Passes run one at a time across all spaces. A problem in one space
+  never pauses another or the personal space. `pause`, `resume` and `quit` apply to every space.
+- **The echo.** Every answer for a team space must carry `craft-space` with that space (success, `403`, `404`, `409`, `410`).
+  A missing or different one stops that space with "the server is too old for team spaces": a server that ignored the header
+  would otherwise answer about the personal space.
+- **Read-only.** A role of viewer, or an archived space, puts the space's engine in read-only mode (see the sync design,
+  "Read-only spaces"); `read_only` in the space's entry says so. The server lists an archived space with the member's
+  stored role (an editor stays `editor`) although their access is capped at viewer; read `archived`, not `role` alone, to
+  know whether the member may write.
+- **Losing access.** A space the server no longer lists, or answers `404`, stops syncing and shows
+  `run_state: {"kind": "no_access"}` with "You no longer have access to <name>. Your local copy is kept and no longer
+  syncs." Nothing in its folder is touched or deleted. Its saved sync state is dropped, so if the account is added again the
+  folder is merged with the space afresh (a first sync, above): no local file is deleted, a file deleted here meanwhile is
+  not deleted on the server, one deleted on the server meanwhile is not deleted here (and goes up again), and a file that
+  differs on both sides is kept twice (one as a conflict copy). A member of an archived space has not lost access: the space stays
+  listed (`archived: true`) and syncs read-only.
+
+| Local call | Answer |
+| --- | --- |
+| `GET /v1/spaces` | `{spaces: [{space, kind, name?, role, state, archived, folder?, sync, run_state?, last_sync_ms?, read_only}]}`: the personal space first, then the team spaces, invitations (`state: "invited"`, no folder) among them. `sync` is `on`, `off` or `unavailable` |
+| `POST /v1/spaces/{id}/accept` | the server's answer: the space as it lists it |
+| `POST /v1/spaces/{id}/decline` | 204 |
+| `POST /v1/spaces/{id}/sync` | `{on, folder?, adopt?}` → the space as `GET /v1/spaces` lists it |
+| `POST /v1/spaces/{id}/approve-deletes` | `{set?}` → `{approved, message, set?, total, truncated, entries[{path, side}], held_set?, held_total, held[{path, links}]}`: approves the deletions the mass-delete guard holds back in a synced team space (`spaces/<id>/approval.json`), as `craft-cloud-agent sync --approve-deletes[=<set>] --space <id or name>` does. With a `set` only that set, if it is the one waiting; a set that is not waiting (an app sends `look`) approves nothing and lists the waiting one: `set` is its name (a hash of exactly those deletions), `total` their number, `entries` up to 1000 of them (`side` is `server` or `here`; `truncated` says there are more, and the paths are cut at 512 KiB), `held` the deletes held behind a link (up to 100; only the command line releases them, by naming `held_set`). `message` is the command line's words, cut at 16 KiB. Without a `set`, the set the previous call listed |
+| `GET /v1/spaces/{id}/members`, `POST` (`{username, role}`), `PATCH …/members/{user}` (`{role}`), `DELETE …/members/{user}` | passed on to the server as they are (`SpaceMembers`, `SpaceMember`, 204): who may do what is the server's decision, so an editor's invitation is `403 read_only` and the last owner's demotion `409 last_owner` |
+| `GET /v1/spaces/{id}/usage` | `{stored_bytes, quota_bytes?, …}`, passed on |
+| `PATCH /v1/spaces/{id}` | `{name?, quota_bytes?, password?, …}` passed on (a rename by an owner; a limit by an administrator with the confirmation) → the space as the administrator's list shows it |
+| `POST /v1/spaces/{id}/leave` | 204: leaves the space on the server (the account's own `DELETE …/members/{its id}`); a refusal (the last owner: `last_owner`, a rate limit, no connection) changes nothing here and the space keeps syncing. The agent looks at its list again; the space is then lost to it: `no_access`, the sync ends, the folder and its files stay |
+| `GET /v1/admin/spaces?cursor&limit&query`, `POST` (`AdminCreateSpace`) | the administrator's list of team spaces and the creation of one, passed on with the confirmation in the body |
+| `POST /v1/admin/spaces/{id}/archive`, `…/unarchive` (`{password, …}`), `PUT …/owner` (`{user, password, …}`) | passed on, 204 |
+| `GET /v1/status` | gains `spaces: [{space, run_state, last_sync_ms?, read_only}]`, one per synced space or one that lost access; the top-level fields describe the personal space |
+
+Accept and decline, the members, the usage, the rename, leaving and the administrator's team space calls are passed on to the server, which decides; its refusals keep their status and code (the administrator's password stays in the body, is kept by nobody and is left out of every `Debug` output). An agent from before
+team spaces answers these calls with `not_found` ("no such call"), which `craft-cloud-app` reports as `agent_too_old`.

@@ -13,4 +13,4 @@ pub mod local;
 pub mod name;
 
 pub use ids::{DeviceId, DocId, Epoch, NodeId, SpaceId, VersionId};
-pub use name::{FoldKey, Name, NameError, UNICODE_VERSION};
+pub use name::{FoldKey, MAX_SPACE_NAME_CHARS, Name, NameError, SpaceName, SpaceNameError, UNICODE_VERSION, fold_search};
