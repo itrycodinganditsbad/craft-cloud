@@ -181,7 +181,7 @@ pub(crate) fn end_live_connections(state: &AppState, devices: &[DeviceId]) {
 // ---- reads ----
 
 /// `GET /admin/server`: counters and kinds only.
-async fn server(State(state): State<Shared>) -> Result<Json<AdminServerInfo>, ApiError> {
+pub(crate) async fn server_info(state: &AppState) -> Result<AdminServerInfo, ApiError> {
     let counts = state.meta.admin_server_counts().await?;
     // Answering at all with the counts is the database being fine. The store's probe and the full state never fail
     // the page: a store that is down is `store_ok: false`.
@@ -190,7 +190,7 @@ async fn server(State(state): State<Shared>) -> Result<Json<AdminServerInfo>, Ap
         Some(guard) => guard.status(&state.meta).await.unwrap_or_else(|_| guard.refusing()),
         None => false,
     };
-    Ok(Json(AdminServerInfo {
+    Ok(AdminServerInfo {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         users: counts.users,
         devices_active: counts.devices_active,
@@ -203,17 +203,21 @@ async fn server(State(state): State<Shared>) -> Result<Json<AdminServerInfo>, Ap
         store_ok: Some(store.ok),
         store_check_ms: Some(store.checked_ms),
         refusing_uploads: Some(refusing_uploads),
-    }))
+    })
+}
+
+async fn server(State(state): State<Shared>) -> Result<Json<AdminServerInfo>, ApiError> {
+    Ok(Json(server_info(&state).await?))
 }
 
 /// `GET /admin/storage`: bounded account and manifest-index counts, plus the ten largest accounts, and the room the
 /// server has (filesystem numbers, the database's size and the configured capacity).
-async fn storage(State(state): State<Shared>) -> Result<Json<AdminStorageOverview>, ApiError> {
+pub(crate) async fn storage_overview(state: &AppState) -> Result<AdminStorageOverview, ApiError> {
     let overview = state.meta.admin_storage_overview().await?;
     let info = state.storage_info.clone();
     // Filesystem queries block. If the task fails, the numbers are left out.
     let measured = tokio::task::spawn_blocking(move || info.measure()).await.unwrap_or_default();
-    Ok(Json(AdminStorageOverview {
+    Ok(AdminStorageOverview {
         accounts: overview.accounts,
         stored_bytes: overview.stored_bytes,
         default_quota_bytes: overview.default_quota_bytes,
@@ -242,8 +246,12 @@ async fn storage(State(state): State<Shared>) -> Result<Json<AdminStorageOvervie
         server_fs_total_bytes: measured.server_fs_total,
         server_fs_free_bytes: measured.server_fs_free,
         database_bytes: measured.database_bytes,
-        compression: Some(Box::new(compression_view(&state, true).await?)),
-    }))
+        compression: Some(Box::new(compression_view(state, true).await?)),
+    })
+}
+
+async fn storage(State(state): State<Shared>) -> Result<Json<AdminStorageOverview>, ApiError> {
+    Ok(Json(storage_overview(&state).await?))
 }
 
 /// How long the overview keeps the totals over the blobs table: they sum every row, which a busy overview must not do for
@@ -252,7 +260,7 @@ const TOTALS_TTL_MS: i64 = 30_000;
 
 /// The compression part of the overview: the settings in force and what they save, from the recorded sizes and the last
 /// `store estimate`. `none` in the config shows as the algorithm and wins over the level.
-async fn compression_view(state: &AppState, cached: bool) -> Result<AdminCompression, ApiError> {
+pub(crate) async fn compression_view(state: &AppState, cached: bool) -> Result<AdminCompression, ApiError> {
     let now = state.now_ms();
     let kept =
         state.compression_totals.lock().ok().and_then(|slot| *slot).filter(|(at, _)| cached && now.saturating_sub(*at) < TOTALS_TTL_MS && *at <= now);
@@ -325,14 +333,20 @@ async fn set_compression(
         return Err(ApiError::invalid(format!("level is {} to {}", craft_cloud_store::MIN_ZSTD_LEVEL, craft_cloud_store::MAX_ZSTD_LEVEL)));
     }
     let actor = confirm(&state, &auth, Confirmation::new(req.password, req.totp_code, req.recovery_code)).await?;
-    {
-        // Commit and apply as one step: two changes at once must leave the store at the level the database ends with.
-        let _changing = state.compression_change.lock().await;
-        state.meta.admin_set_compression_level(&actor, state.store.level(), req.level, state.now_ms()).await?;
-        state.store.set_level(req.level);
-    }
+    set_compression_level(&state, &actor, req.level).await?;
     tracing::info!(actor = %auth.device, level = req.level, "admin: compression level changed");
     Ok(Json(compression_view(&state, false).await?))
+}
+
+pub(crate) async fn set_compression_level(state: &AppState, actor: &AdminActor, level: u8) -> Result<(), ApiError> {
+    if !(craft_cloud_store::MIN_ZSTD_LEVEL..=craft_cloud_store::MAX_ZSTD_LEVEL).contains(&level) {
+        return Err(ApiError::invalid(format!("level is {} to {}", craft_cloud_store::MIN_ZSTD_LEVEL, craft_cloud_store::MAX_ZSTD_LEVEL)));
+    }
+    // Commit and apply as one step: two changes at once must leave the store at the level the database ends with.
+    let _changing = state.compression_change.lock().await;
+    state.meta.admin_set_compression_level(actor, state.store.level(), level, state.now_ms()).await?;
+    state.store.set_level(level);
+    Ok(())
 }
 
 /// `GET /admin/users/{id}/usage`: the account's stored bytes and labeled estimates.

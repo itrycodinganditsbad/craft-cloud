@@ -10,11 +10,14 @@
 use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::response::Response;
+#[cfg(test)]
+use craft_cloud_meta::StorageOverview;
 use craft_cloud_meta::{
-    AdminActor, AdminUser, AdminVia, AuditEvent, AuditQuery, DeviceRecord, RESET_TTL_MS, StorageOverview, UserId, valid_username,
+    AdminActor, AdminUser, AdminVia, AuditEvent, AuditQuery, DeviceRecord, RESET_TTL_MS, StorageEstimate, UserId, valid_username,
 };
 use craft_cloud_proto::DeviceId;
 use craft_cloud_proto::api::AdminCode;
+use craft_cloud_proto::api::{AdminCompression, AdminServerInfo, AdminStorageOverview};
 use craft_cloud_proto::join::INVITE_TTL_MS;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -46,6 +49,7 @@ pub(super) struct ActionForm {
     pub(super) name: String,
     /// The account name of a team space's owner (the Team spaces page).
     pub(super) owner: String,
+    pub(super) compression_level: String,
 }
 
 impl std::fmt::Debug for ActionForm {
@@ -101,6 +105,25 @@ fn parse_user(id: &str) -> Result<UserId, WebError> {
     Uuid::parse_str(id).map(UserId).map_err(|_| WebError::not_found("account"))
 }
 
+fn usage_rows(usage: &StorageEstimate) -> Vec<(&'static str, String)> {
+    let estimates = usage.reason.is_none();
+    vec![
+        ("Usage stored", fmt_bytes(usage.stored_bytes)),
+        ("Physical", "not measured".to_owned()),
+        ("Files", "not measured".to_owned()),
+        ("Effective quota", usage.quota_bytes.map_or_else(|| "none".to_owned(), fmt_bytes)),
+        (
+            "Trash estimate (overlapping)",
+            if estimates { usage.trash_bytes.map_or_else(|| "none".to_owned(), fmt_bytes) } else { "estimates not available yet".to_owned() },
+        ),
+        (
+            "History estimate (overlapping)",
+            if estimates { usage.history_bytes.map_or_else(|| "none".to_owned(), fmt_bytes) } else { "estimates not available yet".to_owned() },
+        ),
+    ]
+}
+
+#[cfg(test)]
 fn storage_section(storage: &StorageOverview) -> String {
     let mut body = heading("Storage");
     body.push_str("<dl>");
@@ -143,14 +166,183 @@ fn storage_section(storage: &StorageOverview) -> String {
     body
 }
 
+fn server_health(info: &AdminServerInfo) -> String {
+    let mut rows = Vec::new();
+    if info.database_ok == Some(false) {
+        rows.push("Database not answering");
+    }
+    if info.store_ok == Some(false) {
+        rows.push("Store not answering");
+    }
+    if info.refusing_uploads == Some(true) {
+        rows.push("Refusing uploads");
+    }
+    if rows.is_empty() {
+        return format!("{}<p class=\"muted\">Healthy</p>", heading("Server health"));
+    }
+    format!("{}{}", heading("Server health"), notice(&rows.join(" · "), true))
+}
+
+fn compression_section(compression: &AdminCompression) -> String {
+    let mut body = String::from("<h2>Compression</h2><dl>");
+    let mut row = |term: &str, value: String| {
+        body.push_str(&format!("<dt>{}</dt><dd>{}</dd>", super::html::esc(term), super::html::esc(&value)));
+    };
+    row("Algorithm", compression.algorithm.clone());
+    row("Level in use", format!("{} · {}", compression.level, compression.admin_level.map_or("from the config", |_| "set by an admin")));
+    row("Logical size, all blobs", format!("{} · {} blobs", fmt_bytes(compression.logical_bytes), compression.blobs));
+    row(
+        "Stored size of the known part",
+        format!("{} of {}", fmt_bytes(compression.known_physical_bytes), fmt_bytes(compression.known_logical_bytes)),
+    );
+    row("Saving", compression.saving_permille.map_or_else(|| "not measured".to_owned(), |saving| format!("{}.{:01} %", saving / 10, saving % 10)));
+    row("Known share of the data", format!("{}.{:01} %", compression.known_permille / 10, compression.known_permille % 10));
+    if let Some(estimate) = &compression.estimate {
+        row("Last estimate", fmt_time(estimate.at_ms));
+        row("Estimate sample", format!("{} blobs, {}", estimate.sampled_blobs, fmt_bytes(estimate.sampled_bytes)));
+        let levels = estimate
+            .levels
+            .iter()
+            .map(|level| {
+                format!("{}: {}.{:01} % · {} KiB/s", level.level, level.saving_permille / 10, level.saving_permille % 10, level.kib_per_second)
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        row("Per-level estimates", levels);
+    } else {
+        row("Per-level estimates", "not measured".to_owned());
+    }
+    body.push_str("</dl>");
+    body
+}
+
+/// `GET /web/storage`: server and account storage numbers, remembered estimates, and the confirmed compression form.
+pub(super) async fn storage(State(state): State<Shared>, request: Request) -> Result<Response, WebError> {
+    let authed = authenticate(&state, request.headers()).await.map_err(WebError::for_get)?;
+    let q: NoticeQuery = read_query(&request)?;
+    let overview = crate::admin::storage_overview(&state).await?;
+    let compression = overview.compression.as_deref().ok_or_else(|| WebError::invalid("Storage information is unavailable."))?;
+    let ctx = authed.ctx();
+    let two_factor = asks_for_code(&state, &authed).await?;
+    let mut body = heading("Storage");
+    body.push_str(&storage_notice(q.notice.as_deref()));
+    body.push_str(&storage_details(&overview));
+    body.push_str(&compression_section(compression));
+    let labels = (craft_cloud_store::MIN_ZSTD_LEVEL..=craft_cloud_store::MAX_ZSTD_LEVEL).map(|level| level.to_string()).collect::<Vec<_>>();
+    let options = labels.iter().map(|level| (level.as_str(), level.as_str())).collect::<Vec<_>>();
+    let current = compression.level.to_string();
+    if compression.algorithm == "none" {
+        body.push_str(
+            "<p class=\"muted\">Set by the server config: compression = \"none\" stores blobs plain, so there is no level to change here.</p>",
+        );
+    } else {
+        let mut inner = select("compression", "compression_level", "Level for new files (1 to 19)", &options, &current);
+        inner.push_str(
+            "<p class=\"muted\">A change needs your password. It applies to files stored from now on; files already stored are not rewritten.</p>",
+        );
+        inner.push_str(&confirm_fields("compression", two_factor));
+        inner.push_str("<p><button type=\"submit\">Change level</button></p>");
+        body.push_str(&post_form(&ctx, "/web/storage", "panel", &inner));
+    }
+    Ok(ok_page(&ctx, "Storage", &body))
+}
+
+fn storage_notice(key: Option<&str>) -> String {
+    match key {
+        Some("compression") => notice("The compression level was updated.", false),
+        _ => String::new(),
+    }
+}
+
+/// `POST /web/storage`: the level is audited through the same metadata operation as the JSON admin route.
+pub(super) async fn set_compression(State(state): State<Shared>, request: Request) -> Result<Response, WebError> {
+    let (authed, form) = begin(&state, request).await?;
+    let level = form
+        .compression_level
+        .trim()
+        .parse::<u8>()
+        .ok()
+        .filter(|level| (1..=19).contains(level))
+        .ok_or_else(|| WebError::invalid("The compression level is 1 to 19."))?;
+    let actor = actor(&state, &authed, &form).await?;
+    crate::admin::set_compression_level(&state, &actor, level).await?;
+    tracing::info!(level, "admin (web): compression level changed");
+    Ok(redirect("/web/storage?notice=compression"))
+}
+
+fn storage_details(storage: &AdminStorageOverview) -> String {
+    let mut body = String::from("<h2>Server storage</h2><dl>");
+    let mut row = |term: &str, value: String| {
+        body.push_str(&format!("<dt>{}</dt><dd>{}</dd>", super::html::esc(term), super::html::esc(&value)));
+    };
+    row("Stored", fmt_bytes(storage.stored_bytes));
+    row("Store", storage.store_kind.clone().unwrap_or_else(|| "not reported".to_owned()));
+    let capacity = storage.capacity_bytes.filter(|bytes| *bytes > 0);
+    row("Capacity", capacity.map_or_else(|| "not configured".to_owned(), fmt_bytes));
+    row(
+        "Capacity used",
+        capacity.map_or_else(
+            || "not configured".to_owned(),
+            |total| {
+                let percent = u128::from(storage.stored_bytes).saturating_mul(100) / u128::from(total);
+                format!("{} of {} ({}%)", fmt_bytes(storage.stored_bytes), fmt_bytes(total), percent)
+            },
+        ),
+    );
+    let fs = storage.store_fs_total_bytes.zip(storage.store_fs_free_bytes);
+    row(
+        "Store filesystem",
+        fs.map_or_else(
+            || "not measured".to_owned(),
+            |(total, free)| format!("{} used of {}; {} available", fmt_bytes(total.saturating_sub(free)), fmt_bytes(total), fmt_bytes(free)),
+        ),
+    );
+    let data = storage.server_fs_total_bytes.zip(storage.server_fs_free_bytes);
+    row(
+        "Data directory filesystem",
+        data.map_or_else(
+            || "not measured".to_owned(),
+            |(total, free)| format!("{} used of {}; {} available", fmt_bytes(total.saturating_sub(free)), fmt_bytes(total), fmt_bytes(free)),
+        ),
+    );
+    row("Database size", storage.database_bytes.map_or_else(|| "not measured".to_owned(), fmt_bytes));
+    row(
+        "Manifest index",
+        format!(
+            "{} complete, {} building, {} not indexed",
+            storage.manifest_index.complete, storage.manifest_index.building, storage.manifest_index.not_indexed
+        ),
+    );
+    body.push_str("</dl>");
+    let rows = storage
+        .top_accounts
+        .iter()
+        .map(|account| {
+            vec![
+                link(&user_href(UserId(account.id)), &account.username),
+                super::html::esc(&fmt_bytes(account.stored_bytes)),
+                super::html::esc(&account.quota_bytes.map_or_else(|| "none".to_owned(), fmt_bytes)),
+            ]
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        body.push_str("<p>No accounts.</p>");
+    } else {
+        body.push_str(&table("Top accounts by stored bytes", &["Account", "Stored", "Effective quota"], &rows));
+    }
+    body
+}
+
 // ---- overview ----
 
 /// `GET /web`.
 pub(super) async fn overview(State(state): State<Shared>, request: Request) -> Result<Response, WebError> {
     let authed = authenticate(&state, request.headers()).await.map_err(WebError::for_get)?;
     let counts = state.meta.admin_server_counts().await?;
+    let server = crate::admin::server_info(&state).await?;
     let storage = state.meta.admin_storage_overview().await?;
     let mut body = heading("Overview");
+    body.push_str(&server_health(&server));
     body.push_str("<dl>");
     let mut row = |term: &str, value: String| {
         body.push_str(&format!("<dt>{}</dt><dd>{}</dd>", super::html::esc(term), super::html::esc(&value)));
@@ -169,9 +361,16 @@ pub(super) async fn overview(State(state): State<Shared>, request: Request) -> R
     body.push_str(" &middot; ");
     body.push_str(&link("/web/spaces", "Manage team spaces"));
     body.push_str(" &middot; ");
+    body.push_str(&link("/web/storage", "Manage storage"));
+    body.push_str(" &middot; ");
     body.push_str(&link("/web/audit", "Read the audit log"));
     body.push_str("</p>");
-    body.push_str(&storage_section(&storage));
+    body.push_str(&format!(
+        "<p>Storage: {} stored across {} accounts. {}</p>",
+        fmt_bytes(storage.stored_bytes),
+        storage.accounts,
+        link("/web/storage", "View storage details")
+    ));
     Ok(ok_page(&authed.ctx(), "Overview", &body))
 }
 
@@ -330,23 +529,9 @@ pub(super) async fn user(State(state): State<Shared>, Path(id): Path<String>, re
     row("Devices signed in", found.devices_active.to_string());
     row("Stored", fmt_bytes(found.stored_bytes));
     if let Some(usage) = usage {
-        row("Effective quota", usage.quota_bytes.map_or_else(|| "none".to_owned(), fmt_bytes));
-        row(
-            "Trash estimate (overlapping)",
-            if usage.reason.is_some() {
-                "estimates not available yet".to_owned()
-            } else {
-                usage.trash_bytes.map_or_else(|| "none".to_owned(), fmt_bytes)
-            },
-        );
-        row(
-            "History estimate (overlapping)",
-            if usage.reason.is_some() {
-                "estimates not available yet".to_owned()
-            } else {
-                usage.history_bytes.map_or_else(|| "none".to_owned(), fmt_bytes)
-            },
-        );
+        for (term, value) in usage_rows(&usage) {
+            row(term, value);
+        }
     } else {
         row("Quota", found.quota_bytes.map_or_else(|| "none (the server's cap applies, if any)".to_owned(), fmt_bytes));
     }
@@ -772,5 +957,52 @@ mod tests {
         let html = storage_section(&storage);
         assert!(html.contains("&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;"), "{html}");
         assert!(!html.contains("<script>"), "{html}");
+    }
+
+    #[test]
+    fn storage_details_escape_names_and_show_unconfigured_measurements() {
+        let mut storage = AdminStorageOverview { capacity_bytes: None, store_kind: Some("s3".into()), ..Default::default() };
+        storage.top_accounts.push(craft_cloud_proto::api::AdminStorageAccount {
+            id: Uuid::nil(),
+            username: "<script>bad()</script>".into(),
+            stored_bytes: 1024,
+            quota_bytes: None,
+        });
+        let html = storage_details(&storage);
+        assert!(html.contains("not configured") && html.contains("not measured"), "{html}");
+        assert!(html.contains("&lt;script&gt;bad()&lt;/script&gt;"), "{html}");
+        assert!(html.contains("/web/users/00000000-0000-0000-0000-000000000000"), "{html}");
+        assert!(!html.contains("<script>"), "{html}");
+    }
+
+    #[test]
+    fn overview_health_only_says_healthy_when_no_fault_is_reported() {
+        let mut info = AdminServerInfo {
+            version: "test".into(),
+            users: 0,
+            devices_active: 0,
+            stored_bytes: 0,
+            live_bytes: 0,
+            storage_kind: "disk".into(),
+            database_kind: "sqlite".into(),
+            started_ms: None,
+            database_ok: Some(true),
+            store_ok: Some(true),
+            store_check_ms: None,
+            refusing_uploads: Some(false),
+        };
+        assert!(server_health(&info).contains("Healthy"));
+        info.refusing_uploads = Some(true);
+        assert!(server_health(&info).contains("Refusing uploads"));
+    }
+
+    #[test]
+    fn account_usage_rows_show_known_numbers_and_label_unmeasured_fields() {
+        let usage = StorageEstimate { stored_bytes: 2048, quota_bytes: Some(4096), trash_bytes: Some(512), history_bytes: Some(256), reason: None };
+        let rows = usage_rows(&usage);
+        assert!(rows.contains(&("Usage stored", "2.0 KiB".to_owned())));
+        assert!(rows.contains(&("Effective quota", "4.0 KiB".to_owned())));
+        assert!(rows.contains(&("Physical", "not measured".to_owned())));
+        assert!(rows.contains(&("Files", "not measured".to_owned())));
     }
 }

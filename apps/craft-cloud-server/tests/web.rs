@@ -1366,6 +1366,7 @@ async fn user_controlled_text_is_escaped(s: &Web) {
     drop(conn);
     let pages = [
         s.get("/web", Some(&sess.token)).await,
+        s.get("/web/storage", Some(&sess.token)).await,
         s.get("/web/users", Some(&sess.token)).await,
         s.get(&format!("/web/users/{}", ana.id.0), Some(&sess.token)).await,
         s.get("/web/audit", Some(&sess.token)).await,

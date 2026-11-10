@@ -429,6 +429,13 @@ Open `https://cloud.example.org/web` and sign in as an admin. The server refuses
 `behind_proxy = true` and `public_url` is an `https://` address with no path: the pages' cookie is `Secure` (a browser only
 sends it over HTTPS) and every form is checked against the origin of `public_url`.
 
+The Overview shows server health and whether uploads are refused because the server is full. Users, team spaces and the audit
+log have their own pages. Storage shows stored and physical bytes, compression savings, the configured capacity, measured
+filesystem space when available, the ten largest accounts and remembered compression estimates. Set the compression level
+there with a form; every change requires the admin's password and, when enabled, a second-factor code. Loading the page does
+not run a storage estimate. Account pages show stored bytes, quota and available trash and history estimates; physical size
+and file counts are not currently measured per account.
+
 **Behind the proxy.**
 
 - The proxy terminates TLS and forwards `/web` and `/api` (and `/join`) to the server's `listen` address. It must pass the
