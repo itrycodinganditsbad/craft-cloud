@@ -187,7 +187,7 @@ mod tests {
         let retrying = Status { online: false, run_state: RunState::Retrying { message: "can't reach it".into() }, ..status() };
         assert_eq!(state_of(Some(&retrying)), TrayState::Offline);
         assert_eq!(state_of(Some(&Status { run_state: RunState::PausedByUser, ..status() })), TrayState::Paused);
-        let stuck = Status { run_state: RunState::Paused { reason: "the folder is missing".into() }, ..status() };
+        let stuck = Status { run_state: RunState::Paused { reason: "the folder is missing".into(), reason_code: None }, ..status() };
         assert_eq!(state_of(Some(&stuck)), TrayState::NeedsAttention);
         assert_eq!(state_of(Some(&Status { removed: true, ..stuck })), TrayState::NeedsAttention);
         assert_eq!(state_of(Some(&crate::model::tests::status(false))), TrayState::NeedsAttention, "not joined yet");
