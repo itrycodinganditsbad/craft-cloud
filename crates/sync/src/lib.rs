@@ -13,8 +13,8 @@ pub mod state;
 pub mod transport;
 
 pub use engine::{
-    Config, DEFAULT_IGNORES, Engine, NOT_NFC_REASON, OTHER_REASON, Report, SAVE_ORDER_WAITS, SAVE_RECORD_WAITS, STILL_CHANGING, SaveRecords,
-    SyncError,
+    Config, DEFAULT_IGNORES, Engine, NOT_NFC_REASON, OTHER_REASON, READ_ONLY_EDITED, READ_ONLY_NEW, Report, SAVE_ORDER_WAITS, SAVE_RECORD_WAITS,
+    STILL_CHANGING, SaveRecords, SyncError,
 };
 pub use fs::{FileMeta, Fs, FsEntry, FsKind, LandError, MemFs, ReadOnly, is_read_only, read_only_error, rel};
 pub use path::RelPath;

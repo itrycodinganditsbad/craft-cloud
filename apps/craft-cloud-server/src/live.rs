@@ -42,6 +42,14 @@
 //! - **Presence** is relayed to the document's other subscribers (of any device), never stored, at most
 //!   [`Limits::presence_per_sec`] per document per connection (more are dropped).
 //!
+//! - **Lookups that fail**: a look at the account's access or device that cannot be made (the database cannot be read)
+//!   confirms nothing ([`Look::Unconfirmed`]). Past [`Limits::live_recheck`] the connection relays no update and no
+//!   presence and accepts no presence; the look is repeated every [`Limits::live_retry`], and after
+//!   [`LOOKUP_FAILURES_MAX`] failures (or [`Limits::live_patience`]) the connection ends with an `internal` error and a
+//!   plain close (not `access_changed`).
+//! - **Pages to a slow reader**: [`send_page`] sends a page frame by frame while listening for the revocation signals,
+//!   reads the access again between frames and ends the page within [`Limits::live_page_send`].
+//!
 //! [`Session`] is the protocol, free of the WebSocket: the connection loop ([`connect`]) feeds it frames and
 //! notifications and sends what it returns. The agent's recents simulation drives sessions directly.
 
@@ -51,24 +59,49 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, State};
 use axum::response::Response;
-use craft_cloud_meta::DeviceAuth;
-use craft_cloud_proto::api::codes;
+use craft_cloud_meta::{DeviceAuth, MetaError, UserId, WriteGuard};
+use craft_cloud_proto::api::{SpaceRole, codes};
 use craft_cloud_proto::live::{
-    AppName, ClientFrame, DOCUMENT_KIND_PREFIX, DocKind, LIVE_DOCUMENTS_PROTOCOL, MAX_FRAME_BYTES, MAX_SUBSCRIPTIONS, MAX_UPDATE_BYTES,
-    PROTOCOL_MISMATCH, ServerFrame, node_doc, shared_version, update_hash,
+    ACCESS_CHANGED, ACCESS_CHANGED_CLOSE, AppName, ClientFrame, DOCUMENT_KIND_PREFIX, DocKind, LIVE_DOCUMENTS_PROTOCOL, LIVE_PROTOCOL_MAX,
+    LIVE_PROTOCOL_MIN, LIVE_SPACES_PROTOCOL, MAX_FRAME_BYTES, MAX_SUBSCRIPTIONS, MAX_UPDATE_BYTES, PROTOCOL_MISMATCH, ServerFrame, node_doc,
+    shared_version, update_hash,
 };
 use craft_cloud_proto::{DeviceId, DocId, Epoch, ManifestId, NodeId, SpaceId};
-use tokio::sync::broadcast;
+use futures_util::{Sink, SinkExt};
+use tokio::sync::{broadcast, watch};
 use tokio::time::Instant;
+use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::space::SpaceAccess;
 use crate::state::{AppState, Limits};
 
-/// Live connections one device may hold at once (a reconnect may overlap the old connection for a moment).
+/// Live connections one device may hold at once to one space (a reconnect may overlap the old connection for a moment).
 pub const MAX_CONNECTIONS_PER_DEVICE: usize = 4;
+/// …and to all its spaces together.
+pub const MAX_CONNECTIONS_PER_DEVICE_TOTAL: usize = 32;
+/// Documents one device may follow in one space ([`MAX_SUBSCRIPTIONS`])…
+pub const MAX_SUBSCRIPTIONS_PER_SPACE: usize = MAX_SUBSCRIPTIONS;
+/// …and in all its spaces together.
+pub const MAX_SUBSCRIPTIONS_PER_DEVICE_TOTAL: usize = 1024;
+/// How long a connection trusts its last look at the account's access (and its device) before it relays updates and
+/// presence, or accepts presence ([`Limits::live_recheck`]).
+pub const RECHECK_EVERY: Duration = Duration::from_secs(5);
+/// A look at the account that failed (the database could not be read) is repeated this often ([`Limits::live_retry`]).
+pub const LOOKUP_RETRY: Duration = Duration::from_secs(1);
+/// A connection whose look failed this many times in a row (at least [`LOOKUP_RETRY`] apart) ends, never having been
+/// told that its access is fine ([`Limits::live_patience`])...
+pub const LOOKUP_FAILURES_MAX: u32 = 3;
+/// ...or when this long has passed since the first failed look.
+pub const LOOKUP_PATIENCE: Duration = Duration::from_secs(15);
+/// The frames of one catch-up page must all be sent within this long ([`Limits::live_page_send`]): a reader that takes
+/// longer loses the connection, so a page of 256 frames cannot hold it for 256 times [`SEND_TIMEOUT`].
+pub const PAGE_SEND_TIMEOUT: Duration = Duration::from_secs(120);
+/// After a change of a space's members a connection looks at its access at once, then at most this often.
+const MEMBERS_COALESCE: Duration = Duration::from_secs(1);
 /// Updates (and creates) a connection may send at once before it is refilled…
 pub const UPDATE_BURST: u32 = 400;
 /// …at this many per second.
@@ -80,8 +113,8 @@ pub const PUMP_PAGE: u32 = 256;
 pub const PUMP_BYTES: u64 = 4 * 1024 * 1024;
 /// The agent must say `hello` this soon after connecting.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
-/// The server pings this often…
-const PING_EVERY: Duration = Duration::from_secs(30);
+/// The server pings this often (by default; [`Limits::live_ping`])…
+pub const PING_EVERY: Duration = Duration::from_secs(30);
 /// …and closes a connection it heard nothing from (not even a pong) for this long.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// A frame the agent doesn't read within this long closes the connection.
@@ -102,6 +135,9 @@ pub struct PresenceNote {
     pub bytes: Arc<Vec<u8>>,
     /// The session it came from (not sent back to it).
     pub from: u64,
+    /// The account of the session it came from, as the server knows it: relayed as `presence_from {user}` on protocol 3,
+    /// whatever the bytes say.
+    pub user: Uuid,
 }
 
 /// One document's compaction: the request out (to which session and device, for which `upto`, since when), and the
@@ -118,8 +154,8 @@ struct Compaction {
 pub struct LiveHub {
     spaces: Mutex<HashMap<SpaceId, broadcast::Sender<DocId>>>,
     presence: Mutex<HashMap<SpaceId, broadcast::Sender<PresenceNote>>>,
-    connections: Mutex<HashMap<DeviceId, usize>>,
-    subscriptions: Mutex<HashMap<DeviceId, usize>>,
+    connections: Mutex<Connections>,
+    subscriptions: Mutex<Connections>,
     revoked: broadcast::Sender<DeviceId>,
     compactions: Mutex<HashMap<(SpaceId, DocId), Compaction>>,
     /// Each device's presence budget per document, across its connections.
@@ -146,40 +182,83 @@ impl Default for LiveHub {
 /// Sessions are numbered, so a presence message isn't sent back to the one it came from.
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
-/// One of a device's live connections; frees its slot when dropped.
-pub struct ConnectionSlot {
-    hub: Arc<AppState>,
-    device: DeviceId,
+/// The process's registry of open live connections: how many each device holds to each space, and in all. (Another
+/// server process on the same database has its own; the limits are per process, like the rest of the hub.)
+#[derive(Default)]
+struct Connections {
+    per_space: HashMap<(DeviceId, SpaceId), usize>,
+    per_device: HashMap<DeviceId, usize>,
 }
 
-impl Drop for ConnectionSlot {
-    fn drop(&mut self) {
-        release(&self.hub.live.connections, self.device, 1);
+impl Connections {
+    /// Takes a place for `device` in `space`; false when it holds `max_here` to that space or `max_total` in all.
+    fn take(&mut self, device: DeviceId, space: SpaceId, max_here: usize, max_total: usize) -> bool {
+        let total = self.per_device.get(&device).copied().unwrap_or(0);
+        let here = self.per_space.get(&(device, space)).copied().unwrap_or(0);
+        if here >= max_here || total >= max_total {
+            return false;
+        }
+        self.per_space.insert((device, space), here + 1);
+        self.per_device.insert(device, total + 1);
+        true
     }
-}
 
-fn release(counts: &Mutex<HashMap<DeviceId, usize>>, device: DeviceId, n: usize) {
-    let mut counts = counts.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(count) = counts.get_mut(&device) {
-        *count = count.saturating_sub(n);
-        if *count == 0 {
-            counts.remove(&device);
+    fn release(&mut self, device: DeviceId, space: SpaceId, n: usize) {
+        if let Some(here) = self.per_space.get_mut(&(device, space)) {
+            *here = here.saturating_sub(n);
+            if *here == 0 {
+                self.per_space.remove(&(device, space));
+            }
+        }
+        if let Some(total) = self.per_device.get_mut(&device) {
+            *total = total.saturating_sub(n);
+            if *total == 0 {
+                self.per_device.remove(&device);
+            }
         }
     }
 }
 
-/// Takes one of `max` slots of `device` in `counts`; false when all are taken.
-fn take(counts: &Mutex<HashMap<DeviceId, usize>>, device: DeviceId, max: usize) -> bool {
-    let mut counts = counts.lock().unwrap_or_else(PoisonError::into_inner);
-    let count = counts.entry(device).or_insert(0);
-    if *count >= max {
-        return false;
+/// One of a device's live connections to a space; frees its place when dropped.
+pub struct ConnectionSlot {
+    hub: Arc<AppState>,
+    device: DeviceId,
+    space: SpaceId,
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.hub.live.connections.lock().unwrap_or_else(PoisonError::into_inner).release(self.device, self.space, 1);
     }
-    *count += 1;
-    true
 }
 
 impl LiveHub {
+    /// Registers a connection of `device` to `space`, or `None` when the device holds too many.
+    pub fn open_connection(&self, state: &Arc<AppState>, device: DeviceId, space: SpaceId) -> Option<ConnectionSlot> {
+        let taken = self.connections.lock().unwrap_or_else(PoisonError::into_inner).take(
+            device,
+            space,
+            MAX_CONNECTIONS_PER_DEVICE,
+            MAX_CONNECTIONS_PER_DEVICE_TOTAL,
+        );
+        taken.then(|| ConnectionSlot { hub: state.clone(), device, space })
+    }
+
+    /// Takes a place for one more followed document of `device` in `space`; false at [`MAX_SUBSCRIPTIONS_PER_SPACE`] in the
+    /// space or [`MAX_SUBSCRIPTIONS_PER_DEVICE_TOTAL`] in all.
+    fn take_subscription(&self, device: DeviceId, space: SpaceId) -> bool {
+        self.subscriptions.lock().unwrap_or_else(PoisonError::into_inner).take(
+            device,
+            space,
+            MAX_SUBSCRIPTIONS_PER_SPACE,
+            MAX_SUBSCRIPTIONS_PER_DEVICE_TOTAL,
+        )
+    }
+
+    fn release_subscriptions(&self, device: DeviceId, space: SpaceId, n: usize) {
+        self.subscriptions.lock().unwrap_or_else(PoisonError::into_inner).release(device, space, n);
+    }
+
     /// `device` was revoked: its live connections end. (One revoked by another process, the admin CLI, is found by the
     /// check every connection makes at each ping.)
     pub fn revoke(&self, device: DeviceId) {
@@ -332,11 +411,50 @@ pub struct Reply {
     pub close: bool,
 }
 
+/// What a look at a connection's device and access found.
+#[derive(Debug, PartialEq)]
+pub enum Look {
+    /// Both are as they were (read now, or read within [`Limits::live_recheck`]).
+    Confirmed,
+    /// The connection ends with this frame.
+    Ended(ServerFrame),
+    /// The database could not be read: nothing is known, and nothing counts as confirmed. The connection relays no update
+    /// and no presence and accepts no presence until a look succeeds; after [`LOOKUP_FAILURES_MAX`] failed looks, or
+    /// [`Limits::live_patience`], it ends with [`Look::Ended`].
+    Unconfirmed,
+}
+
+/// The failed looks since the last one that succeeded.
+#[derive(Debug, Clone, Copy)]
+struct Unconfirmed {
+    /// The first failed look.
+    since: Instant,
+    /// The last one counted.
+    last: Instant,
+    failures: u32,
+}
+
 /// One live connection's protocol state: its device, its subscriptions and what it has sent of each.
 pub struct Session {
     state: Arc<AppState>,
     space: SpaceId,
     device: DeviceId,
+    /// The device's account: presence is stamped with it, and its access to the space is read again as it changes.
+    user: UserId,
+    /// The account's role in the space when the connection was opened (`Owner` in its own personal space). The
+    /// connection ends when it changes ([`Session::check_access`]).
+    role: SpaceRole,
+    /// Whether the space is the account's own personal space (not a team space).
+    personal: bool,
+    /// When the account's access and device were last confirmed: relaying and accepting presence trust it for
+    /// [`Limits::live_recheck`] ([`Session::fresh`]).
+    verified: Instant,
+    /// Looks that failed since `verified` was set: the connection is not trusted past `live_recheck` while there are any.
+    unconfirmed: Option<Unconfirmed>,
+    /// When the device was last confirmed active (a write trusts it for [`Limits::live_recheck`]).
+    device_verified: Instant,
+    /// A write found the account's access gone: the connection ends after the answer.
+    lost: bool,
     welcomed: bool,
     /// The live protocol agreed at `hello` (0 before).
     protocol: u32,
@@ -354,7 +472,7 @@ pub struct Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        release(&self.state.live.subscriptions, self.device, self.subscriptions.len());
+        self.state.live.release_subscriptions(self.device, self.space, self.subscriptions.len());
         for doc in self.asked.keys() {
             self.state.live.forget_ask(self.space, *doc, self.id);
         }
@@ -369,11 +487,23 @@ impl Session {
     /// A session for the signed-in device `auth`. The caller listens to the space ([`LiveHub::listen`]) before the
     /// session reads anything, and hands it what it hears ([`Session::note`], [`Session::lagged`]).
     pub fn new(state: Arc<AppState>, auth: &DeviceAuth) -> Self {
+        Self::in_space(state, auth, auth.personal_space(), SpaceRole::Owner, true)
+    }
+
+    /// A session of the device `auth` on `space`, where the space layer found its account to have `role`.
+    pub fn in_space(state: Arc<AppState>, auth: &DeviceAuth, space: SpaceId, role: SpaceRole, personal: bool) -> Self {
         let budget = Budget::new(&state.limits);
         Self {
             state,
-            space: auth.space,
+            space,
             device: auth.device,
+            user: auth.user,
+            role,
+            personal,
+            verified: Instant::now(),
+            unconfirmed: None,
+            device_verified: Instant::now(),
+            lost: false,
             welcomed: false,
             protocol: 0,
             id: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
@@ -390,31 +520,300 @@ impl Session {
         self.protocol >= LIVE_DOCUMENTS_PROTOCOL
     }
 
+    /// Whether the connection speaks team spaces (protocol 3 on): `welcome_space`, `presence_from`.
+    fn spaces(&self) -> bool {
+        self.protocol >= LIVE_SPACES_PROTOCOL
+    }
+
+    /// The server's side of `hello`: the space's epoch and, in a team space, the account's role read again (it may have
+    /// changed since the upgrade), and the frame that tells the agent: `welcome`, or `welcome_space` on protocol 3.
+    async fn hello(&mut self, protocol: u32) -> Result<ServerFrame, Reply> {
+        let closing = |code: &str, message: String| Reply { frames: vec![ServerFrame::error(code, message, None, None)], close: true };
+        if !self.personal {
+            match self.state.meta.space_access(self.user, self.space).await {
+                Ok(Some(role)) => self.role = role,
+                Ok(None) => return Err(closing(ACCESS_CHANGED, "you no longer have access to this space".to_owned())),
+                Err(e) => {
+                    let e = ApiError::from(e);
+                    return Err(closing(e.code, e.message));
+                }
+            }
+        }
+        let epoch = match self.state.meta.live_epoch(self.space).await {
+            Ok(epoch) => epoch,
+            Err(e) => {
+                let e = ApiError::from(e);
+                return Err(closing(e.code, e.message));
+            }
+        };
+        self.epoch = Some(epoch);
+        Ok(if protocol >= LIVE_SPACES_PROTOCOL {
+            ServerFrame::WelcomeSpace { protocol, epoch, space: self.space, role: self.role }
+        } else {
+            ServerFrame::Welcome { protocol, epoch }
+        })
+    }
+
+    /// Whether the account may still do what it did when the connection opened: `Some(the frame to end with)` when it is
+    /// no longer a member, when its role changed (a role lowered, the space archived, the space unarchived) or when the
+    /// account was disabled or marked for removal. The agent connects again and gets the role it has now, or a refusal.
+    /// Read from the database, never from a cache. A database that cannot be read is an error, which the caller must not
+    /// take as "nothing changed" ([`Session::look_failed`]).
+    async fn check_access(&mut self) -> Result<Option<ServerFrame>, MetaError> {
+        let now = self.state.meta.space_access(self.user, self.space).await?;
+        Ok((now != Some(self.role)).then(|| ServerFrame::error(ACCESS_CHANGED, "your access to this space changed; connect again", None, None)))
+    }
+
+    /// The access was confirmed now.
+    fn confirmed(&mut self) {
+        self.verified = Instant::now();
+        self.unconfirmed = None;
+    }
+
+    /// A look failed with `e` (the database could not be read). Nothing is confirmed by it: the time of the last
+    /// confirmation stays, so the connection is not trusted past [`Limits::live_recheck`]. Counts one failure per
+    /// [`Limits::live_retry`]; at [`LOOKUP_FAILURES_MAX`] of them, or [`Limits::live_patience`] after the first, the
+    /// connection ends with a server error (not `access_changed`: nothing is known about the access).
+    fn look_failed(&mut self, e: &MetaError) -> Look {
+        tracing::warn!(error = %e, "a live connection's access couldn't be confirmed");
+        let (retry, patience) = (self.state.limits.live_retry, self.state.limits.live_patience);
+        let now = Instant::now();
+        let unconfirmed = self.unconfirmed.get_or_insert(Unconfirmed { since: now, last: now, failures: 0 });
+        if unconfirmed.failures == 0 || now.saturating_duration_since(unconfirmed.last) >= retry {
+            unconfirmed.failures += 1;
+            unconfirmed.last = now;
+        }
+        if unconfirmed.failures >= LOOKUP_FAILURES_MAX || now.saturating_duration_since(unconfirmed.since) >= patience {
+            Look::Ended(Self::unconfirmed_frame())
+        } else {
+            Look::Unconfirmed
+        }
+    }
+
+    /// The frame that ends a connection whose access cannot be confirmed. A server error, not `access_changed`: nothing
+    /// is known about the access, and the agent connects again.
+    fn unconfirmed_frame() -> ServerFrame {
+        ServerFrame::error(codes::INTERNAL, "the server could not confirm your access to this space; connect again", None, None)
+    }
+
+    /// The device and then the access, read now: a device signed out meanwhile (an account disabled) is told so first.
+    /// A confirmed look is remembered ([`Session::fresh`]); a look that could not be made is not ([`Look::Unconfirmed`]).
+    pub async fn check_identity(&mut self) -> Look {
+        match self.state.meta.device_active(self.device).await {
+            Ok(true) => {}
+            Ok(false) => return Look::Ended(ServerFrame::error(codes::UNAUTHORIZED, "this device was signed out", None, None)),
+            Err(e) => return self.look_failed(&e),
+        }
+        match self.check_access().await {
+            Ok(None) => {}
+            Ok(Some(ended)) => return Look::Ended(ended),
+            Err(e) => return self.look_failed(&e),
+        }
+        self.confirmed();
+        self.device_verified = self.verified;
+        Look::Confirmed
+    }
+
+    /// [`Session::check_identity`] unless it was done within [`Limits::live_recheck`] (or, after a failed look, within
+    /// [`Limits::live_retry`]). Before a connection relays updates or presence, or accepts presence, so that an account
+    /// removed by another process (the command line, a second server on the database) stops sending and receiving within
+    /// that time instead of at the next ping.
+    pub async fn fresh(&mut self) -> Look {
+        if self.trusted_since().elapsed() < self.state.limits.live_recheck {
+            return Look::Confirmed;
+        }
+        if self.unconfirmed.is_some_and(|u| u.last.elapsed() < self.state.limits.live_retry) {
+            return Look::Unconfirmed;
+        }
+        self.check_identity().await
+    }
+
+    /// Whether the connection is past [`Limits::live_recheck`] with a look that failed: it relays and accepts nothing.
+    pub fn blocked(&self) -> bool {
+        self.unconfirmed.is_some() && self.trusted_since().elapsed() >= self.state.limits.live_recheck
+    }
+
+    /// When the older of the two confirmations, the device's and the access's, was made. Relaying trusts a connection for
+    /// [`Limits::live_recheck`] from here: a frame that read only the access (the device came from the cache) must not
+    /// extend the device's trust.
+    fn trusted_since(&self) -> Instant {
+        self.verified.min(self.device_verified)
+    }
+
+    /// [`Session::check_identity`] for a look that a signal asked for (the space's members changed, a revocation was
+    /// missed). If it cannot be made, the remaining trust is withdrawn at once: the connection relays and accepts nothing
+    /// until a look works, instead of going on for up to [`Limits::live_recheck`] after a change made in this process.
+    pub async fn signalled(&mut self) -> Look {
+        let look = self.check_identity().await;
+        if look == Look::Unconfirmed {
+            let now = Instant::now();
+            let expired = now.checked_sub(self.state.limits.live_recheck).unwrap_or(now);
+            self.verified = self.verified.min(expired);
+            self.device_verified = self.device_verified.min(expired);
+        }
+        look
+    }
+
+    /// When the next look is due, if the last one failed: the connection loop makes it, so a database that stays
+    /// unreadable ends the connection even when nothing else happens on it.
+    pub fn retry_at(&self) -> Option<Instant> {
+        let unconfirmed = self.unconfirmed?;
+        Some((unconfirmed.last + self.state.limits.live_retry).max(self.trusted_since() + self.state.limits.live_recheck))
+    }
+
+    /// The device, trusted for [`Limits::live_recheck`]: a write from a device signed out by another process is refused
+    /// within that time. An error is a database that could not be read; the device is not taken as active then.
+    async fn device_fresh(&mut self) -> Result<Option<ServerFrame>, MetaError> {
+        if self.device_verified.elapsed() < self.state.limits.live_recheck {
+            return Ok(None);
+        }
+        if !self.state.meta.device_active(self.device).await? {
+            return Ok(Some(ServerFrame::error(codes::UNAUTHORIZED, "this device was signed out", None, None)));
+        }
+        self.device_verified = Instant::now();
+        Ok(None)
+    }
+
+    /// A revocation heard on the hub's channel: the frame to end with when it is this connection's device, or (when some
+    /// were missed) when the device or the access turn out to have changed.
+    pub async fn revoked(&mut self, heard: Result<DeviceId, broadcast::error::RecvError>) -> Option<ServerFrame> {
+        match heard {
+            Ok(device) => (device == self.device).then(|| ServerFrame::error(codes::UNAUTHORIZED, "this device was signed out", None, None)),
+            Err(broadcast::error::RecvError::Lagged(_)) => match self.signalled().await {
+                Look::Ended(frame) => Some(frame),
+                Look::Confirmed | Look::Unconfirmed => None,
+            },
+            Err(broadcast::error::RecvError::Closed) => None,
+        }
+    }
+
+    /// The store handle for a live write. In a team space it re-checks the account's role inside the write transaction
+    /// ([`craft_cloud_meta::Meta::guarded`]), after the frame's own check: a role lowered, a member removed or a space
+    /// archived between the two is respected, and nothing is stored or announced. A personal space's owner has nothing to
+    /// re-check.
+    fn writer(&self) -> craft_cloud_meta::Meta {
+        if self.personal { self.state.meta.clone() } else { self.state.meta.guarded(WriteGuard { user: self.user, min: SpaceRole::Editor }) }
+    }
+
+    /// A store error of a live write as the answer for the agent. A guarded write that finds the account without access
+    /// ends the connection (`access_changed`); one that finds it below an editor is `read_only`.
+    fn write_failed(&mut self, e: MetaError) -> ApiError {
+        if matches!(e, MetaError::NotFound("space")) {
+            self.lost = true;
+            return ApiError::new(axum::http::StatusCode::NOT_FOUND, ACCESS_CHANGED, "your access to this space changed; connect again");
+        }
+        e.into()
+    }
+
+    /// The role a frame needs, in a team space: `create`, `update` and `snapshot` need an editor; `subscribe` and
+    /// `subscribe_log` a viewer (a read that starts a catch-up). Presence and `unsubscribe` need only the membership the
+    /// connection was opened with, which a change of the space's members, the ping and [`Session::fresh`] re-check.
+    fn role_needed(frame: &ClientFrame) -> Option<SpaceRole> {
+        match frame {
+            ClientFrame::Create { .. } | ClientFrame::CreateDocument { .. } | ClientFrame::Update { .. } | ClientFrame::Snapshot { .. } => {
+                Some(SpaceRole::Editor)
+            }
+            ClientFrame::Subscribe { .. } | ClientFrame::SubscribeLog { .. } => Some(SpaceRole::Viewer),
+            ClientFrame::Hello { .. } | ClientFrame::Unsubscribe { .. } | ClientFrame::Presence { .. } => None,
+        }
+    }
+
+    /// The refusal of a frame whose checks could not be made (the database could not be read): `internal`, naming the
+    /// frame's document, and the connection stays; one that keeps failing ends ([`Session::look_failed`]).
+    fn unconfirmed_reply(&mut self, e: MetaError, frame: &ClientFrame) -> Reply {
+        if let Look::Ended(ended) = self.look_failed(&e) {
+            return Reply { frames: vec![ended], close: true };
+        }
+        let (doc, client_seq) = Self::frame_refs(frame);
+        Reply { frames: vec![refused(e.into(), doc, client_seq)], close: false }
+    }
+
+    /// The document and the update a frame names, for the answer that refuses it.
+    fn frame_refs(frame: &ClientFrame) -> (Option<DocId>, Option<u64>) {
+        match frame {
+            ClientFrame::Create { doc, .. }
+            | ClientFrame::CreateDocument { doc, .. }
+            | ClientFrame::Snapshot { doc, .. }
+            | ClientFrame::Subscribe { doc, .. }
+            | ClientFrame::SubscribeLog { doc, .. } => (Some(*doc), None),
+            ClientFrame::Update { doc, client_seq, .. } => (Some(*doc), Some(*client_seq)),
+            ClientFrame::Hello { .. } | ClientFrame::Unsubscribe { .. } | ClientFrame::Presence { .. } => (None, None),
+        }
+    }
+
+    /// The check of one frame before anything else is done with it. Presence is accepted only from a connection whose
+    /// access was confirmed within [`Limits::live_recheck`] (presence from one whose look failed is dropped). For a write or a subscribe the device is confirmed within
+    /// that time too, and in a team space the account's access is read from the database now (so a change made by
+    /// another process, the command line, is respected at once): a connection whose access is not the one it was opened
+    /// with ends, and a viewer's write is refused with `read_only` and changes nothing. The write itself is guarded again in
+    /// its transaction ([`Session::writer`]). `None` lets the frame through.
+    async fn gate(&mut self, frame: &ClientFrame) -> Option<Reply> {
+        let Some(need) = Self::role_needed(frame) else {
+            if matches!(frame, ClientFrame::Presence { .. }) {
+                match self.fresh().await {
+                    Look::Confirmed => {}
+                    Look::Ended(ended) => return Some(Reply { frames: vec![ended], close: true }),
+                    Look::Unconfirmed => return Some(Reply::default()),
+                }
+            }
+            return None;
+        };
+        match self.device_fresh().await {
+            Ok(None) => {}
+            Ok(Some(ended)) => return Some(Reply { frames: vec![ended], close: true }),
+            Err(e) => return Some(self.unconfirmed_reply(e, frame)),
+        }
+        if self.personal {
+            return None;
+        }
+        match self.check_access().await {
+            Ok(None) => {}
+            Ok(Some(ended)) => return Some(Reply { frames: vec![ended], close: true }),
+            Err(e) => return Some(self.unconfirmed_reply(e, frame)),
+        }
+        self.confirmed();
+        if self.role >= need {
+            return None;
+        }
+        let (doc, client_seq) = Self::frame_refs(frame);
+        Some(Reply { frames: vec![refused(crate::space::read_only(), doc, client_seq)], close: false })
+    }
+
     /// Handles one frame from the agent.
     pub async fn handle(&mut self, frame: ClientFrame) -> Reply {
+        let mut reply = self.handle_frame(frame).await;
+        // A write found the account's access gone: the answer was `access_changed`, and the connection ends with it.
+        if self.lost {
+            reply.close = true;
+        }
+        reply
+    }
+
+    async fn handle_frame(&mut self, frame: ClientFrame) -> Reply {
         let one = |frame| Reply { frames: vec![frame], close: false };
         if !self.welcomed {
             return match frame {
                 ClientFrame::Hello { min, max } => match shared_version(min, max) {
-                    Some(protocol) => match self.state.meta.live_epoch(self.space).await {
-                        Ok(epoch) => {
+                    // A team space has a role per frame, which protocol 2 has no way to say: a connection to one that does not
+                    // reach protocol 3 is refused, like a version nobody shares.
+                    Some(protocol) if protocol < LIVE_SPACES_PROTOCOL && !self.personal => Reply {
+                        frames: vec![ServerFrame::error(PROTOCOL_MISMATCH, "team spaces need live protocol 3: update the agent", None, None)],
+                        close: true,
+                    },
+                    Some(protocol) => match self.hello(protocol).await {
+                        Ok(frame) => {
                             self.welcomed = true;
                             self.protocol = protocol;
-                            self.epoch = Some(epoch);
-                            one(ServerFrame::Welcome { protocol, epoch })
+                            one(frame)
                         }
-                        Err(e) => {
-                            let e = ApiError::from(e);
-                            Reply { frames: vec![ServerFrame::error(e.code, e.message, None, None)], close: true }
-                        }
+                        Err(reply) => reply,
                     },
                     None => Reply {
                         frames: vec![ServerFrame::error(
                             PROTOCOL_MISMATCH,
                             format!(
                                 "the server speaks live protocol {}-{}, the agent {min}-{max}: update the older one",
-                                craft_cloud_proto::live::LIVE_PROTOCOL_MIN,
-                                craft_cloud_proto::live::LIVE_PROTOCOL_MAX
+                                LIVE_PROTOCOL_MIN, LIVE_PROTOCOL_MAX
                             ),
                             None,
                             None,
@@ -425,6 +824,9 @@ impl Session {
                 _ => Reply { frames: vec![ServerFrame::error(codes::INVALID, "say hello first", None, None)], close: true },
             };
         }
+        if let Some(reply) = self.gate(&frame).await {
+            return reply;
+        }
         match frame {
             ClientFrame::Hello { .. } => one(ServerFrame::error(codes::INVALID, "hello was said already", None, None)),
             ClientFrame::Create { doc, kind } => one(self.create(doc, kind).await),
@@ -434,7 +836,7 @@ impl Session {
             },
             ClientFrame::Unsubscribe { doc } => {
                 if self.subscriptions.remove(&doc).is_some() {
-                    release(&self.state.live.subscriptions, self.device, 1);
+                    self.state.live.release_subscriptions(self.device, self.space, 1);
                 }
                 self.dirty.remove(&doc);
                 Reply::default()
@@ -455,10 +857,10 @@ impl Session {
                 Ok(()) => Reply::default(),
                 Err(e) => one(refused(e, Some(doc), None)),
             },
-            ClientFrame::Snapshot { doc, upto, manifest } => {
-                self.snapshot(doc, upto, manifest).await;
-                Reply::default()
-            }
+            ClientFrame::Snapshot { doc, upto, manifest } => match self.snapshot(doc, upto, manifest).await {
+                Some(ended) => one(ended),
+                None => Reply::default(),
+            },
             ClientFrame::Presence { doc, bytes } => {
                 self.presence(doc, bytes);
                 Reply::default()
@@ -491,25 +893,35 @@ impl Session {
             Err(e) => return refused(e.into(), Some(doc), None),
         }
         let kind = DocKind::Document { node, app }.as_text();
-        match self.state.meta.create_live_document(self.space, doc, &kind, node, &manifest, self.state.now_ms()).await {
+        match self.writer().create_live_document(self.space, doc, &kind, node, &manifest, self.state.now_ms()).await {
             Ok((_, kept)) => ServerFrame::CreatedDocument { doc, kept },
-            Err(e) => refused(e.into(), Some(doc), None),
+            Err(e) => {
+                let e = self.write_failed(e);
+                refused(e, Some(doc), None)
+            }
         }
     }
 
     /// `snapshot {doc, upto, manifest}`: the answer to this session's `compact`, taken only for the `upto` it was
     /// asked, and only for a manifest the account uploaded; recorded past the current base only. Never answered: a
-    /// snapshot that isn't taken changes nothing, and another device is asked later.
-    async fn snapshot(&mut self, doc: DocId, upto: u64, manifest: ManifestId) {
+    /// snapshot that isn't taken changes nothing, and another device is asked later. Except one found to come from an
+    /// account whose access is gone (the guard in the transaction, after the frame's own check): that is answered with
+    /// `access_changed`, and the connection ends with it like any other loss of access.
+    async fn snapshot(&mut self, doc: DocId, upto: u64, manifest: ManifestId) -> Option<ServerFrame> {
         if !self.subscriptions.contains_key(&doc) || self.asked.get(&doc) != Some(&upto) {
-            return;
+            return None;
         }
         self.asked.remove(&doc);
-        match self.state.meta.compact_live_doc(self.space, doc, upto, &manifest).await {
+        match self.writer().compact_live_doc(self.space, doc, upto, &manifest).await {
             Ok(true) => self.state.live.compacted(self.space, doc),
             Ok(false) => {}
+            Err(e @ MetaError::NotFound("space")) => {
+                let e = self.write_failed(e);
+                return Some(refused(e, Some(doc), None));
+            }
             Err(e) => tracing::info!(error = %e, "a live document's snapshot wasn't recorded"),
         }
+        None
     }
 
     /// `presence {doc, bytes}`: relayed to the document's other subscribers, within the device's budget for the
@@ -521,13 +933,20 @@ impl Session {
         if !self.state.live.spend_presence(self.device, doc, self.state.limits.presence_per_sec) || !self.budget.spend() {
             return;
         }
-        self.state.live.publish_presence(self.space, PresenceNote { doc, bytes: Arc::new(bytes), from: self.id });
+        // The account is the server's: whatever the bytes say, the others are told who sent them.
+        self.state.live.publish_presence(self.space, PresenceNote { doc, bytes: Arc::new(bytes), from: self.id, user: self.user.0 });
     }
 
     /// Another connection's presence message: the frame for this one's agent, if it follows the document.
     pub fn relay(&self, note: &PresenceNote) -> Option<ServerFrame> {
-        (self.documents() && note.from != self.id && self.subscriptions.contains_key(&note.doc))
-            .then(|| ServerFrame::Presence { doc: note.doc, bytes: note.bytes.as_ref().clone() })
+        (self.documents() && note.from != self.id && self.subscriptions.contains_key(&note.doc)).then(|| {
+            let bytes = note.bytes.as_ref().clone();
+            if self.spaces() {
+                ServerFrame::PresenceFrom { doc: note.doc, bytes, user: note.user }
+            } else {
+                ServerFrame::Presence { doc: note.doc, bytes }
+            }
+        })
     }
 
     /// The `compact` to ask this session's agent for, if the log above the snapshot is long (`upto - base` updates,
@@ -535,7 +954,8 @@ impl Session {
     fn maybe_compact(&mut self, doc: DocId, upto: u64, base: u64, above: u64) -> Option<ServerFrame> {
         let limits = &self.state.limits;
         let long = upto.saturating_sub(base) > limits.compact_updates || above > limits.compact_bytes;
-        if !self.documents() || !long || self.asked.get(&doc).is_some_and(|asked| *asked >= upto) {
+        // A viewer could not upload the snapshot (it cannot write), so it is never asked.
+        if !self.documents() || !self.role.may_write() || !long || self.asked.get(&doc).is_some_and(|asked| *asked >= upto) {
             return None;
         }
         if !self.state.live.ask_compaction(self.space, doc, self.id, self.device, limits) {
@@ -554,9 +974,12 @@ impl Session {
         if kind.fixed_id(self.space) != Some(doc) {
             return refused(ApiError::invalid("that document ID doesn't belong to that kind"), Some(doc), None);
         }
-        match self.state.meta.create_live_doc(self.space, doc, &kind.as_text(), None, self.state.now_ms()).await {
+        match self.writer().create_live_doc(self.space, doc, &kind.as_text(), None, self.state.now_ms()).await {
             Ok(_) => ServerFrame::Created { doc },
-            Err(e) => refused(e.into(), Some(doc), None),
+            Err(e) => {
+                let e = self.write_failed(e);
+                refused(e, Some(doc), None)
+            }
         }
     }
 
@@ -572,28 +995,28 @@ impl Session {
             return Err(ApiError::invalid("this document's catch-up is under way; subscribe again after `subscribed`"));
         }
         let new = !self.subscriptions.contains_key(&doc);
-        if new && !take(&self.state.live.subscriptions, self.device, MAX_SUBSCRIPTIONS) {
+        if new && !self.state.live.take_subscription(self.device, self.space) {
             return Err(ApiError::rate_limited(format!("a device may follow at most {MAX_SUBSCRIPTIONS} documents"), None));
         }
         let found = match self.state.meta.live_doc(self.space, doc).await {
             Ok(found) => found,
             Err(e) => {
                 if new {
-                    release(&self.state.live.subscriptions, self.device, 1);
+                    self.state.live.release_subscriptions(self.device, self.space, 1);
                 }
                 return Err(e.into());
             }
         };
         let Some(found) = found else {
             if new {
-                release(&self.state.live.subscriptions, self.device, 1);
+                self.state.live.release_subscriptions(self.device, self.space, 1);
             }
             return Err(ApiError::not_found("document"));
         };
         // A document of a file is for an agent that reads its snapshot: one on protocol 1 never made one.
         if !self.documents() && found.kind.starts_with(DOCUMENT_KIND_PREFIX) {
             if new {
-                release(&self.state.live.subscriptions, self.device, 1);
+                self.state.live.release_subscriptions(self.device, self.space, 1);
             }
             return Err(ApiError::invalid("documents of files need live protocol 2"));
         }
@@ -607,14 +1030,14 @@ impl Session {
                 Ok((page, _)) => page.first().filter(|u| u.seq == after).map(|u| update_hash(&u.bytes)),
                 Err(e) => {
                     if new {
-                        release(&self.state.live.subscriptions, self.device, 1);
+                        self.state.live.release_subscriptions(self.device, self.space, 1);
                     }
                     return Err(e.into());
                 }
             };
             if ours != Some(at) {
                 if new {
-                    release(&self.state.live.subscriptions, self.device, 1);
+                    self.state.live.release_subscriptions(self.device, self.space, 1);
                 }
                 return Err(ApiError::new(
                     axum::http::StatusCode::GONE,
@@ -648,17 +1071,18 @@ impl Session {
         }
         // Appended and published in a task of its own: a connection that drops meanwhile must not skip the publish of
         // an update that was stored.
-        let (state, space, device) = (self.state.clone(), self.space, self.device);
+        let (state, space, device, meta) = (self.state.clone(), self.space, self.device, self.writer());
         let appended = tokio::spawn(async move {
-            let appended = state.meta.append_live_update_counted(space, doc, device, client_seq, &bytes, state.now_ms()).await?;
+            let appended = meta.append_live_update_counted(space, doc, device, client_seq, &bytes, state.now_ms()).await?;
             state.live.publish(space, doc);
-            Ok::<_, ApiError>(appended)
+            Ok::<_, MetaError>(appended)
         })
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "live append task failed");
             ApiError::internal()
-        })??;
+        })?
+        .map_err(|e| self.write_failed(e))?;
         // The device that sent the update that made the log long is asked first: it holds every update up to it once
         // those below have reached it.
         let compact = if appended.repeat { None } else { self.maybe_compact(doc, appended.seq, appended.base, appended.above_bytes) };
@@ -678,12 +1102,18 @@ impl Session {
     }
 
     /// The check every connection makes at each ping: `Some(the frame to close with)` when the connection must end. A
-    /// device revoked by another process (the admin CLI) is found here, at the latest one ping later; so is a space
+    /// device revoked by another process (the admin CLI) is found here, at the latest one ping later; so is a change of
+    /// the account's access to the space ([`Session::check_access`]) and a space
     /// whose live epoch changed (a restore from a backup, or a `live reset-doc`) while the connection was open: the agent
     /// connects again and learns the new one in `welcome`.
     pub async fn check(&mut self) -> Option<ServerFrame> {
-        if !self.state.meta.device_active(self.device).await.unwrap_or(true) {
-            return Some(ServerFrame::error(codes::UNAUTHORIZED, "this device was signed out", None, None));
+        // The device and the account's access, read again: a change made by another process (two servers on one database)
+        // or by the command line is found here, at the latest one ping later. A look that could not be made ends nothing
+        // yet (it ends the connection once it keeps failing), and confirms nothing.
+        match self.check_identity().await {
+            Look::Ended(ended) => return Some(ended),
+            Look::Unconfirmed => return None,
+            Look::Confirmed => {}
         }
         if let Some(epoch) = self.epoch
             && let Ok(now) = self.state.meta.live_epoch(self.space).await
@@ -761,25 +1191,43 @@ impl Session {
 pub async fn connect(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<DeviceAuth>,
+    Extension(access): Extension<SpaceAccess>,
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Result<Response, ApiError> {
     let upgrade = upgrade.map_err(|e| ApiError::new(e.status(), codes::INVALID, e.body_text()))?;
-    if !take(&state.live.connections, auth.device, MAX_CONNECTIONS_PER_DEVICE) {
-        return Err(ApiError::rate_limited(format!("a device may hold at most {MAX_CONNECTIONS_PER_DEVICE} live connections"), Some(5)));
+    // The space layer found the caller a member of the space (a non-member was refused with 404 before this) and read its
+    // role. A team space is served on live protocol 3 only: `hello` refuses a connection that does not reach it.
+    let Some(slot) = state.live.open_connection(&state, auth.device, access.space) else {
+        return Err(ApiError::rate_limited(
+            format!(
+                "a device may hold at most {MAX_CONNECTIONS_PER_DEVICE} live connections to a space and {MAX_CONNECTIONS_PER_DEVICE_TOTAL} in all"
+            ),
+            Some(5),
+        ));
+    };
+    // Listening for revocations before the device is looked up once more, and before the upgrade: a revoke between
+    // the sign-in check and here is seen by the lookup, one after it by the receiver, so none is missed.
+    let revocations = state.live.revocations();
+    if !state.meta.device_active(auth.device).await? {
+        return Err(ApiError::unauthorized());
     }
-    let slot = ConnectionSlot { hub: state.clone(), device: auth.device };
     // No frame is over an update and its envelope (snapshots travel through the chunk API).
     Ok(upgrade.max_message_size(MAX_FRAME_BYTES).max_frame_size(MAX_FRAME_BYTES).on_upgrade(move |socket| async move {
         let _slot = slot;
         // Listening before the session reads anything, so no update falls between a read and the notification.
-        let notes = state.live.listen(auth.space);
-        let presence = state.live.listen_presence(auth.space);
-        serve(socket, Session::new(state, &auth), notes, presence).await;
+        let notes = state.live.listen(access.space);
+        let presence = state.live.listen_presence(access.space);
+        // …and to changes of the space's members, before `hello` reads the role: a change before it is read there, one
+        // after it is heard here.
+        // (a personal space's members never change).
+        let members = (!access.personal).then(|| state.notifier.subscribe_members(access.space));
+        let session = Session::in_space(state, &auth, access.space, access.role, access.personal);
+        serve(socket, session, Streams { notes, presence, revocations, members }).await;
     }))
 }
 
 /// Sends one frame, within [`SEND_TIMEOUT`]; false when the connection is done.
-async fn send(socket: &mut WebSocket, frame: &ServerFrame) -> bool {
+async fn send<S: Sink<Message> + Unpin>(socket: &mut S, frame: &ServerFrame) -> bool {
     let bytes = match frame.encode() {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -787,10 +1235,10 @@ async fn send(socket: &mut WebSocket, frame: &ServerFrame) -> bool {
             return false;
         }
     };
-    matches!(tokio::time::timeout(SEND_TIMEOUT, socket.send(Message::Binary(bytes.into()))).await, Ok(Ok(())))
+    matches!(tokio::time::timeout(SEND_TIMEOUT, SinkExt::send(socket, Message::Binary(bytes.into()))).await, Ok(Ok(())))
 }
 
-async fn send_all(socket: &mut WebSocket, frames: &[ServerFrame]) -> bool {
+async fn send_all<S: Sink<Message> + Unpin>(socket: &mut S, frames: &[ServerFrame]) -> bool {
     for frame in frames {
         if !send(socket, frame).await {
             return false;
@@ -799,16 +1247,137 @@ async fn send_all(socket: &mut WebSocket, frames: &[ServerFrame]) -> bool {
     true
 }
 
+/// How the sending of a page ended ([`send_page`]).
+#[derive(Debug, PartialEq)]
+enum Sent {
+    /// Every frame went out.
+    All,
+    /// The connection is done: a frame was not taken in time, or the page took too long, or the server is stopping.
+    Broken,
+    /// The connection ends with this frame: the account's access (or the device) is gone, or could not be confirmed.
+    Ended(ServerFrame),
+}
+
+/// What can end a connection while a page is being sent, besides the socket.
+struct Interrupts<'a> {
+    members: &'a mut Option<watch::Receiver<u64>>,
+    revocations: &'a mut broadcast::Receiver<DeviceId>,
+    debounce: &'a mut Debounce,
+    stopping: &'a mut watch::Receiver<bool>,
+}
+
+/// Sends the frames of one catch-up page. A reader that does not read must not hold a revoked connection: each frame
+/// is sent while the connection also listens to the changes of the space's members (looked at at once, as in the loop),
+/// to the revocation of its device and to shutdown; the account's access is read again between frames once
+/// [`Limits::live_recheck`] has passed; and the whole page must be out within [`Limits::live_page_send`].
+async fn send_page<S: Sink<Message> + Unpin>(socket: &mut S, session: &mut Session, frames: &[ServerFrame], interrupts: &mut Interrupts<'_>) -> Sent {
+    let deadline = Instant::now() + session.state.limits.live_page_send;
+    for frame in frames {
+        match session.fresh().await {
+            Look::Confirmed => {}
+            Look::Ended(ended) => return Sent::Ended(ended),
+            // A page cannot be paused: what was read of the log counts as sent, so the agent connects again.
+            Look::Unconfirmed => return Sent::Ended(Session::unconfirmed_frame()),
+        }
+        let Interrupts { members, revocations, debounce, stopping } = &mut *interrupts;
+        let mut sending = std::pin::pin!(send(socket, frame));
+        loop {
+            tokio::select! {
+                biased;
+                () = async { drop(stopping.wait_for(|stop| *stop).await) } => return Sent::Broken,
+                () = tokio::time::sleep_until(deadline) => return Sent::Broken,
+                changed = async { match members.as_mut() { Some(members) => members.changed().await, None => std::future::pending().await } } => {
+                    if changed.is_err() {
+                        return Sent::Broken;
+                    }
+                    debounce.note(Instant::now());
+                }
+                () = async { match debounce.due() { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => {
+                    debounce.ran(Instant::now());
+                    if let Look::Ended(ended) = session.signalled().await {
+                        return Sent::Ended(ended);
+                    }
+                }
+                heard = revocations.recv() => {
+                    if let Some(ended) = session.revoked(heard).await {
+                        return Sent::Ended(ended);
+                    }
+                }
+                sent = &mut sending => {
+                    if !sent {
+                        return Sent::Broken;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    Sent::All
+}
+
+/// What a connection listens to besides its agent.
+struct Streams {
+    /// Documents of the space that got an update.
+    notes: broadcast::Receiver<DocId>,
+    /// Presence messages of the space.
+    presence: broadcast::Receiver<PresenceNote>,
+    /// Devices revoked through the API.
+    revocations: broadcast::Receiver<DeviceId>,
+    /// Changes of the space's members, roles and life cycle (none for a personal space): the account's access is read
+    /// again at once, and then at most once a second however many changes come (a device signed out meanwhile, as when an
+    /// account is disabled, is reported as that first).
+    members: Option<watch::Receiver<u64>>,
+}
+
+/// Coalesces the changes of a space's members: the first is looked at at once, the ones that follow within
+/// [`MEMBERS_COALESCE`] of a look are looked at together when that time is over.
+#[derive(Debug, Default)]
+struct Debounce {
+    last: Option<Instant>,
+    pending: Option<Instant>,
+}
+
+impl Debounce {
+    /// A change was heard at `now`.
+    fn note(&mut self, now: Instant) {
+        if self.pending.is_none() {
+            self.pending = Some(self.last.map_or(now, |last| now.max(last + MEMBERS_COALESCE)));
+        }
+    }
+
+    /// When the look that is due should happen, if one is.
+    fn due(&self) -> Option<Instant> {
+        self.pending
+    }
+
+    /// The look happened at `now`.
+    fn ran(&mut self, now: Instant) {
+        self.last = Some(now);
+        self.pending = None;
+    }
+}
+
+/// Whether `frame` ends a connection because the account's access changed.
+fn is_access_changed(frame: &ServerFrame) -> bool {
+    matches!(frame, ServerFrame::Error { code, .. } if code == ACCESS_CHANGED)
+}
+
 /// The connection loop: frames in, frames out, the log pumped while a document has news, pings, and an end on
-/// shutdown, silence or a broken connection.
-async fn serve(mut socket: WebSocket, mut session: Session, mut notes: broadcast::Receiver<DocId>, mut presence: broadcast::Receiver<PresenceNote>) {
+/// shutdown, silence, a broken connection or a change of the account's access.
+async fn serve(mut socket: WebSocket, mut session: Session, streams: Streams) {
+    let Streams { mut notes, mut presence, mut revocations, mut members } = streams;
+    let mut debounce = Debounce::default();
     let mut stopping = session.state.notifier.shutdown_signal();
-    let mut revocations = session.state.live.revocations();
     let mut last_heard = Instant::now();
-    let mut ping = tokio::time::interval_at(Instant::now() + PING_EVERY, PING_EVERY);
+    // Set when the connection ends because the account's access changed: the close frame says so.
+    let mut access_changed = false;
+    let ping_every = session.state.limits.live_ping;
+    let mut ping = tokio::time::interval_at(Instant::now() + ping_every, ping_every);
     let hello_by = Instant::now() + HELLO_TIMEOUT;
     loop {
         let quiet_until = if session.welcomed { last_heard + IDLE_TIMEOUT } else { hello_by };
+        // When a look that failed is made again (the account's access could not be read).
+        let retry_at = session.retry_at();
         tokio::select! {
             biased;
             () = async { drop(stopping.wait_for(|stop| *stop).await) } => break,
@@ -824,7 +1393,30 @@ async fn serve(mut socket: WebSocket, mut session: Session, mut notes: broadcast
                     Ok(frame) => session.handle(frame).await,
                     Err(e) => Reply { frames: vec![ServerFrame::error(codes::INVALID, e.to_string(), None, None)], close: true },
                 };
+                access_changed |= reply.frames.iter().any(is_access_changed);
                 if !send_all(&mut socket, &reply.frames).await || reply.close {
+                    break;
+                }
+            }
+            changed = async { match members.as_mut() { Some(members) => members.changed().await, None => std::future::pending().await } } => {
+                // The sender lives as long as the server; if it is gone the server is stopping.
+                if changed.is_err() {
+                    break;
+                }
+                debounce.note(Instant::now());
+            }
+            () = async { match debounce.due() { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => {
+                debounce.ran(Instant::now());
+                if let Look::Ended(frame) = session.signalled().await {
+                    access_changed |= is_access_changed(&frame);
+                    let _ = send(&mut socket, &frame).await;
+                    break;
+                }
+            }
+            () = async { match retry_at { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => {
+                if let Look::Ended(frame) = session.fresh().await {
+                    access_changed |= is_access_changed(&frame);
+                    let _ = send(&mut socket, &frame).await;
                     break;
                 }
             }
@@ -836,30 +1428,39 @@ async fn serve(mut socket: WebSocket, mut session: Session, mut notes: broadcast
             },
             note = presence.recv() => match note {
                 Ok(note) => {
-                    if let Some(frame) = session.relay(&note)
-                        && !send(&mut socket, &frame).await
-                    {
-                        break;
+                    if let Some(frame) = session.relay(&note) {
+                        // Not to an account whose access was taken away elsewhere meanwhile, nor while it cannot be
+                        // confirmed (presence is ephemeral: the next message says where the cursor is).
+                        match session.fresh().await {
+                            Look::Ended(ended) => {
+                                access_changed |= is_access_changed(&ended);
+                                let _ = send(&mut socket, &ended).await;
+                                break;
+                            }
+                            Look::Unconfirmed => {}
+                            Look::Confirmed => {
+                                if !send(&mut socket, &frame).await {
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
                 // Presence that fell behind is dropped: the next one says where the cursor is.
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => break,
             },
-            revoked = revocations.recv() => {
-                let ours = match revoked {
-                    Ok(device) => device == session.device,
-                    // Missed some: look the device up.
-                    Err(broadcast::error::RecvError::Lagged(_)) => !session.state.meta.device_active(session.device).await.unwrap_or(true),
-                    Err(broadcast::error::RecvError::Closed) => false,
-                };
-                if ours {
-                    let _ = send(&mut socket, &ServerFrame::error(codes::UNAUTHORIZED, "this device was signed out", None, None)).await;
+            heard = revocations.recv() => {
+                // Missed some: the device and the access are read.
+                if let Some(frame) = session.revoked(heard).await {
+                    access_changed |= is_access_changed(&frame);
+                    let _ = send(&mut socket, &frame).await;
                     break;
                 }
             }
             _ = ping.tick() => {
                 if let Some(frame) = session.check().await {
+                    access_changed |= is_access_changed(&frame);
                     let _ = send(&mut socket, &frame).await;
                     break;
                 }
@@ -869,20 +1470,40 @@ async fn serve(mut socket: WebSocket, mut session: Session, mut notes: broadcast
             }
             () = tokio::time::sleep_until(quiet_until) => break,
             // Lowest priority: send what a subscribed document's log holds that the agent lacks, a page at a time.
-            () = std::future::ready(()), if session.has_work() => match session.pump().await {
-                Ok(frames) => {
-                    if !send_all(&mut socket, &frames).await {
+            () = std::future::ready(()), if session.has_work() && !session.blocked() => {
+                // Not to an account whose access was taken away elsewhere meanwhile, nor while it cannot be confirmed.
+                match session.fresh().await {
+                    Look::Ended(ended) => {
+                        access_changed |= is_access_changed(&ended);
+                        let _ = send(&mut socket, &ended).await;
+                        break;
+                    }
+                    Look::Unconfirmed => continue,
+                    Look::Confirmed => {}
+                }
+                match session.pump().await {
+                    Ok(frames) => {
+                        let mut interrupts = Interrupts { members: &mut members, revocations: &mut revocations, debounce: &mut debounce, stopping: &mut stopping };
+                        match send_page(&mut socket, &mut session, &frames, &mut interrupts).await {
+                            Sent::All => {}
+                            Sent::Broken => break,
+                            Sent::Ended(ended) => {
+                                access_changed |= is_access_changed(&ended);
+                                let _ = send(&mut socket, &ended).await;
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = send(&mut socket, &ServerFrame::error(e.code, e.message, None, None)).await;
                         break;
                     }
                 }
-                Err(e) => {
-                    let _ = send(&mut socket, &ServerFrame::error(e.code, e.message, None, None)).await;
-                    break;
-                }
-            },
+            }
         }
     }
-    let _ = socket.send(Message::Close(None)).await;
+    let close = access_changed.then(|| CloseFrame { code: ACCESS_CHANGED_CLOSE, reason: ACCESS_CHANGED.into() });
+    let _ = tokio::time::timeout(SEND_TIMEOUT, socket.send(Message::Close(close))).await;
 }
 
 #[cfg(test)]
@@ -892,6 +1513,16 @@ mod tests {
     use craft_cloud_proto::live::{AppName, recents_doc};
     use craft_cloud_store::Store;
     use craft_cloud_store::memory::MemoryBackend;
+
+    /// The server answers a `hello` with the highest protocol both speak, up to 3.
+    #[test]
+    fn the_server_answers_the_highest_shared_protocol() {
+        assert_eq!(shared_version(1, 1), Some(1));
+        assert_eq!(shared_version(1, 2), Some(2), "an agent of protocol 2 gets the old frames");
+        assert_eq!(shared_version(1, 3), Some(LIVE_SPACES_PROTOCOL));
+        assert_eq!(shared_version(3, 3), Some(3));
+        assert_eq!(shared_version(4, 9), None);
+    }
 
     /// A session of a fresh account's device, past `hello`, with its recents document for `wordcraft` made.
     async fn session(limits: crate::state::Limits) -> (Session, DocId, Meta, DeviceAuth) {
@@ -1062,6 +1693,107 @@ mod tests {
         }
         let Some(ServerFrame::Error { code, .. }) = s.check().await else { panic!("the reset went unseen") };
         assert_eq!(code, "resync_required");
+    }
+
+    // ---- a role per write, coalesced looks, subscription limits (protocol 3) ----
+
+    use craft_cloud_meta::SpaceActor;
+    use craft_cloud_proto::SpaceName;
+
+    /// A team space of `owner` with `member` an editor, and a session of the member's device on it, past `hello` 3, that
+    /// still believes it is an editor.
+    async fn team_session(owner: &Account, member: &mut Account) -> (SpaceId, Session) {
+        let space = owner.meta.create_team_space(&SpaceActor::Cli, &SpaceName::new("Studio").unwrap(), owner.user.id, None, 0).await.unwrap();
+        owner.meta.invite_member(&SpaceActor::Cli, space, member.user.id, SpaceRole::Editor, 0).await.unwrap();
+        let token = [member.next_token; 32];
+        member.next_token += 1;
+        member.meta.create_device(member.user.id, "pc", &token, 0).await.unwrap();
+        let auth = member.meta.device_by_token(&token).await.unwrap().unwrap();
+        let mut session = Session::in_space(member.state.clone(), &auth, space, SpaceRole::Editor, false);
+        let reply = session.handle(ClientFrame::Hello { min: 1, max: 3 }).await;
+        assert!(matches!(reply.frames.as_slice(), [ServerFrame::WelcomeSpace { role: SpaceRole::Editor, .. }]), "{:?}", reply.frames);
+        let doc = recents_doc(space, &AppName::new("wordcraft").unwrap());
+        let reply = session.handle(ClientFrame::Create { doc, kind: DocKind::Recents { app: AppName::new("wordcraft").unwrap() } }).await;
+        assert!(matches!(reply.frames.as_slice(), [ServerFrame::Created { .. }]), "{:?}", reply.frames);
+        let reply = session.handle(ClientFrame::Subscribe { doc, after: 0, at: None }).await;
+        assert!(reply.frames.is_empty());
+        (space, session)
+    }
+
+    /// The frame's role check and the write are two steps. A role lowered, a member removed or a space archived between
+    /// them (here: after the check, by calling the write itself, which is what runs after it) must not store or announce
+    /// anything: the write is guarded in its own transaction.
+    #[tokio::test]
+    async fn a_live_write_is_refused_in_its_transaction_when_the_role_went_between_the_check_and_the_commit() {
+        for change in ["lowered", "removed", "archived"] {
+            let owner = Account::new(Default::default()).await;
+            let mut member = Account::with_meta(Default::default(), owner.meta.clone(), "bo").await;
+            let (space, mut session) = team_session(&owner, &mut member).await;
+            let doc = recents_doc(space, &AppName::new("wordcraft").unwrap());
+            let mut woken = member.state.live.listen(space);
+            match change {
+                "lowered" => {
+                    owner.meta.change_member_role(&SpaceActor::Cli, space, member.user.id, SpaceRole::Viewer, 1).await.unwrap();
+                }
+                "removed" => owner.meta.remove_member(&SpaceActor::Cli, space, member.user.id, 1).await.unwrap(),
+                _ => {
+                    owner.meta.set_space_archived(&SpaceActor::Cli, space, true, 1).await.unwrap();
+                }
+            }
+            // The session still believes it is an editor; the write is what notices.
+            let refused = session.update(doc, 1, b"too late".to_vec()).await.unwrap_err();
+            let want = if change == "removed" { ACCESS_CHANGED } else { codes::READ_ONLY };
+            assert_eq!(refused.code, want, "{change}");
+            assert!(session.lost == (change == "removed"), "{change}");
+            assert!(woken.try_recv().is_err(), "{change}: nothing is announced to the space");
+            assert_eq!(owner.meta.live_doc(space, doc).await.unwrap().unwrap().head, 0, "{change}: nothing is stored");
+            // The same for a `create` of a document and an answer to a `compact`.
+            let created = session.create(doc, DocKind::Recents { app: AppName::new("wordcraft").unwrap() }).await;
+            assert!(matches!(&created, ServerFrame::Error { code, .. } if code == want), "{change}: {created:?}");
+        }
+    }
+
+    #[test]
+    fn member_changes_are_looked_at_at_once_then_at_most_once_a_second() {
+        let t0 = Instant::now();
+        let mut d = Debounce::default();
+        assert_eq!(d.due(), None);
+        d.note(t0);
+        assert_eq!(d.due(), Some(t0), "the first change: at once");
+        d.ran(t0);
+        assert_eq!(d.due(), None);
+        // A burst right after: one look, a second after the last.
+        for ms in [10, 20, 500] {
+            d.note(t0 + Duration::from_millis(ms));
+        }
+        assert_eq!(d.due(), Some(t0 + MEMBERS_COALESCE));
+        d.ran(t0 + MEMBERS_COALESCE);
+        // A change long after the last look is at once again.
+        let later = t0 + Duration::from_secs(10);
+        d.note(later);
+        assert_eq!(d.due(), Some(later));
+    }
+
+    #[test]
+    fn subscriptions_are_limited_per_space_and_in_all() {
+        let hub = LiveHub::default();
+        let device = DeviceId::generate();
+        let spaces: Vec<SpaceId> = (0..5).map(|_| SpaceId::generate()).collect();
+        for _ in 0..MAX_SUBSCRIPTIONS_PER_SPACE {
+            assert!(hub.take_subscription(device, spaces[0]));
+        }
+        assert!(!hub.take_subscription(device, spaces[0]), "256 in one space");
+        // Another space has its own 256, up to 1024 in all.
+        for space in &spaces[1..4] {
+            for _ in 0..MAX_SUBSCRIPTIONS_PER_SPACE {
+                assert!(hub.take_subscription(device, *space));
+            }
+        }
+        assert!(!hub.take_subscription(device, spaces[4]), "1024 in all");
+        hub.release_subscriptions(device, spaces[0], 1);
+        assert!(hub.take_subscription(device, spaces[0]), "a freed place can be taken again");
+        // Another device is not counted.
+        assert!(hub.take_subscription(DeviceId::generate(), spaces[4]));
     }
 
     // ---- documents of files, snapshots, compaction and presence (protocol 2) ----
@@ -1563,5 +2295,337 @@ mod tests {
             vec![ServerFrame::Subscribed { doc, head: 0 }],
             "no snapshot, no log: every machine pushes its own"
         );
+    }
+
+    // ---- lookups that fail, a revocation behind a slow reader, a snapshot that loses the race ----
+
+    /// A database file with a second connection to it: a table renamed away makes every look that reads it fail (the
+    /// database "cannot be read"), and renamed back it works again.
+    struct Breakable {
+        _dir: tempfile::TempDir,
+        conn: sqlx::SqliteConnection,
+        meta: Meta,
+    }
+
+    impl Breakable {
+        async fn new() -> Self {
+            use sqlx::Connection;
+            let dir = tempfile::tempdir().unwrap();
+            let url = format!("sqlite:{}?mode=rwc", dir.path().join("meta.db").display());
+            let meta = Meta::open(&url).await.unwrap();
+            let conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+            Self { _dir: dir, conn, meta }
+        }
+
+        async fn rename(&mut self, from: &str, to: &str) {
+            sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE {from} RENAME TO {to}"))).execute(&mut self.conn).await.unwrap();
+        }
+
+        async fn break_table(&mut self, table: &str) {
+            self.rename(table, &format!("{table}_away")).await;
+        }
+
+        async fn mend_table(&mut self, table: &str) {
+            self.rename(&format!("{table}_away"), table).await;
+        }
+    }
+
+    /// Limits of the tests of failed looks: trusted for 30 ms, a failed look repeated every 40 ms.
+    fn quick_looks() -> crate::state::Limits {
+        crate::state::Limits { live_recheck: Duration::from_millis(30), live_retry: Duration::from_millis(40), ..Default::default() }
+    }
+
+    /// A team space on a database that can be broken, its owner's and its member's accounts, and the member's session.
+    async fn breakable_team(limits: crate::state::Limits) -> (Breakable, Account, Account, SpaceId, Session) {
+        let db = Breakable::new().await;
+        let owner = Account::with_meta(limits.clone(), db.meta.clone(), "ana").await;
+        let mut member = Account::with_meta(limits, db.meta.clone(), "bo").await;
+        let (space, session) = team_session(&owner, &mut member).await;
+        (db, owner, member, space, session)
+    }
+
+    /// A look at the account that fails (the database cannot be read) is not "nothing changed": it renews nothing, the
+    /// connection relays nothing and accepts no presence while it lasts, and one that keeps failing ends with a server
+    /// error after three looks (not `access_changed`). A look that works again lifts it.
+    #[tokio::test]
+    async fn a_failed_look_never_confirms_and_a_connection_that_keeps_failing_ends() {
+        let (mut db, _owner, member, space, mut session) = breakable_team(quick_looks()).await;
+        let doc = recents_doc(space, &app());
+        let mut heard = member.state.live.listen_presence(space);
+        // Control: while its last look is recent, presence is relayed.
+        session.handle(ClientFrame::Presence { doc, bytes: vec![1] }).await;
+        assert!(heard.try_recv().is_ok(), "presence of a connection that is trusted is relayed");
+        db.break_table("space_members").await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let confirmed_at = session.verified;
+        // Past its time, the account's access cannot be read: presence is dropped, and nothing is renewed.
+        assert!(session.handle(ClientFrame::Presence { doc, bytes: vec![2] }).await.frames.is_empty());
+        assert!(heard.try_recv().is_err(), "presence of a connection that cannot be confirmed isn't relayed");
+        assert_eq!(session.verified, confirmed_at, "a failed look doesn't renew the time of the last one");
+        assert!(session.blocked(), "nothing is pumped to it");
+        assert!(session.retry_at().is_some());
+        assert_eq!(session.fresh().await, Look::Unconfirmed, "no new look within the retry time");
+        // Two more looks, each after the retry time: the third failure ends the connection.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(session.fresh().await, Look::Unconfirmed, "the second failure");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let Look::Ended(ServerFrame::Error { code, .. }) = session.fresh().await else { panic!("the connection goes on") };
+        assert_eq!(code, codes::INTERNAL, "a server error, not access_changed");
+        assert!(!session.lost);
+    }
+
+    /// …and a database that can be read again within that time lifts it: the connection is trusted again, and nothing
+    /// ends.
+    #[tokio::test]
+    async fn a_look_that_works_again_lifts_an_unconfirmed_connection() {
+        let (mut db, _owner, member, space, mut session) = breakable_team(quick_looks()).await;
+        let doc = recents_doc(space, &app());
+        let mut heard = member.state.live.listen_presence(space);
+        db.break_table("space_members").await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(session.fresh().await, Look::Unconfirmed);
+        db.mend_table("space_members").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(session.fresh().await, Look::Confirmed);
+        assert!(!session.blocked() && session.retry_at().is_none());
+        session.handle(ClientFrame::Presence { doc, bytes: vec![3] }).await;
+        assert!(heard.try_recv().is_ok(), "relayed again");
+    }
+
+    /// A device that cannot be looked up is not taken as active either: a write is refused with `internal` (and stores
+    /// nothing), and the connection's own look is unconfirmed.
+    #[tokio::test]
+    async fn a_failed_device_lookup_never_confirms_the_device() {
+        let (mut db, owner, _member, space, mut session) = breakable_team(quick_looks()).await;
+        let doc = recents_doc(space, &app());
+        db.break_table("devices").await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let reply = session.handle(ClientFrame::Update { doc, client_seq: 1, bytes: b"x".to_vec() }).await;
+        let [ServerFrame::Error { code, client_seq: Some(1), .. }] = reply.frames.as_slice() else { panic!("{:?}", reply.frames) };
+        assert_eq!(code, codes::INTERNAL);
+        assert!(!reply.close, "the first failure ends nothing");
+        db.mend_table("devices").await;
+        assert_eq!(owner.meta.live_doc(space, doc).await.unwrap().unwrap().head, 0, "nothing was stored");
+        db.break_table("devices").await;
+        assert_eq!(session.fresh().await, Look::Unconfirmed, "the device lookup fails too");
+    }
+
+    /// Limits for the tests of a slow reader: a long trust in the last look (only a signal, or the time given, finds a
+    /// change), pages of at most `page` in all.
+    fn slow_reader(recheck: Duration, page: Duration) -> crate::state::Limits {
+        crate::state::Limits { live_recheck: recheck, live_page_send: page, ..Default::default() }
+    }
+
+    /// A sink that takes each message after `delay` and counts it.
+    fn slow_sink(delay: Duration, taken: Arc<std::sync::atomic::AtomicUsize>) -> impl Sink<Message, Error = std::convert::Infallible> + Unpin {
+        Box::pin(futures_util::sink::unfold((), move |(), _message: Message| {
+            let taken = taken.clone();
+            async move {
+                tokio::time::sleep(delay).await;
+                taken.fetch_add(1, Ordering::Relaxed);
+                Ok::<(), std::convert::Infallible>(())
+            }
+        }))
+    }
+
+    fn page_of(doc: DocId, n: u64) -> Vec<ServerFrame> {
+        (1..=n).map(|seq| ServerFrame::Update { doc, seq, bytes: vec![1], device: DeviceId::generate() }).collect()
+    }
+
+    /// Sends a page of 100 frames to a reader that takes 20 ms for each, after `change` ran 100 ms in.
+    async fn page_to_slow_reader<F, Fut>(limits: crate::state::Limits, change: F) -> (Sent, usize, Duration)
+    where
+        F: FnOnce(Account, Account, SpaceId, DeviceId) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (_db, owner, member, space, mut session) = breakable_team(limits).await;
+        let doc = recents_doc(space, &app());
+        let (mut members, mut revocations, mut debounce, mut stopping) = (
+            Some(member.state.notifier.subscribe_members(space)),
+            member.state.live.revocations(),
+            Debounce::default(),
+            member.state.notifier.shutdown_signal(),
+        );
+        let device = session.device;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            change(owner, member, space, device).await;
+        });
+        let taken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut sink = slow_sink(Duration::from_millis(20), taken.clone());
+        let mut interrupts = Interrupts { members: &mut members, revocations: &mut revocations, debounce: &mut debounce, stopping: &mut stopping };
+        let started = Instant::now();
+        let sent = tokio::time::timeout(Duration::from_secs(20), send_page(&mut sink, &mut session, &page_of(doc, 100), &mut interrupts))
+            .await
+            .expect("the page was never given up");
+        (sent, taken.load(Ordering::Relaxed), started.elapsed())
+    }
+
+    fn access_changed_frame(sent: &Sent) -> bool {
+        matches!(sent, Sent::Ended(frame) if is_access_changed(frame))
+    }
+
+    /// A member removed while a page goes to a slow reader: the signal of the space's members ends the connection in the
+    /// middle of the page, far from its end (100 frames at 20 ms each are two seconds).
+    #[tokio::test]
+    async fn a_removal_signalled_in_this_process_interrupts_a_page_to_a_slow_reader() {
+        let (sent, taken, took) =
+            page_to_slow_reader(slow_reader(Duration::from_secs(3600), Duration::from_secs(60)), |owner, member, space, _| async move {
+                let user = member.user.id;
+                owner.meta.remove_member(&SpaceActor::Cli, space, user, 1).await.unwrap();
+                member.state.notifier.members_changed(space);
+            })
+            .await;
+        assert!(access_changed_frame(&sent), "{sent:?}");
+        assert!(taken < 30 && took < Duration::from_millis(1500), "{taken} frames in {took:?}");
+    }
+
+    /// A removal that no signal announces (another process): once the time of the last look has passed, the access is read
+    /// between the frames of the page, and the rest of the page isn't sent.
+    #[tokio::test]
+    async fn a_removal_made_elsewhere_is_found_between_the_frames_of_a_page() {
+        let (sent, taken, took) =
+            page_to_slow_reader(slow_reader(Duration::from_millis(40), Duration::from_secs(60)), |owner, member, space, _| async move {
+                let user = member.user.id;
+                owner.meta.remove_member(&SpaceActor::Cli, space, user, 1).await.unwrap();
+            })
+            .await;
+        assert!(access_changed_frame(&sent), "{sent:?}");
+        assert!(taken < 30 && took < Duration::from_millis(1500), "{taken} frames in {took:?}");
+    }
+
+    /// A device revoked in this process while a page goes to a slow reader: the page stops.
+    #[tokio::test]
+    async fn a_revoked_device_interrupts_a_page_to_a_slow_reader() {
+        let (sent, taken, took) =
+            page_to_slow_reader(slow_reader(Duration::from_secs(3600), Duration::from_secs(60)), |_, member, _, device| async move {
+                member.state.live.revoke(device);
+            })
+            .await;
+        assert!(matches!(&sent, Sent::Ended(ServerFrame::Error { code, .. }) if code == codes::UNAUTHORIZED), "{sent:?}");
+        assert!(taken < 30 && took < Duration::from_millis(1500), "{taken} frames in {took:?}");
+    }
+
+    /// A reader that takes no frame at all cannot hold a page for longer than the page's own limit (each frame has a minute).
+    #[tokio::test]
+    async fn a_page_is_sent_within_its_own_limit() {
+        let (_db, _owner, member, space, mut session) = breakable_team(slow_reader(Duration::from_secs(3600), Duration::from_millis(150))).await;
+        let doc = recents_doc(space, &app());
+        let (mut members, mut revocations, mut debounce, mut stopping) = (
+            Some(member.state.notifier.subscribe_members(space)),
+            member.state.live.revocations(),
+            Debounce::default(),
+            member.state.notifier.shutdown_signal(),
+        );
+        let mut stuck =
+            Box::pin(futures_util::sink::unfold((), |(), _message: Message| futures_util::future::pending::<Result<(), std::convert::Infallible>>()));
+        let mut interrupts = Interrupts { members: &mut members, revocations: &mut revocations, debounce: &mut debounce, stopping: &mut stopping };
+        let started = Instant::now();
+        let sent = tokio::time::timeout(Duration::from_secs(10), send_page(&mut stuck, &mut session, &page_of(doc, 5), &mut interrupts))
+            .await
+            .expect("the page was never given up");
+        assert_eq!(sent, Sent::Broken);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// An answer to a `compact` from an account whose access went after the frame's check (the race: the guard in the
+    /// transaction finds it) is answered `access_changed` and ends the connection, like any other loss of access, and
+    /// stores nothing.
+    #[tokio::test]
+    async fn a_snapshot_that_loses_the_race_ends_the_connection_with_access_changed() {
+        let owner = Account::new(Default::default()).await;
+        let mut member = Account::with_meta(Default::default(), owner.meta.clone(), "bo").await;
+        let (space, mut session) = team_session(&owner, &mut member).await;
+        let doc = recents_doc(space, &app());
+        session.asked.insert(doc, 4);
+        owner.meta.remove_member(&SpaceActor::Cli, space, member.user.id, 1).await.unwrap();
+        // The frame's own check came first and found the access; this is what runs after it.
+        let answer = session.snapshot(doc, 4, ManifestId::from_bytes([1; 32])).await;
+        let Some(ServerFrame::Error { code, .. }) = answer else { panic!("{answer:?}") };
+        assert_eq!(code, ACCESS_CHANGED);
+        assert!(session.lost, "the connection ends with it");
+        assert_eq!(owner.meta.live_doc(space, doc).await.unwrap().unwrap().base, 0);
+    }
+
+    // ---- the second review: device trust, signals that cannot look, pages while unconfirmed, patience ----
+
+    /// A write that read only the access (the device came from the cache) must not extend the device's trust for relaying:
+    /// a device signed out by another process (no signal) stops receiving `live_recheck` after its last real look at the
+    /// device, not after the write.
+    #[tokio::test]
+    async fn a_write_does_not_extend_the_trust_in_the_device() {
+        let limits = crate::state::Limits { live_recheck: Duration::from_millis(400), ..Default::default() };
+        let (_db, owner, member, space, mut session) = breakable_team(limits).await;
+        let doc = recents_doc(space, &app());
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        owner.meta.revoke_device(member.user.id, session.device).await.unwrap();
+        // The device is still trusted (250 ms of 400): the write is taken, and its look at the access renews that trust.
+        let reply = session.handle(ClientFrame::Update { doc, client_seq: 1, bytes: b"x".to_vec() }).await;
+        assert!(matches!(reply.frames.as_slice(), [ServerFrame::Ack { .. }]), "{:?}", reply.frames);
+        // 500 ms after the device's last real look, 250 ms after the write: nothing may be relayed to a signed-out device.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let Look::Ended(ServerFrame::Error { code, .. }) = session.fresh().await else { panic!("the signed-out device is still trusted") };
+        assert_eq!(code, codes::UNAUTHORIZED);
+    }
+
+    /// A signal (the space's members changed) whose look cannot be made withdraws the trust at once: the connection is
+    /// blocked, relays nothing and accepts no presence, though the time of its last look is far from over.
+    #[tokio::test]
+    async fn a_signalled_look_that_fails_withdraws_the_trust_at_once() {
+        let limits = crate::state::Limits { live_recheck: Duration::from_secs(3600), live_retry: Duration::from_millis(40), ..Default::default() };
+        let (mut db, _owner, member, space, mut session) = breakable_team(limits).await;
+        let doc = recents_doc(space, &app());
+        let mut heard = member.state.live.listen_presence(space);
+        db.break_table("space_members").await;
+        assert!(!session.blocked());
+        assert_eq!(session.signalled().await, Look::Unconfirmed);
+        assert!(session.blocked(), "no more trust for an hour");
+        session.handle(ClientFrame::Presence { doc, bytes: vec![1] }).await;
+        assert!(heard.try_recv().is_err(), "no presence accepted");
+        assert_eq!(session.fresh().await, Look::Unconfirmed);
+    }
+
+    /// The patience clause: one failed look is counted per retry time, so a long retry time never reaches three failures,
+    /// but the connection still ends once `live_patience` has passed since the first.
+    #[tokio::test]
+    async fn a_connection_that_cannot_be_confirmed_for_the_patience_time_ends() {
+        let limits = crate::state::Limits {
+            live_recheck: Duration::from_millis(30),
+            live_retry: Duration::from_secs(3600),
+            live_patience: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let (mut db, _owner, _member, _space, mut session) = breakable_team(limits).await;
+        db.break_table("space_members").await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(session.check_identity().await, Look::Unconfirmed, "the first failure");
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let Look::Ended(ServerFrame::Error { code, .. }) = session.check_identity().await else { panic!("still waiting") };
+        assert_eq!(code, codes::INTERNAL);
+    }
+
+    /// A page whose connection stops being trusted while it is sent (the access cannot be read) is not sent on: it ends
+    /// with `internal` after the frames the trust covered, far from the page's end.
+    #[tokio::test]
+    async fn a_page_is_not_sent_on_while_the_access_cannot_be_confirmed() {
+        // A retry time that never comes: only the first failed look can end the page, not a count of failures.
+        let limits = crate::state::Limits { live_recheck: Duration::from_millis(60), live_retry: Duration::from_secs(3600), ..Default::default() };
+        let (mut db, _owner, member, space, mut session) = breakable_team(limits).await;
+        let doc = recents_doc(space, &app());
+        let (mut members, mut revocations, mut debounce, mut stopping) = (
+            Some(member.state.notifier.subscribe_members(space)),
+            member.state.live.revocations(),
+            Debounce::default(),
+            member.state.notifier.shutdown_signal(),
+        );
+        db.break_table("space_members").await;
+        let taken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut sink = slow_sink(Duration::from_millis(20), taken.clone());
+        let mut interrupts = Interrupts { members: &mut members, revocations: &mut revocations, debounce: &mut debounce, stopping: &mut stopping };
+        let sent = tokio::time::timeout(Duration::from_secs(20), send_page(&mut sink, &mut session, &page_of(doc, 100), &mut interrupts))
+            .await
+            .expect("the page was never given up");
+        assert!(matches!(&sent, Sent::Ended(ServerFrame::Error { code, .. }) if code == codes::INTERNAL), "{sent:?}");
+        assert!(taken.load(Ordering::Relaxed) < 50, "{} frames", taken.load(Ordering::Relaxed));
     }
 }

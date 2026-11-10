@@ -32,14 +32,16 @@ impl Limiter {
         Self { windows: Mutex::new(Windows { entries: HashMap::new(), last_sweep: None }), period, capacity }
     }
 
-    /// Counts one attempt for `key`; false once `max` attempts were made in the current window, or when
+    /// Counts one attempt for `key`; false once `max` attempts were counted in the current window, or when
     /// the key is new and the limiter is full.
     pub fn allow(&self, key: &str, max: u32, now: Instant) -> bool {
         self.count(key, max, now).is_some()
     }
 
     /// [`Limiter::allow`] for a caller that may give the attempt back: the window it was counted in, for
-    /// [`Limiter::refund`], or `None` when it is refused.
+    /// [`Limiter::refund`], or `None` when it is refused. A refused attempt is not counted: the count never goes past
+    /// `max`, so refused tries made at the same moment as a counted one cannot make that one's refund (or the window's
+    /// end) leave the key with more counted attempts than were accepted.
     pub fn count(&self, key: &str, max: u32, now: Instant) -> Option<Counted> {
         let mut windows = self.windows.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let sweep_due = windows.last_sweep.is_none_or(|last| now.saturating_duration_since(last) >= self.period);
@@ -55,8 +57,18 @@ impl Limiter {
         if now.saturating_duration_since(entry.0) >= self.period {
             *entry = (now, 0);
         }
-        entry.1 = entry.1.saturating_add(1);
-        (entry.1 <= max).then_some(Counted(entry.0))
+        if entry.1 >= max {
+            return None;
+        }
+        entry.1 += 1;
+        Some(Counted(entry.0))
+    }
+
+    /// How long until `key`'s current window ends (when its count starts again from nothing): what a refused caller is
+    /// told in `Retry-After`. A key that has no window running is `Duration::ZERO`.
+    pub fn retry_after(&self, key: &str, now: Instant) -> Duration {
+        let windows = self.windows.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        windows.entries.get(key).map_or(Duration::ZERO, |(start, _)| (*start + self.period).saturating_duration_since(now))
     }
 
     /// Gives back one attempt [`Limiter::count`] counted for `key`, if the window it was counted in is still the
@@ -145,6 +157,21 @@ mod tests {
 
     /// An attempt counted near the end of a window whose redeem finishes in the next one: its refund would give the
     /// new window one try more than the limit.
+    #[test]
+    fn a_refused_attempt_is_not_counted_so_a_refund_frees_exactly_one_place() {
+        let limiter = Limiter::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        let first = limiter.count("user:a", 2, t0).unwrap();
+        let _second = limiter.count("user:a", 2, t0).unwrap();
+        // Tries made while the key is full are refused, however many there are.
+        for _ in 0..10 {
+            assert!(limiter.count("user:a", 2, t0).is_none());
+        }
+        limiter.refund("user:a", first);
+        assert!(limiter.count("user:a", 2, t0).is_some(), "the refund freed one place");
+        assert!(limiter.count("user:a", 2, t0).is_none(), "and only one");
+    }
+
     #[test]
     fn a_refund_never_crosses_into_a_later_window() {
         let limiter = Limiter::new(Duration::from_secs(60));

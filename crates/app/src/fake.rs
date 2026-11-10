@@ -258,6 +258,7 @@ impl Hub {
                     autostart: None,
                     last_sync_ms: None,
                     removed: false,
+                    spaces: Vec::new(),
                 };
                 respond_json(&mut stream, 200, &status);
             }
@@ -876,7 +877,7 @@ mod tests {
         let stored = a.client().blobs().put(b"blob bytes").unwrap();
         assert_eq!(
             b.client().blobs().get(&stored.hash, stored.len).unwrap_err(),
-            crate::Error::Refused { code: "offline".into(), message: "the server can't be reached to fetch the blob".into() }
+            crate::Error::Refused { code: "offline".into(), message: "the server can't be reached to fetch the blob".into(), name_taken: None }
         );
         b.set_online(true);
         assert_eq!(b.client().blobs().get(&stored.hash, stored.len).unwrap(), b"blob bytes");
