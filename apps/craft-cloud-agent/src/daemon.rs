@@ -47,6 +47,7 @@ use crate::local_api::{Command, Control, LocalApi};
 use crate::lock::Lock;
 use crate::schedule::{Ms, Next, PassEnd, Phase, Recheck, Scheduler, Timing};
 use crate::settle::Stability;
+use crate::spaces::{PassGate, Spaces, SpacesConfig};
 use crate::watch::{FolderWatcher, WatchEvent};
 
 /// The loop's settings. [`RunOptions::default`] is what `craft-cloud-agent run` uses; tests make the times short.
@@ -127,7 +128,7 @@ struct PassDone {
 /// How a pass that ended with `error` is scheduled: a pause for what needs the user (rechecked by itself where that
 /// is safe and may help; see [`Recheck`]), a retry with backoff for the rest. A finished pass that left files still
 /// changing runs again when the disk says the earliest look at them is due (`recheck_in`).
-fn pass_end(result: &Result<PassSummary, AgentError>, recheck_in: Option<Duration>) -> PassEnd {
+pub(crate) fn pass_end(result: &Result<PassSummary, AgentError>, recheck_in: Option<Duration>) -> PassEnd {
     match result {
         // Deletes held behind a link can be approved too, so the loop looks for an approval while any is held (more
         // slowly: nothing else waits for it).
@@ -140,13 +141,17 @@ fn pass_end(result: &Result<PassSummary, AgentError>, recheck_in: Option<Duratio
 /// Which pauses look again by themselves: a folder or marker that is missing (a drive not mounted yet), folders
 /// that lie inside one another, or another agent on the folder can be put right at any moment and checking is
 /// harmless, so every minute; a server that speaks another protocol or refuses requests is fixed by an update, and an
-/// account whose storage on the server is full by the admin allowing more, so every ten minutes; a revoked device,
+/// account whose storage on the server is full by the admin allowing more, a space that turned read-only for the account by an owner raising its role, so every ten minutes; a revoked device,
 /// damaged or newer saved files, another account's state and damaged data from the server never fix themselves, so
 /// the loop waits until it is stopped.
 fn recheck_for(e: &AgentError) -> Recheck {
     match e {
         AgentError::Root(_) | AgentError::DataInFolder { .. } | AgentError::Lock(_) => Recheck::Soon,
-        AgentError::Server(craft_cloud_sync::TransportError::Protocol(_) | craft_cloud_sync::TransportError::QuotaExceeded { .. }) => Recheck::Slowly,
+        AgentError::Server(
+            craft_cloud_sync::TransportError::Protocol(_)
+            | craft_cloud_sync::TransportError::QuotaExceeded { .. }
+            | craft_cloud_sync::TransportError::ReadOnly,
+        ) => Recheck::Slowly,
         _ => Recheck::Never,
     }
 }
@@ -154,7 +159,13 @@ fn recheck_for(e: &AgentError) -> Recheck {
 /// The pass thread: opens the folder when a pass is asked for (again after a stop that needs the user, so a folder
 /// that came back is opened afresh), runs the pass on its own current-thread runtime and reports it. Ends when the
 /// loop drops its end of `requests`, releasing the folder's lock.
-fn pass_thread(data: DataDir, stability: Stability, requests: std::sync::mpsc::Receiver<Vec<NodeId>>, events: mpsc::UnboundedSender<Event>) {
+fn pass_thread(
+    data: DataDir,
+    stability: Stability,
+    gate: PassGate,
+    requests: std::sync::mpsc::Receiver<Vec<NodeId>>,
+    events: mpsc::UnboundedSender<Event>,
+) {
     let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(runtime) => Some(runtime),
         Err(e) => {
@@ -170,6 +181,8 @@ fn pass_thread(data: DataDir, stability: Stability, requests: std::sync::mpsc::R
     let Some(runtime) = runtime else { return };
     let mut session: Option<Session> = None;
     while let Ok(approve) = requests.recv() {
+        // The team spaces' passes and this one take turns.
+        let _turn = gate.hold();
         let result = runtime.block_on(async {
             let open = match session.take() {
                 Some(open) => open,
@@ -760,6 +773,10 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
             record_delay: options.record_delay,
             session_grace: options.session_grace,
             announce_delay: options.announce_delay,
+            team: false,
+            username: account.username.clone(),
+            read_only: false,
+            generation: 0,
         };
         let hub = match Hub::start(hub_config, control.clone(), user_paused) {
             Ok(hub) => Some(hub),
@@ -776,9 +793,11 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
         // The stability window's looks, shared: the disk asks, the loop leaves the watcher's events for waiting files alone.
         let stability = Stability::new(options.timing.stability);
         let (thread_data, thread_stability) = (data.clone(), stability.clone());
+        let gate = PassGate::default();
+        let thread_gate = gate.clone();
         let pass = std::thread::Builder::new()
             .name("craft-cloud-pass".into())
-            .spawn(move || pass_thread(thread_data, thread_stability, requests_rx, pass_events))
+            .spawn(move || pass_thread(thread_data, thread_stability, thread_gate, requests_rx, pass_events))
             .map_err(|source| AgentError::Io { path: data.path().to_owned(), source })?;
         // Where the saved state read the change feed to, once a first sync is done.
         let since = data.load_state().ok().and_then(|saved| saved.state.space.map(|_| saved.state.seq));
@@ -798,6 +817,16 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
             tokio::spawn(long_poll(transport.clone(), since_rx.clone(), tell, options, random))
         };
         let mut poll = (!user_paused).then(&start_poll);
+        // The account's team spaces (a server without them has none): looked for now and then, and synced when turned on.
+        let spaces = Spaces::start(SpacesConfig {
+            data: data.clone(),
+            account: account.clone(),
+            options,
+            control: control.clone(),
+            gate,
+            paused: user_paused,
+        });
+        control.set_spaces_handle(Some(spaces.handle()));
 
         let mut scheduler = Scheduler::new(options.timing, status.now(), random);
         let mut watching = Watching::default();
@@ -988,13 +1017,14 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                             break End::Exit(Exit::Failed);
                         }
                         say(out, "stopping after the running pass (press Ctrl-C again to stop at once)");
+                        spaces.handle().quiesce();
                         scheduler.stop();
                         watching.watcher = None;
                     }
                     None => stop_open = false,
                 },
                 command = commands.recv(), if commands_open => match command {
-                    Some(Command::Login(_, reply) | Command::Join(_, reply)) => {
+                    Some(Command::Login(_, reply) | Command::Join(_, reply) | Command::LoginSecondFactor(_, reply)) => {
                         let _ = reply.send(Err(crate::cli::already_signed_in(&account)));
                     }
                     // Signed out on the server first (an unreachable server changes nothing, and syncing goes on); then
@@ -1015,6 +1045,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                                 poll.abort();
                             }
                             watching.watcher = None;
+                            spaces.handle().set_paused(true);
                             if let Some(hub) = &hub {
                                 // Bounded: a hub that doesn't answer never holds up the loop (its stop, quit, beats).
                                 let _ = tokio::time::timeout(HUB_ANSWER, hub.handle().set_paused(true)).await;
@@ -1039,6 +1070,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                                 remember_paused(data, false, out);
                             }
                             poll = Some(start_poll());
+                            spaces.handle().set_paused(false);
                             if let Some(hub) = &hub {
                                 let _ = tokio::time::timeout(HUB_ANSWER, hub.handle().set_paused(false)).await;
                             }
@@ -1051,6 +1083,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                     }
                     Some(Command::Quit(reply)) => {
                         say(out, "quitting after the running pass");
+                        spaces.handle().quiesce();
                         scheduler.stop();
                         watching.watcher = None;
                         let _ = reply.send(Ok(()));
@@ -1071,6 +1104,32 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
         }
         drop(watching);
         drop(requests);
+        // The team spaces stop with the account: a running pass finishes, then their folders are let go of (after a second
+        // stop at once: nothing queued starts, and the pass thread is not waited for, as the personal one is not). Only the
+        // second stop asks for that; a loop that ends because its pass thread is gone also exits with `Failed`.
+        control.set_spaces_handle(None);
+        // A first stop waits here for a team pass that is under way, which can take as long as the server does not answer;
+        // signals are read meanwhile, and a second one ends the wait.
+        let spaces_handle = spaces.handle();
+        let stopping_spaces = spaces.stop(stops > 1);
+        tokio::pin!(stopping_spaces);
+        loop {
+            tokio::select! {
+                () = &mut stopping_spaces => break,
+                signal = stop.recv(), if stop_open => match signal {
+                    Some(()) => {
+                        stops += 1;
+                        if stops == 2 {
+                            say(out, "stopping at once");
+                            spaces_handle.stop_now();
+                        }
+                    }
+                    None => stop_open = false,
+                },
+            }
+        }
+        control.set_team_hubs(Vec::new());
+        control.set_spaces(Vec::new(), Vec::new());
         // Recents stop with the account: their followers are told, and what they were given is on disk.
         control.set_hub(None);
         drop(hub);
@@ -1178,7 +1237,7 @@ async fn wait_needing_you(
                         let _ = reply.send(Err(e));
                     }
                 },
-                Some(Command::Login(_, reply) | Command::Join(_, reply) | Command::Pause(reply) | Command::Resume(reply)) => {
+                Some(Command::Login(_, reply) | Command::Join(_, reply) | Command::LoginSecondFactor(_, reply) | Command::Pause(reply) | Command::Resume(reply)) => {
                     let _ = reply.send(Err(AgentError::NeedsYou(reason.to_owned())));
                 }
                 Some(Command::Quit(reply)) => {
@@ -1227,6 +1286,20 @@ async fn wait_for_sign_in(
                         return SignedOut::SignedIn;
                     }
                 }
+                Some(Command::LoginSecondFactor(request, reply)) => {
+                    let args = LoginArgs {
+                        url: request.server.clone(),
+                        user: request.user.clone(),
+                        folder: request.folder.as_ref().map(std::path::PathBuf::from),
+                        device_name: request.device_name.clone(),
+                        adopt: request.adopt,
+                    };
+                    let factor = crate::http::Factor { totp_code: request.totp_code.clone(), recovery_code: request.recovery_code.clone() };
+                    let result = crate::cli::login_second_factor_locked(data, &args, &request.challenge, &factor).await;
+                    if signed_in(result, "signed in", control, reply, out) {
+                        return SignedOut::SignedIn;
+                    }
+                }
                 Some(Command::Join(request, reply)) => {
                     let args = JoinArgs {
                         join: request.join.clone(),
@@ -1236,7 +1309,9 @@ async fn wait_for_sign_in(
                         // The caller asks for it with `POST /v1/autostart` once joined.
                         autostart: false,
                     };
-                    let result = crate::cli::join_locked(data, &args, request.password.as_deref()).await;
+                    let factor = (request.totp_code.is_some() || request.recovery_code.is_some())
+                        .then(|| crate::http::Factor { totp_code: request.totp_code.clone(), recovery_code: request.recovery_code.clone() });
+                    let result = crate::cli::join_locked(data, &args, request.password.as_deref(), factor.as_ref()).await;
                     if signed_in(result, "joined", control, reply, out) {
                         return SignedOut::SignedIn;
                     }
@@ -1284,7 +1359,7 @@ fn signed_in(
 /// Whether a watcher event runs a pass: it does unless every path in it is a file waiting to settle (an event without
 /// paths may be anything). Each waiting file's event is recorded, so its cheap look follows once it goes quiet (see
 /// [`crate::settle::Settling::event`]).
-fn counts_as_change(roots: &[std::path::PathBuf], stability: &Stability, paths: &[std::path::PathBuf], closed: bool) -> bool {
+pub(crate) fn counts_as_change(roots: &[std::path::PathBuf], stability: &Stability, paths: &[std::path::PathBuf], closed: bool) -> bool {
     let mut change = paths.is_empty();
     for p in paths {
         let waiting = crate::watch::relative(roots, p).is_some_and(|r| stability.event(&r, closed));
@@ -1295,7 +1370,7 @@ fn counts_as_change(roots: &[std::path::PathBuf], stability: &Stability, paths: 
 
 /// The cheap looks that are due (one stat each, see [`crate::settle::Settling::peeked`]): whether one found a file
 /// settled (or gone), so a pass should run.
-fn take_due_peeks(folder: &std::path::Path, stability: &Stability) -> bool {
+pub(crate) fn take_due_peeks(folder: &std::path::Path, stability: &Stability) -> bool {
     let wall = now_ms();
     let mut settled = false;
     for path in stability.take_peeks() {
@@ -1325,6 +1400,7 @@ fn summary_to_show(summary: &PassSummary, last_held: &mut Option<String>) -> (Op
 fn summary_worth_showing(s: &PassSummary) -> bool {
     s.downloaded + s.uploaded + s.removed_locally + s.removed_remotely + s.moved_locally + s.moved_remotely + s.created_dirs + s.refused > 0
         || !s.conflict_copies.is_empty()
+        || !s.restored.is_empty()
         || !s.skipped.is_empty()
         || !s.held_deletes.is_empty()
         || s.needs_approval()

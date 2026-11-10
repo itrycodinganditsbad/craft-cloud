@@ -127,3 +127,26 @@ jobs:
 
       - name: Test storage, metadata and the server on every backend
         run: cargo test -p craft-cloud-store -p craft-cloud-meta -p craft-cloud-server --locked
+
+  # The other jobs build with the newest stable Rust, so code or a dependency that needs a newer compiler than the
+  # `rust-version` in Cargo.toml would go unnoticed. Keep the toolchain here equal to that `rust-version`.
+  msrv:
+    name: minimum Rust version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux system dependencies (egui/winit)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@1.95
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check
+        run: cargo check --workspace --all-targets --locked

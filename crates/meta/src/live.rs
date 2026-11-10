@@ -89,6 +89,8 @@ pub const MAX_LIVE_DOCUMENTS_HOLDING_UPDATES: u64 = 10_000;
 /// (they are kept until retention): 1 GiB. Over it, every append is refused with [`MetaError::QuotaExceeded`]
 /// (`quota_exceeded`). The server's `live_bytes_per_user` sets it.
 pub const DEFAULT_LIVE_BYTES_PER_SPACE: u64 = 1024 * 1024 * 1024;
+/// The same cap for a team space: 4 GiB. The server's `[spaces] team_live_bytes` sets it.
+pub const DEFAULT_TEAM_LIVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// What an append did ([`Meta::append_live_update_counted`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +168,7 @@ impl Meta {
         // Insert first: on Postgres, begin_write takes no lock, so a select-then-insert would race another device's
         // create of the same document into a primary-key violation. A conflict does nothing, and the row is read back.
         let mut w = self.begin_write().await?;
+        self.check_guard(&mut w.tx, space).await?;
         let inserted = sqlx::query(
             "INSERT INTO live_docs (space_id, id, kind, node, created_ms, head_seq) VALUES ($1, $2, $3, $4, $5, 0) \
              ON CONFLICT (space_id, id) DO NOTHING",
@@ -245,6 +248,7 @@ impl Meta {
         }
         let (space_key, id_key, node_key) = (uuid_bytes(space.as_uuid()), uuid_bytes(id.as_uuid()), uuid_bytes(node.as_uuid()));
         let mut w = self.begin_write().await?;
+        self.check_guard(&mut w.tx, space).await?;
         let file = sqlx::query("SELECT is_dir, deleted FROM nodes WHERE space_id = $1 AND id = $2")
             .bind(space_key.clone())
             .bind(node_key.clone())
@@ -342,6 +346,7 @@ impl Meta {
     pub async fn compact_live_doc(&self, space: SpaceId, doc: DocId, upto: u64, manifest: &ManifestId) -> Result<bool, MetaError> {
         let (space_key, doc_key) = (uuid_bytes(space.as_uuid()), uuid_bytes(doc.as_uuid()));
         let mut w = self.begin_write().await?;
+        self.check_guard(&mut w.tx, space).await?;
         let snapshot = snapshot_of(&mut w.tx, space, manifest).await?;
         let row = sqlx::query("SELECT base_seq, head_seq FROM live_docs WHERE space_id = $1 AND id = $2")
             .bind(space_key.clone())
@@ -399,6 +404,12 @@ impl Meta {
     /// too (`base` back to 0; its blobs stay in the chunk store): machines that hold the document send it up again as
     /// updates. `NotFound` if the space has no such document.
     pub async fn reset_live_doc(&self, space: SpaceId, doc: DocId) -> Result<(), MetaError> {
+        self.reset_live_doc_audited(space, doc, None).await
+    }
+
+    /// [`Meta::reset_live_doc`], writing a `cli.live_reset` event for the space (no actor, no names) in the same
+    /// transaction when `audit_at` gives the time: for a team space's document, which belongs to several accounts.
+    pub async fn reset_live_doc_audited(&self, space: SpaceId, doc: DocId, audit_at: Option<i64>) -> Result<(), MetaError> {
         let (space_key, doc_key) = (uuid_bytes(space.as_uuid()), uuid_bytes(doc.as_uuid()));
         let mut w = self.begin_write().await?;
         sqlx::query(
@@ -426,6 +437,9 @@ impl Meta {
             return Err(MetaError::NotFound("document"));
         }
         sqlx::query("DELETE FROM live_updates WHERE space_id = $1 AND doc = $2").bind(space_key).bind(doc_key).execute(&mut *w.tx).await?;
+        if let Some(now_ms) = audit_at {
+            crate::audit::record_in(&mut w.tx, now_ms, crate::audit::NewEvent::new(crate::audit::AuditAction::CliLiveReset).on_space(space)).await?;
+        }
         w.commit().await
     }
 
@@ -489,6 +503,8 @@ impl Meta {
         let client_seq = to_i64(client_seq)?;
         let (space_key, doc_key, device_key) = (uuid_bytes(space.as_uuid()), uuid_bytes(doc.as_uuid()), uuid_bytes(device.as_uuid()));
         let mut w = self.begin_write().await?;
+        // A handle made by `Meta::guarded` re-checks the account's role here, in the write's own transaction.
+        self.check_guard(&mut w.tx, space).await?;
         // Taking the next number locks the document's row (on Postgres), so appends to one document run one at a
         // time and the check for a repeat below can't race another append of the same update.
         let size = i64::try_from(bytes.len()).map_err(|_| MetaError::Invalid("an update too large"))?;
@@ -556,16 +572,17 @@ impl Meta {
         }
         // Every row of every live document of the space, compacted ones too, counts towards its live bytes (kept until
         // retention): over the cap, nothing is stored. A repeat was acked above.
-        let live: i64 = sqlx::query("UPDATE spaces SET live_bytes = live_bytes + $1 WHERE id = $2 RETURNING live_bytes")
+        let row = sqlx::query("UPDATE spaces SET live_bytes = live_bytes + $1 WHERE id = $2 RETURNING live_bytes, kind")
             .bind(size)
             .bind(space_key.clone())
             .fetch_one(&mut *w.tx)
-            .await?
-            .try_get("live_bytes")?;
-        let live = to_u64(live)?;
-        if live > self.live_bytes_cap {
+            .await?;
+        let live = to_u64(row.try_get("live_bytes")?)?;
+        // A team space has a cap of its own: its content belongs to the space, not to one account.
+        let cap = if row.try_get::<String, _>("kind")? == "team" { self.team_live_bytes_cap } else { self.live_bytes_cap };
+        if live > cap {
             w.tx.rollback().await?;
-            return Err(MetaError::LiveFull { used: live.saturating_sub(to_u64(size)?), limit: self.live_bytes_cap });
+            return Err(MetaError::LiveFull { used: live.saturating_sub(to_u64(size)?), limit: cap });
         }
         sqlx::query("INSERT INTO live_updates (space_id, doc, seq, bytes, device, client_seq, created_ms) VALUES ($1, $2, $3, $4, $5, $6, $7)")
             .bind(space_key)

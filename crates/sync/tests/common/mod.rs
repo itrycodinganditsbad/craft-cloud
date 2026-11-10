@@ -12,10 +12,10 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use craft_cloud_meta::{Meta, MetaError, Role, UserRecord};
-use craft_cloud_proto::api::{CommitResponse, SpaceResponse};
+use craft_cloud_meta::{Meta, MetaError, Role, SpaceActor, UserId, UserRecord, WriteGuard};
+use craft_cloud_proto::api::{CommitResponse, SpaceResponse, SpaceRole};
 use craft_cloud_proto::{
-    ChangeSet, ChunkId, Conflict, ConflictKind, ConflictStamp, DeviceId, FileHash, Manifest, ManifestId, Op, PageCursor, SpaceId,
+    ChangeSet, ChunkId, Conflict, ConflictKind, ConflictStamp, DeviceId, FileHash, Manifest, ManifestId, Op, PageCursor, SpaceId, SpaceName,
 };
 use craft_cloud_store::memory::MemoryBackend;
 use craft_cloud_store::{BlobKey, Store};
@@ -39,6 +39,21 @@ impl Server {
 
     pub async fn user(&self, name: &str) -> UserRecord {
         self.meta.create_user(name, "$argon2id$test", Role::Member, 0).await.unwrap()
+    }
+
+    /// A team space called `name` with `owner` as its first owner.
+    pub async fn team_space(&self, name: &str, owner: &UserRecord) -> SpaceId {
+        self.meta.create_team_space(&SpaceActor::Cli, &SpaceName::new(name).unwrap(), owner.id, None, 0).await.unwrap()
+    }
+
+    /// `user` is a member of `space` with `role` (added on the command line: accepted at once).
+    pub async fn add_member(&self, space: SpaceId, user: &UserRecord, role: SpaceRole) {
+        self.meta.invite_member(&SpaceActor::Cli, space, user.id, role, 0).await.unwrap();
+    }
+
+    /// Gives the member `user` of `space` another role.
+    pub async fn set_role(&self, space: SpaceId, user: &UserRecord, role: SpaceRole) {
+        self.meta.change_member_role(&SpaceActor::Cli, space, user.id, role, 0).await.unwrap();
     }
 
     /// The whole-file hash of every version the server ever stored, for "nothing was lost" checks.
@@ -80,6 +95,11 @@ pub struct Faults {
     pub every: AtomicU64,
     /// Make the next commit apply on the server but report failure, as if its reply was lost.
     pub lose_commit_reply: AtomicBool,
+    /// Fail the next commit before it reaches the server.
+    pub fail_next_commit: AtomicBool,
+    /// Make the next read of the change feed answer `ResyncRequired`, as if the server's history had been cut short:
+    /// the machine then lists the tree again.
+    pub resync_next_changes: AtomicBool,
     /// Make every commit come back refused, naming an operation the batch doesn't have.
     pub bad_conflict_index: AtomicBool,
     /// The machine died (see `MemFs::die_after`): every call fails.
@@ -87,10 +107,16 @@ pub struct Faults {
     /// The machine dies right after the n-th commit from now applies on the server, before its answer arrives
     /// (0 = never): that commit's reply is lost, and every call after it fails.
     pub die_on_commit: AtomicU64,
+    /// The n-th commit from now on (1 = the next) and every one after it is refused with `ReadOnly`, as when the account's
+    /// role was lowered in between (0 = never). Nothing is stored by a refused commit.
+    pub refuse_commits_from: AtomicU64,
     /// How many chunks this device downloaded (counted, not a fault).
     pub chunk_downloads: AtomicU64,
     /// How many chunks this device uploaded (counted, not a fault).
     pub chunk_uploads: AtomicU64,
+    /// How many calls that write (missing-chunk query, chunk, manifest, commit, save record) the device made, however
+    /// they were answered (counted, not a fault): a viewer's engine makes none once it knows its role.
+    pub write_calls: AtomicU64,
     /// The next this many chunk uploads are answered as stored but never stored, as by a proxy that answered for
     /// the server and lost them.
     pub lose_chunks: AtomicU64,
@@ -119,6 +145,8 @@ pub struct Local {
     device: DeviceId,
     username: String,
     page: u32,
+    /// The account when the space is a team space: the server's role checks run for it, as the routes do.
+    member: Option<UserId>,
     pub faults: Arc<Faults>,
     clock: Arc<Mutex<i64>>,
     committed: Arc<Mutex<BTreeSet<ManifestId>>>,
@@ -130,12 +158,32 @@ fn meta_err(e: MetaError) -> TransportError {
         MetaError::MissingChunks(m) => TransportError::MissingChunks(m),
         MetaError::ResyncRequired => TransportError::ResyncRequired,
         MetaError::QuotaExceeded { used, limit } => TransportError::QuotaExceeded { used, limit },
+        MetaError::ReadOnly => TransportError::ReadOnly,
         MetaError::NotFound(_) => TransportError::NotFound,
         other => TransportError::Protocol(other.to_string()),
     }
 }
 
 impl Local {
+    /// The metadata handle a write goes through: in a team space it checks the role again inside its transaction.
+    fn writer(&self) -> Meta {
+        match self.member {
+            Some(user) => self.meta.guarded(WriteGuard { user, min: SpaceRole::Editor }),
+            None => self.meta.clone(),
+        }
+    }
+
+    /// The layer in front of a write route: counts the call and refuses an account whose role is too low.
+    async fn write_gate(&self) -> Result<(), TransportError> {
+        self.faults.write_calls.fetch_add(1, Ordering::Relaxed);
+        let Some(user) = self.member else { return Ok(()) };
+        match self.meta.space_access(user, self.space).await.map_err(meta_err)? {
+            Some(role) if role >= SpaceRole::Editor => Ok(()),
+            Some(_) => Err(TransportError::ReadOnly),
+            None => Err(TransportError::NotFound),
+        }
+    }
+
     fn now(&self) -> i64 {
         let mut c = self.clock.lock().unwrap();
         *c += 1;
@@ -148,7 +196,19 @@ impl Transport for Local {
     async fn space(&self) -> Result<SpaceResponse, TransportError> {
         self.faults.check()?;
         let info = self.meta.space_info(self.space).await.map_err(meta_err)?;
-        Ok(SpaceResponse { space: self.space, root: info.root, epoch: info.epoch, seq: info.seq, username: self.username.clone() })
+        Ok(SpaceResponse {
+            space: self.space,
+            root: info.root,
+            epoch: info.epoch,
+            seq: info.seq,
+            username: self.username.clone(),
+            kind: None,
+            name: None,
+            role: match self.member {
+                Some(user) => self.meta.space_access(user, self.space).await.map_err(meta_err)?,
+                None => None,
+            },
+        })
     }
 
     async fn tree(&self, after: Option<PageCursor>) -> Result<ChangeSet, TransportError> {
@@ -158,16 +218,21 @@ impl Transport for Local {
 
     async fn changes(&self, since: u64, after: Option<PageCursor>) -> Result<ChangeSet, TransportError> {
         self.faults.check()?;
+        if self.faults.resync_next_changes.swap(false, Ordering::Relaxed) {
+            return Err(TransportError::ResyncRequired);
+        }
         self.meta.changes(self.space, since, after, self.page).await.map_err(meta_err)
     }
 
     async fn missing_chunks(&self, ids: &[ChunkId]) -> Result<Vec<ChunkId>, TransportError> {
         self.faults.check()?;
+        self.write_gate().await?;
         self.meta.missing_chunks(self.space, ids).await.map_err(meta_err)
     }
 
     async fn put_chunk(&self, id: &ChunkId, data: Bytes) -> Result<(), TransportError> {
         self.faults.check()?;
+        self.write_gate().await?;
         self.faults.chunk_uploads.fetch_add(1, Ordering::Relaxed);
         // One engine drives a transport at a time, so a load and a store are enough.
         if let Some(left) = self.faults.lose_chunks.load(Ordering::Relaxed).checked_sub(1) {
@@ -175,7 +240,7 @@ impl Transport for Local {
             return Ok(());
         }
         self.store.put(BlobKey::chunk(id), &data).await.map_err(|e| TransportError::Protocol(e.to_string()))?;
-        self.meta.add_chunk(self.space, id, data.len() as u64 + 1, self.now()).await.map_err(meta_err)
+        self.writer().add_chunk(self.space, id, data.len() as u64 + 1, self.now()).await.map_err(meta_err)
     }
 
     async fn get_chunk(&self, id: &ChunkId) -> Result<Bytes, TransportError> {
@@ -189,12 +254,13 @@ impl Transport for Local {
 
     async fn put_manifest(&self, id: &ManifestId, data: Bytes) -> Result<(), TransportError> {
         self.faults.check()?;
+        self.write_gate().await?;
         let manifest = Manifest::decode(&data).map_err(|e| TransportError::Protocol(e.to_string()))?;
         if manifest.id() != *id {
             return Err(TransportError::Protocol("manifest ID mismatch".into()));
         }
         self.store.put(BlobKey::manifest(id), &data).await.map_err(|e| TransportError::Protocol(e.to_string()))?;
-        self.meta.add_manifest(self.space, &manifest, data.len() as u64 + 1, self.now()).await.map_err(meta_err)
+        self.writer().add_manifest(self.space, &manifest, data.len() as u64 + 1, self.now()).await.map_err(meta_err)
     }
 
     async fn get_manifest(&self, id: &ManifestId) -> Result<Bytes, TransportError> {
@@ -207,10 +273,19 @@ impl Transport for Local {
 
     async fn commit(&self, ops: &[Op]) -> Result<CommitResponse, TransportError> {
         self.faults.check()?;
+        self.write_gate().await?;
+        if self.faults.fail_next_commit.swap(false, Ordering::Relaxed) {
+            return Err(TransportError::Unavailable("injected before commit".into()));
+        }
+        match self.faults.refuse_commits_from.load(Ordering::Relaxed) {
+            0 => {}
+            1 => return Err(TransportError::ReadOnly),
+            n => self.faults.refuse_commits_from.store(n - 1, Ordering::Relaxed),
+        }
         if self.faults.bad_conflict_index.load(Ordering::Relaxed) {
             return Err(TransportError::Rejected(vec![Conflict { op: ops.len() + 5, kind: ConflictKind::NoSuchNode }]));
         }
-        let out = self.meta.commit(self.space, self.device, ops, self.now()).await.map_err(meta_err);
+        let out = self.writer().commit(self.space, self.device, ops, self.now()).await.map_err(meta_err);
         if let (Err(TransportError::Rejected(conflicts)), Ok(_)) = (&out, std::env::var("SIM_TRACE")) {
             eprintln!("TRACE {} refused {conflicts:?} of {ops:?}", self.name);
         }
@@ -239,7 +314,8 @@ impl Transport for Local {
         save: &craft_cloud_proto::SaveRecord,
     ) -> Result<(), TransportError> {
         self.faults.check()?;
-        self.meta.attach_save(self.space, node, version, save).await.map(|_| ()).map_err(meta_err)
+        self.write_gate().await?;
+        self.writer().attach_save(self.space, node, version, save).await.map(|_| ()).map_err(meta_err)
     }
 }
 
@@ -281,6 +357,7 @@ pub async fn machine_on<F: Fs>(
         device,
         username: user.username.clone(),
         page,
+        member: None,
         faults: Arc::new(Faults::default()),
         clock: Arc::new(Mutex::new(1_760_000_000_000)),
         committed: server.committed.clone(),
@@ -288,6 +365,18 @@ pub async fn machine_on<F: Fs>(
     let mut config = Config::new(name, device);
     tweak(&mut config);
     Engine::new(fs, transport, State::default(), config, || STAMP).unwrap()
+}
+
+/// A machine of `user` in the team `space`, with an empty folder: its transport checks the account's role in `space` as
+/// the server's routes do (a viewer's writes are refused with `ReadOnly`), and counts the write calls it makes.
+pub async fn team_machine(server: &Server, user: &UserRecord, space: SpaceId, name: &str) -> Machine {
+    let mut m = machine(server, user, name).await;
+    let mut transport = m.transport().clone();
+    transport.space = space;
+    transport.member = Some(user.id);
+    let config = Config::new(name, transport.device);
+    m = Engine::new(MemFs::new(), transport, State::default(), config, || STAMP).unwrap();
+    m
 }
 
 /// The same machine after a crash and a restart: its folder and device as they are, a fresh engine that starts
