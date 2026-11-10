@@ -77,7 +77,7 @@ fn node_state(row: &AnyRow) -> Result<NodeState, MetaError> {
 impl Meta {
     /// Starts a read transaction that sees one consistent snapshot. On Postgres the isolation level has to be
     /// set as the transaction's first statement. SQLite read transactions are already snapshots.
-    async fn read_snapshot(&self) -> Result<sqlx::Transaction<'static, sqlx::Any>, MetaError> {
+    pub(crate) async fn read_snapshot(&self) -> Result<sqlx::Transaction<'static, sqlx::Any>, MetaError> {
         let mut tx = self.pool.begin().await?;
         if self.dialect == crate::Dialect::Postgres {
             sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY").execute(&mut *tx).await?;

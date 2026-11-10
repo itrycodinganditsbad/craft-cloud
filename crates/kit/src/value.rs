@@ -95,7 +95,7 @@ impl BlobStore for AgentBlobs {
 /// An agent's refusal, its code kept in the message (`agent_too_old: …`).
 fn agent_error(e: craft_cloud_app::Error) -> KitError {
     match e {
-        craft_cloud_app::Error::Refused { code, message } => KitError::Agent(format!("{code}: {message}")),
+        craft_cloud_app::Error::Refused { code, message, .. } => KitError::Agent(format!("{code}: {message}")),
         other => KitError::from(other),
     }
 }

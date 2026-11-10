@@ -214,7 +214,9 @@ impl Shared {
                     }
                 }
                 Ok(DocsEvent::Error { id: Some(id), seq: Some(seq), code, message }) => self.route(id, Event::Refused { seq, code, message }),
-                Ok(DocsEvent::Error { id: Some(id), seq: None, code, message }) => self.answer(id, Answer::Refused(Error::Refused { code, message })),
+                Ok(DocsEvent::Error { id: Some(id), seq: None, code, message }) => {
+                    self.answer(id, Answer::Refused(Error::Refused { code, message, name_taken: None }))
+                }
                 Ok(DocsEvent::Error { id: None, .. }) | Err(_) => {}
             },
             Message::Binary(bytes) => {
@@ -317,7 +319,7 @@ impl Documents {
                 let status = response.status().as_u16();
                 let body = response.into_body().unwrap_or_default();
                 return Err(match serde_json::from_slice::<ErrorBody>(&body) {
-                    Ok(body) => Error::Refused { code: body.error, message: body.message },
+                    Ok(body) => Error::Refused { code: body.error, message: body.message, name_taken: body.name_taken },
                     Err(_) => Error::Protocol(format!("HTTP {status}")),
                 });
             }
@@ -451,7 +453,7 @@ impl Importer {
                 Ok(Document { id: self.id, head, snapshot, updates, events: self.events, shared: self.shared, seq: AtomicU64::new(0) })
             }
             Answer::NotLive(reason) => {
-                Err(Error::Refused { code: "not_live".into(), message: format!("the file opens as a plain file ({reason:?})") })
+                Err(Error::Refused { code: "not_live".into(), message: format!("the file opens as a plain file ({reason:?})"), name_taken: None })
             }
             Answer::NeedsImport => Err(Error::Protocol("asked for the import again".into())),
             Answer::Refused(e) => Err(e),

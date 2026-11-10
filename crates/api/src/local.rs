@@ -13,10 +13,15 @@
 //!   `POST /v1/pairings` → [`PairingInfo`], `GET /v1/pairings/{id}` → [`PairingStatus`](crate::api::PairingStatus),
 //!   `DELETE /v1/pairings/{id}` → 204; `GET /v1/devices` → a list of [`DeviceInfo`](crate::api::DeviceInfo),
 //!   `DELETE /v1/devices/{id}` → the list after; `POST /v1/pause`, `/v1/resume` and `/v1/quit` → [`Status`];
+//!   `GET /v1/usage` → [`AccountUsage`](crate::api::AccountUsage) from the signed-in account's server;
 //!   `POST /v1/autostart` ([`AutostartRequest`]) → [`Status`]; `GET /v1/recents`, upgraded to a WebSocket of JSON
 //!   text messages: [`RecentsRequest`] in, [`RecentsEvent`] out; `GET /v1/docs`, upgraded to a WebSocket of live
 //!   documents ([`docs`]: [`DocsRequest`] and binary frames in, [`DocsEvent`] and binary frames out); `PUT /v1/blobs`
-//!   and `GET /v1/blobs/{hash}`: binary content kept out of live documents ([`blobs`]). Errors are the HTTP API's error
+//!   and `GET /v1/blobs/{hash}`: binary content kept out of live documents ([`blobs`]); the admin calls under
+//!   `/v1/admin` ([`paths::ADMIN_SERVER`], [`paths::ADMIN_USERS`]), which the agent passes on to the server's admin API
+//!   with the same bodies and answers (see `docs/agent.md`); `GET /v1/spaces` → [`SpaceList`] and, under
+//!   `/v1/spaces/{id}`, `POST …/accept`, `…/decline` (passed on to the server) and `…/sync` ([`SpaceSyncRequest`]): the
+//!   team spaces of the account and what this computer does with them. Errors are the HTTP API's error
 //!   body ([`ErrorAnswer`](crate::api::ErrorAnswer) reads its code and message) with its codes and [`codes`].
 //! - **Versions**: [`Status::api`] is the local API version the agent speaks; a client refuses one outside
 //!   [`LOCAL_API_MIN`]..=[`LOCAL_API_MAX`] when it connects.
@@ -26,7 +31,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::NodeId;
+use crate::api::SpaceRole;
+use crate::ids::{DeviceId, Epoch, NodeId, SpaceId, VersionId};
 use crate::limits::MAX_TREE_DEPTH;
 use crate::name::Name;
 
@@ -52,14 +58,16 @@ pub const MAX_TITLE_BYTES: usize = 256;
 pub const MAX_MACHINE_BYTES: usize = 128;
 /// Largest JSON body or WebSocket message of the local API, either way.
 pub const MAX_LOCAL_JSON_BYTES: usize = 1024 * 1024;
+/// Largest body of an admin call (the server's own limit is tiny too: a confirmation and a few fields).
+pub const MAX_ADMIN_JSON_BYTES: usize = 8 * 1024;
 
 /// Error codes of the local API (the `error` field of [`ErrorAnswer`](crate::api::ErrorAnswer)), beside the HTTP API's
 /// `invalid`, `unauthorized` (the token), `not_found`, `too_large` and `internal`.
 pub mod codes {
     /// A `Host` that isn't `127.0.0.1:<port>`, or an `Origin` header: the request didn't come from a local program.
-    pub const FORBIDDEN: &str = "forbidden";
+    pub const FORBIDDEN: &str = crate::api::codes::FORBIDDEN;
     /// `login`: the server refused the username or password.
-    pub const WRONG_PASSWORD: &str = "wrong_password";
+    pub const WRONG_PASSWORD: &str = crate::api::codes::WRONG_PASSWORD;
     /// `login` while signed in: sign out first.
     pub const ALREADY_SIGNED_IN: &str = "already_signed_in";
     /// `logout`, or recents, while signed out.
@@ -86,6 +94,23 @@ pub mod codes {
     pub const FOLDER_HAS_FILES: &str = "folder_has_files";
     /// `GET /v1/blobs/{hash}`: neither this machine nor the account's server has that blob.
     pub const BLOB_NOT_FOUND: &str = "blob_not_found";
+    /// `login` or `join`: the account has two-factor sign-in. The answer's `two_factor` (see [`ErrorExtras`](super::ErrorExtras))
+    /// holds the challenge for `POST /v1/login/second-factor` (empty for `join`: send the same join again with the code).
+    pub const TWO_FACTOR_REQUIRED: &str = crate::api::codes::TWO_FACTOR_REQUIRED;
+    /// A code or recovery code was wrong (HTTP 401 for `login`, `login/second-factor` and `join`, 403 on the account calls).
+    /// It never means the device was revoked.
+    pub const TWO_FACTOR_INVALID: &str = crate::api::codes::TWO_FACTOR_INVALID;
+    /// Too many wrong codes: try again after the answer's `retry_after_secs` (HTTP 429, also the `Retry-After` header).
+    pub const TWO_FACTOR_LOCKED: &str = crate::api::codes::TWO_FACTOR_LOCKED;
+    /// The server has no key for two-factor secrets, so it can't be set up (HTTP 503).
+    pub const TWO_FACTOR_UNAVAILABLE: &str = crate::api::codes::TWO_FACTOR_UNAVAILABLE;
+    /// A set-up is open on another computer (HTTP 409).
+    pub const TWO_FACTOR_PENDING: &str = crate::api::codes::TWO_FACTOR_PENDING;
+    /// `login/second-factor`: the challenge doesn't work any more (it lasts five minutes and takes five wrong codes, and a
+    /// password change ends it): sign in again from the first step (HTTP 409; a 401 would read as a bad local token).
+    pub const TWO_FACTOR_EXPIRED: &str = "two_factor_expired";
+    /// A state clash on the server (two-factor already on, no set-up to confirm, a password that changed meanwhile), HTTP 409.
+    pub const CONFLICT: &str = crate::api::codes::CONFLICT;
     /// Never sent by an agent: what a client reports when the agent answers a call it doesn't know (`not_found` for
     /// the call itself), as one from before that call answers it. Update Craft Cloud.
     pub const AGENT_TOO_OLD: &str = "agent_too_old";
@@ -101,11 +126,34 @@ pub mod paths {
     pub const DOCS: &str = "/v1/docs";
     /// `POST`: join with a join string ([`super::JoinRequest`]) → [`super::Status`].
     pub const JOIN: &str = "/v1/join";
+    /// `POST` ([`super::SecondFactorLoginRequest`]): the second step of a sign-in that answered `two_factor_required` →
+    /// [`super::Status`].
+    pub const LOGIN_SECOND_FACTOR: &str = "/v1/login/second-factor";
+    /// `GET` → [`crate::api::TwoFactorStatus`]; with `/setup`, `/confirm`, `/disable` and `/recovery-codes` below it: the
+    /// signed-in account's two-factor sign-in, passed on to the server ([`super::PasswordRequest`], [`super::TotpRequest`],
+    /// [`super::TwoFactorProofRequest`]). Nothing is stored or logged on the way.
+    pub const TWO_FACTOR: &str = "/v1/account/two-factor";
+    pub const TWO_FACTOR_SETUP: &str = "/v1/account/two-factor/setup";
+    pub const TWO_FACTOR_CONFIRM: &str = "/v1/account/two-factor/confirm";
+    pub const TWO_FACTOR_DISABLE: &str = "/v1/account/two-factor/disable";
+    pub const TWO_FACTOR_RECOVERY_CODES: &str = "/v1/account/two-factor/recovery-codes";
+    /// `GET` → [`crate::api::AccountInfo`]: the signed-in account (its role, and whether it has two-factor sign-in), as the
+    /// server says it.
+    pub const ACCOUNT: &str = "/v1/account";
+    /// `GET /v1/account/activity?cursor&before_ms&limit` → [`crate::api::AuditPage`]: the signed-in account's own security
+    /// events, for every account.
+    pub const ACCOUNT_ACTIVITY: &str = "/v1/account/activity";
+    /// `POST` ([`super::ChangePasswordRequest`]) → 204.
+    pub const ACCOUNT_PASSWORD: &str = "/v1/account/password";
+    /// `POST` → [`crate::api::RevokedOthers`]: sign every other computer of the account out.
+    pub const DEVICES_REVOKE_OTHERS: &str = "/v1/devices/revoke-others";
     /// `POST`: a new add-a-computer code → [`super::PairingInfo`]; `GET`/`DELETE` `/v1/pairings/{id}`: its state, or
     /// cancel it.
     pub const PAIRINGS: &str = "/v1/pairings";
     /// `GET`: the account's computers; `DELETE /v1/devices/{id}`: remove one (never this one).
     pub const DEVICES: &str = "/v1/devices";
+    /// `GET`: the signed-in account's stored bytes and labeled estimates, fetched from its server.
+    pub const USAGE: &str = "/v1/usage";
     /// `POST`: hold syncing (kept across restarts) → [`super::Status`].
     pub const PAUSE: &str = "/v1/pause";
     /// `POST`: sync again after a pause → [`super::Status`].
@@ -116,6 +164,135 @@ pub mod paths {
     pub const AUTOSTART: &str = "/v1/autostart";
     /// `PUT`: a blob → [`super::blobs::Stored`]; `GET /v1/blobs/{hash}`: its bytes ([`super::blobs`]).
     pub const BLOBS: &str = "/v1/blobs";
+    /// `GET`: the server's counters and kinds (an admin's; any other account is refused with `forbidden`) →
+    /// [`AdminServerInfo`](crate::api::AdminServerInfo).
+    pub const ADMIN_SERVER: &str = "/v1/admin/server";
+    /// `GET /v1/admin/storage` → [`AdminStorageOverview`](crate::api::AdminStorageOverview).
+    pub const ADMIN_STORAGE: &str = "/v1/admin/storage";
+    /// `GET /v1/admin/users?cursor&limit&query` → [`AdminUserList`](crate::api::AdminUserList); `POST` (an
+    /// [`AdminCreateUser`](crate::api::AdminCreateUser)) → [`AdminCreatedUser`](crate::api::AdminCreatedUser).
+    /// Under `/v1/admin/users/{id}`: `PATCH` ([`AdminUpdateUser`](crate::api::AdminUpdateUser)) → the account's
+    /// [`AdminUserInfo`](crate::api::AdminUserInfo); `DELETE`, and `POST` to `…/disable`, `…/enable`, `…/invite` and
+    /// `…/password-reset`, and `DELETE …/invite` and `…/devices/{device_id}`, each with an
+    /// [`AdminConfirm`](crate::api::AdminConfirm) (the invite and the reset code answer an
+    /// [`AdminCode`](crate::api::AdminCode), the others have no body); `GET …/devices` →
+    /// [`AdminDevices`](crate::api::AdminDevices). The server's status and error code are the agent's.
+    pub const ADMIN_USERS: &str = "/v1/admin/users";
+    /// `GET /v1/admin/users/{id}/usage` → [`AccountUsage`](crate::api::AccountUsage).
+    pub const ADMIN_USER_USAGE: &str = "/v1/admin/users";
+    /// `GET /v1/admin/audit?cursor&before_ms&limit&user&action` → [`AuditPage`](crate::api::AuditPage): the whole security log,
+    /// newest first, filtered (an admin's).
+    pub const ADMIN_AUDIT: &str = "/v1/admin/audit";
+    /// `GET /v1/admin/audit/export?before_ms&user&action`: the log as NDJSON, streamed through (chunked, never held whole by the
+    /// agent): [`AuditEvent`](crate::api::AuditEvent) lines and a last [`AuditExportEnd`](crate::api::AuditExportEnd) line.
+    /// A stream that ends without that last line was cut off.
+    pub const ADMIN_AUDIT_EXPORT: &str = "/v1/admin/audit/export";
+    /// `GET`: version history for a synced file, addressed by its path relative to the sync root.
+    pub const FILE_HISTORY: &str = "/v1/files/history";
+    /// `POST`: restore a prior version of a synced file, addressed by its path relative to the sync root.
+    pub const FILE_RESTORE: &str = "/v1/files/restore";
+    /// `GET`: the server's deleted nodes; `POST` restore and remove calls address node IDs.
+    pub const TRASH: &str = "/v1/trash";
+    pub const TRASH_RESTORE: &str = "/v1/trash/restore";
+    pub const TRASH_REMOVE: &str = "/v1/trash/remove";
+    /// `GET` → [`super::SpaceList`]: the personal space and the team spaces of the account, invitations among them, with
+    /// what this computer does with each. Under `/v1/spaces/{id}`: `POST …/accept` → the space as the server lists it
+    /// ([`SpaceListItem`](crate::api::SpaceListItem)), `POST …/decline` → 204 (both passed on to the server), and
+    /// `POST …/sync` ([`super::SpaceSyncRequest`]) → the space as [`super::SpaceInfo`], and `POST …/approve-deletes`
+    /// ([`super::ApproveDeletesRequest`]) → [`super::ApproveDeletesAnswer`].
+    pub const SPACES: &str = "/v1/spaces";
+}
+
+/// One version in a file's newest-first history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryVersion {
+    pub id: VersionId,
+    pub parent_version: Option<VersionId>,
+    pub epoch: Epoch,
+    pub seq: u64,
+    pub size: u64,
+    pub mtime_ms: i64,
+    pub device: DeviceId,
+    pub created_ms: i64,
+    pub save: bool,
+    pub pruned: bool,
+}
+
+/// A page of a file's newest-first version history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryResponse {
+    pub versions: Vec<HistoryVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+/// The path and page cursor for `GET /v1/files/history`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileHistoryRequest {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// `POST /v1/files/restore`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreRequest {
+    pub path: String,
+    pub version: VersionId,
+    pub expected_version: VersionId,
+}
+
+/// The new version made by a successful restore.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreResponse {
+    pub version: VersionId,
+    pub parent_version: VersionId,
+    pub seq: u64,
+    pub epoch: Epoch,
+}
+
+/// One deleted node from the server's trash. `path` is a local display hint and can be absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrashItem {
+    pub id: NodeId,
+    pub parent: NodeId,
+    pub name: String,
+    pub is_dir: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    pub deleted_ms: i64,
+    pub purge_after_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// A page of the server's trash, newest deletion first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrashResponse {
+    pub items: Vec<TrashItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+/// `{id}` in a local trash restore or remove request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrashNodeRequest {
+    pub id: String,
+}
+
+/// The server's answer after restoring a node from trash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrashRestoreResponse {
+    pub node: NodeId,
+    pub parent: NodeId,
+    pub name: String,
+    pub renamed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<VersionId>,
+    pub seq: u64,
+    pub epoch: Epoch,
 }
 
 /// Binary content an app keeps out of a live document (images, audio, a font): `PUT /v1/blobs` with the bytes as the
@@ -271,6 +448,171 @@ pub struct Status {
     /// admin): nothing syncs until it signs out and joins again. Its files stay.
     #[serde(default)]
     pub removed: bool,
+    /// The team spaces this computer syncs, or lost access to, one entry each (the fields above describe the personal
+    /// space). An older agent says nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spaces: Vec<SpaceStatus>,
+}
+
+/// What this computer does about one space, in [`SpaceInfo`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpaceSync {
+    /// The space syncs to a folder on this computer.
+    On,
+    /// It doesn't (a team space starts so on every computer: the person chooses).
+    Off,
+    /// It can't: the server is too old for team spaces, or this computer lost access to the space.
+    Unavailable,
+}
+
+/// How the sync of one team space is going, in [`SpaceStatus`] and [`SpaceInfo`]: [`RunState`] for a space, and the two
+/// ways a space stops that a whole agent doesn't. The `Debug` output leaves out the words of `NoAccess`, which name the
+/// space.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum SpaceRun {
+    Idle,
+    Syncing,
+    /// The last pass failed for a reason that may pass by itself; it is tried again.
+    Retrying {
+        message: String,
+    },
+    /// Stopped until someone puts something right (the folder is gone, say).
+    Paused {
+        reason: String,
+    },
+    /// Syncing is paused by the user for every space.
+    PausedByUser,
+    /// The account no longer has access (it was removed, or the invitation withdrawn; an archived space is not this: its members
+    /// keep read access). The local copy is
+    /// kept and no longer syncs; if access comes back it syncs again. `message` says so in words.
+    NoAccess {
+        message: String,
+    },
+    /// The server can't do team spaces yet (it needs an update).
+    Unavailable {
+        message: String,
+    },
+}
+
+impl std::fmt::Debug for SpaceRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Idle => f.write_str("Idle"),
+            Self::Syncing => f.write_str("Syncing"),
+            Self::Retrying { message } => f.debug_struct("Retrying").field("message", message).finish(),
+            Self::Paused { reason } => f.debug_struct("Paused").field("reason", reason).finish(),
+            Self::PausedByUser => f.write_str("PausedByUser"),
+            Self::NoAccess { .. } => f.debug_struct("NoAccess").finish_non_exhaustive(),
+            Self::Unavailable { message } => f.debug_struct("Unavailable").field("message", message).finish(),
+        }
+    }
+}
+
+/// One synced team space in [`Status::spaces`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceStatus {
+    pub space: SpaceId,
+    pub run_state: SpaceRun,
+    /// When the last pass that didn't fail finished (milliseconds since the Unix epoch).
+    #[serde(default)]
+    pub last_sync_ms: Option<i64>,
+    /// The account is a viewer here (or the space is archived): the folder follows the space, and nothing of this
+    /// computer goes up.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// One space in `GET /v1/spaces`: the server's view of it (its name, the account's role, whether it is an invitation)
+/// and this computer's (the folder, whether it syncs, how that goes). The `Debug` output leaves out the name and the
+/// folder.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceInfo {
+    pub space: SpaceId,
+    /// `personal` or `team`.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub role: SpaceRole,
+    /// `active`, or `invited` for an invitation not yet accepted.
+    pub state: String,
+    #[serde(default)]
+    pub archived: bool,
+    /// The folder on this computer (absolute): where the space syncs, or would.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+    pub sync: SpaceSync,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_state: Option<SpaceRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sync_ms: Option<i64>,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+impl std::fmt::Debug for SpaceInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpaceInfo")
+            .field("space", &self.space)
+            .field("kind", &self.kind)
+            .field("role", &self.role)
+            .field("state", &self.state)
+            .field("archived", &self.archived)
+            .field("sync", &self.sync)
+            .field("run_state", &self.run_state)
+            .field("read_only", &self.read_only)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `GET /v1/spaces`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SpaceList {
+    pub spaces: Vec<SpaceInfo>,
+}
+
+/// `POST /v1/spaces/{id}/sync`: turn the sync of a team space on or off on this computer. `folder` (absolute) picks
+/// another folder than the default one beside the personal folder; the folder must not lie inside another synced folder or
+/// the agent's data folder. A folder that already has files in it is synced only with `adopt` (files that differ from
+/// the space's become conflict copies; nothing is deleted).
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SpaceSyncRequest {
+    pub on: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub adopt: bool,
+}
+
+impl std::fmt::Debug for SpaceSyncRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpaceSyncRequest").field("on", &self.on).field("adopt", &self.adopt).finish_non_exhaustive()
+    }
+}
+
+/// `POST /v1/spaces/{id}/approve-deletes`: approve the deletions of a team space that the mass-delete guard holds back, as
+/// `craft-cloud-agent sync --approve-deletes --space` does (it writes the space's `approval.json`, which the running agent
+/// takes). With a `set` (the identifier the waiting list was shown with) only that set is approved if it is the one waiting;
+/// without, the set is approved if it is the one last shown by this call (the first call lists it and approves nothing).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ApproveDeletesRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set: Option<String>,
+}
+
+/// The answer to [`ApproveDeletesRequest`]: whether an approval was handed to the agent, and what the command line
+/// would have said. Its `Debug` output leaves out the words, which list file names.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApproveDeletesAnswer {
+    pub approved: bool,
+    pub message: String,
+}
+
+impl std::fmt::Debug for ApproveDeletesAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApproveDeletesAnswer").field("approved", &self.approved).finish_non_exhaustive()
+    }
 }
 
 /// `POST /v1/login`: what `craft-cloud-agent login` asks for. The password goes to the agent and from there to the
@@ -324,6 +666,12 @@ pub struct JoinRequest {
     /// The new account's password, for an invite that needs one (answered `password_required` without it).
     #[serde(default)]
     pub password: Option<String>,
+    /// The second factor of an account that has two-factor sign-in (answered `two_factor_required` without it, the code not
+    /// used up): a code from the authenticator app, or a recovery code instead. Send the same join again with one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
 }
 
 impl std::fmt::Debug for JoinRequest {
@@ -334,8 +682,126 @@ impl std::fmt::Debug for JoinRequest {
             .field("device_name", &self.device_name)
             .field("adopt", &self.adopt)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
             .finish()
     }
+}
+
+/// What an error answer carries beyond `error` and `message` ([`ErrorAnswer`](crate::api::ErrorAnswer) reads those two): the
+/// challenge of `two_factor_required` and the wait of `two_factor_locked` (also in the `Retry-After` header). A client reads
+/// it from the same body; every field is missing from answers that have no use for it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorExtras {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub two_factor: Option<crate::api::TwoFactorChallenge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
+}
+
+/// `POST /v1/login/second-factor`: the second step of a sign-in the agent answered `two_factor_required`. The agent keeps
+/// nothing between the two steps, so the first step's `server`, `folder`, `device_name` and `adopt` come again (`user` is
+/// the first step's and is only checked to be sane), with the `challenge` from the answer and a code (`totp_code`) or a recovery
+/// code. Answered with [`Status`]. Its `Debug` output hides the challenge and the codes.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecondFactorLoginRequest {
+    pub server: String,
+    pub user: String,
+    #[serde(default)]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub device_name: Option<String>,
+    #[serde(default)]
+    pub adopt: bool,
+    pub challenge: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
+}
+
+impl std::fmt::Debug for SecondFactorLoginRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecondFactorLoginRequest")
+            .field("server", &self.server)
+            .field("user", &self.user)
+            .field("folder", &self.folder)
+            .field("device_name", &self.device_name)
+            .field("adopt", &self.adopt)
+            .field("challenge", &"<redacted>")
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// `POST /v1/account/two-factor/setup`: the account's password, to start setting two-factor sign-in up. Answered with
+/// [`TwoFactorSetupResponse`](crate::api::TwoFactorSetupResponse). Its `Debug` output hides the password.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PasswordRequest {
+    pub password: String,
+}
+
+impl std::fmt::Debug for PasswordRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasswordRequest").field("password", &"<redacted>").finish()
+    }
+}
+
+/// `POST /v1/account/two-factor/confirm`: the first code of the set-up; answered with
+/// [`RecoveryCodes`](crate::api::RecoveryCodes), shown once. Its `Debug` output hides the code.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TotpRequest {
+    pub totp_code: String,
+}
+
+impl std::fmt::Debug for TotpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TotpRequest").field("totp_code", &"<redacted>").finish()
+    }
+}
+
+/// `POST /v1/account/two-factor/disable` (answered 204) and `/recovery-codes` (answered with
+/// [`RecoveryCodes`](crate::api::RecoveryCodes), with `totp_code` only): the password and one second factor. Its `Debug` output
+/// hides all three.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwoFactorProofRequest {
+    pub password: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
+}
+
+impl std::fmt::Debug for TwoFactorProofRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TwoFactorProofRequest")
+            .field("password", &"<redacted>")
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// `POST /v1/account/password`: the account's password change; answered 204, and every other computer is signed out. Its
+/// `Debug` output hides both passwords.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+impl std::fmt::Debug for ChangePasswordRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChangePasswordRequest").field("current_password", &"<redacted>").field("new_password", &"<redacted>").finish()
+    }
+}
+
+/// `PATCH /v1/devices/{id}`: a new name for one of the account's computers; answered with its
+/// [`DeviceInfo`](crate::api::DeviceInfo).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameDeviceRequest {
+    pub name: String,
 }
 
 /// `POST /v1/pairings`: a new add-a-computer code of this account, to enter on the computer being added. It
@@ -736,9 +1202,29 @@ mod tests {
             device_name: None,
             adopt: false,
             password: Some("hunter2-secret".into()),
+            totp_code: Some("918273".into()),
+            recovery_code: Some("RECOVERY-SECRET".into()),
         };
         let shown = format!("{join:?}");
-        assert!(!shown.contains("K7M4") && !shown.contains("hunter2-secret"), "{shown}");
+        assert!(!shown.contains("K7M4") && !shown.contains("hunter2-secret") && !shown.contains("918273") && !shown.contains("RECOVERY"), "{shown}");
+        let second = SecondFactorLoginRequest {
+            server: "https://c.example".into(),
+            user: "ana".into(),
+            folder: None,
+            device_name: None,
+            adopt: false,
+            challenge: "challenge-secret".into(),
+            totp_code: Some("918273".into()),
+            recovery_code: Some("RECOVERY-SECRET".into()),
+        };
+        let shown = format!("{second:?}");
+        assert!(!shown.contains("challenge-secret") && !shown.contains("918273") && !shown.contains("RECOVERY"), "{shown}");
+        let proof =
+            TwoFactorProofRequest { password: "pw-secret-1".into(), totp_code: Some("918273".into()), recovery_code: Some("RECOVERY-SECRET".into()) };
+        let shown = format!("{proof:?} {:?} {:?}", PasswordRequest { password: "pw-secret-1".into() }, TotpRequest { totp_code: "918273".into() });
+        assert!(!shown.contains("pw-secret-1") && !shown.contains("918273") && !shown.contains("RECOVERY"), "{shown}");
+        let change = format!("{:?}", ChangePasswordRequest { current_password: "old-secret-pw".into(), new_password: "new-secret-pw".into() });
+        assert!(!change.contains("secret-pw"), "{change}");
         let pairing = PairingInfo {
             id: uuid::Uuid::nil(),
             join: "cloud.example.com/K7M4-Q9TX".into(),
@@ -747,7 +1233,20 @@ mod tests {
         };
         assert!(!format!("{pairing:?}").contains("K7M4"));
         let minimal: JoinRequest = serde_json::from_value(serde_json::json!({ "join": "x/y" })).unwrap();
-        assert!(!minimal.adopt && minimal.password.is_none());
+        assert!(!minimal.adopt && minimal.password.is_none() && minimal.totp_code.is_none() && minimal.recovery_code.is_none());
+        // An older app's body reads, and a new body without a second factor is the old one.
+        assert_eq!(
+            serde_json::to_value(&minimal).unwrap(),
+            serde_json::json!({ "join": "x/y", "folder": null, "device_name": null, "adopt": false, "password": null })
+        );
+        // The extras of an error answer are optional and ignored by a reader that doesn't know them.
+        let extras: ErrorExtras = serde_json::from_value(serde_json::json!({ "error": "x", "message": "m" })).unwrap();
+        assert_eq!(extras, ErrorExtras::default());
+        let extras: ErrorExtras = serde_json::from_value(
+            serde_json::json!({ "error": "two_factor_required", "two_factor": { "challenge": "c", "expires_ms": 5 }, "retry_after_secs": 7 }),
+        )
+        .unwrap();
+        assert_eq!((extras.two_factor.map(|t| t.expires_ms), extras.retry_after_secs), (Some(5), Some(7)));
     }
 
     #[test]
@@ -770,6 +1269,7 @@ mod tests {
             autostart: None,
             last_sync_ms: Some(1_790_000_000_000),
             removed: false,
+            spaces: Vec::new(),
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["run_state"], serde_json::json!({ "kind": "signed_out" }));
@@ -783,8 +1283,47 @@ mod tests {
         assert_eq!(older.autostart, None, "an older agent says nothing about autostart");
         assert_eq!(older.last_sync_ms, None, "nor about the last sync");
         assert!(!older.removed);
+        assert!(older.spaces.is_empty(), "nor about team spaces");
         let login: LoginRequest = serde_json::from_value(serde_json::json!({ "server": "s", "user": "u", "password": "p", "extra": 1 })).unwrap();
         assert!(!login.adopt && login.folder.is_none(), "missing optional fields default; unknown ones are ignored");
+    }
+
+    #[test]
+    fn spaces_have_a_plain_form_and_their_debug_output_names_nothing() {
+        let space = SpaceId::generate();
+        let info = SpaceInfo {
+            space,
+            kind: "team".into(),
+            name: Some("Studio".into()),
+            role: SpaceRole::Viewer,
+            state: "active".into(),
+            archived: false,
+            folder: Some("/home/ana/Craft Cloud Shared/Studio".into()),
+            sync: SpaceSync::On,
+            run_state: Some(SpaceRun::NoAccess { message: "You no longer have access to Studio. Your local copy is kept.".into() }),
+            last_sync_ms: None,
+            read_only: true,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["sync"], "on");
+        assert_eq!(json["run_state"]["kind"], "no_access");
+        assert!(json.get("last_sync_ms").is_none());
+        assert_eq!(serde_json::from_value::<SpaceInfo>(json).unwrap(), info);
+        let shown = format!("{info:?}");
+        assert!(!shown.contains("Studio") && !shown.contains("Craft Cloud Shared"), "{shown}");
+        assert!(shown.contains("NoAccess"), "the variant is still named: {shown}");
+        let status = SpaceStatus { space, run_state: info.run_state.clone().unwrap(), last_sync_ms: None, read_only: false };
+        let shown = format!("{status:?}");
+        assert!(!shown.contains("Studio"), "the status leaves the name out too: {shown}");
+        let answer = ApproveDeletesAnswer { approved: true, message: "delete on the server: Studio/plan.txt".into() };
+        assert!(!format!("{answer:?}").contains("plan.txt"));
+        let older: Status = serde_json::from_value(serde_json::json!({
+            "api": 1, "signed_in": true, "online": true, "run_state": { "kind": "idle" }
+        }))
+        .unwrap();
+        assert!(older.spaces.is_empty());
+        let request: SpaceSyncRequest = serde_json::from_value(serde_json::json!({ "on": true })).unwrap();
+        assert_eq!(request, SpaceSyncRequest { on: true, folder: None, adopt: false });
     }
 
     #[test]
