@@ -32,10 +32,16 @@ pub struct App {
 pub trait Host {
     /// Opens `folder` in the file manager.
     fn open_folder(&self, folder: &str);
+    /// Opens the file at `path` (checked by [`crate::files::resolve`]) with the OS's default program; why not, if it can't be
+    /// asked.
+    fn open_file(&self, path: &str) -> Result<(), String>;
     /// Writes (`true`) or removes the app's own start-at-login entry.
     fn set_autostart(&self, on: bool) -> Result<(), String>;
     /// Shows the OS's folder picker at `start`, off the UI thread; the answer is sent to `answer` (then `wake`).
     fn pick_folder(&self, start: String, answer: Sender<Event>, wake: Arc<dyn Fn() + Send + Sync>);
+    /// Shows the OS's save dialog with `suggested` as the file name, off the UI thread; the answer (the path, or `None` when
+    /// cancelled) is sent to `answer` as [`crate::audit::AuditMsg::ExportPicked`] (then `wake`).
+    fn save_file(&self, suggested: String, ticket: u64, answer: Sender<Event>, wake: Arc<dyn Fn() + Send + Sync>);
     /// Ends the tray process (Linux, where the tray is a process of its own).
     fn quit_tray(&self) {}
     /// Called every frame with the model, to show its state (the tray icon); events it has go to the model.
@@ -75,6 +81,12 @@ impl App {
             match self.link.perform(effect) {
                 None => {}
                 Some(Effect::OpenFolder(folder)) => self.host.open_folder(&folder),
+                Some(Effect::OpenFile(path)) => {
+                    let opened = self.host.open_file(&path);
+                    if opened.is_err() {
+                        self.handle(Event::FileOpened(opened), ctx);
+                    }
+                }
                 Some(Effect::QuitTray) => self.host.quit_tray(),
                 Some(Effect::QuitApp) => {
                     self.closing = true;
@@ -83,6 +95,10 @@ impl App {
                 Some(Effect::AppAutostart(on)) => {
                     let done = self.host.set_autostart(on);
                     self.handle(Event::AppAutostartSet(done), ctx);
+                }
+                Some(Effect::PickExportFile { suggested, ticket }) => {
+                    let wake_ctx = ctx.clone();
+                    self.host.save_file(suggested, ticket, self.to_self.clone(), Arc::new(move || wake_ctx.request_repaint()));
                 }
                 Some(Effect::PickFolder(start)) => {
                     let wake_ctx = ctx.clone();
@@ -127,6 +143,11 @@ impl eframe::App for App {
         }
     }
 
+    /// The page's own colour, not eframe's translucent grey: see [`crate::ui::kit::clear_color`].
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        crate::ui::kit::clear_color(visuals)
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let events = crate::ui::show(ui, &mut self.model, crate::now_ms());
         let ctx = ui.ctx().clone();
@@ -163,8 +184,21 @@ impl Host for System {
         open_folder(folder);
     }
 
+    fn open_file(&self, path: &str) -> Result<(), String> {
+        open_file(path)
+    }
+
     fn set_autostart(&self, on: bool) -> Result<(), String> {
         crate::autostart::set_for_this_app(on)
+    }
+
+    fn save_file(&self, suggested: String, ticket: u64, answer: Sender<Event>, wake: Arc<dyn Fn() + Send + Sync>) {
+        let _ = std::thread::Builder::new().name("craft-cloud-saver".into()).spawn(move || {
+            let dialog = rfd::AsyncFileDialog::new().set_title("Save the audit log").set_file_name(&suggested);
+            let picked = block_on(dialog.save_file()).map(|handle| handle.path().display().to_string());
+            let _ = answer.send(Event::Audit(crate::audit::AuditMsg::ExportPicked { ticket, path: picked }));
+            wake();
+        });
     }
 
     fn pick_folder(&self, start: String, answer: Sender<Event>, wake: Arc<dyn Fn() + Send + Sync>) {
@@ -183,14 +217,24 @@ impl Host for System {
 /// Opens `folder` in the file manager (`explorer`, `open`, `xdg-open`), in a process of its own that nothing waits
 /// for.
 pub fn open_folder(folder: &str) {
-    let opener = if cfg!(windows) {
+    let _ = crate::start_agent::spawn_detached(std::path::Path::new(opener()), &[folder]);
+}
+
+/// Opens `path`, a file, with the OS's default program (the same opener as [`open_folder`]), in a process of its own that
+/// nothing waits for. The caller has checked the path ([`crate::files::resolve`]); an error is the opener not starting.
+pub fn open_file(path: &str) -> Result<(), String> {
+    crate::start_agent::spawn_detached(std::path::Path::new(opener()), &[path]).map_err(|e| format!("{} didn't start: {e}", opener()))
+}
+
+/// The OS's own opener (`explorer`, `open`, `xdg-open`).
+fn opener() -> &'static str {
+    if cfg!(windows) {
         "explorer"
     } else if cfg!(target_vendor = "apple") {
         "open"
     } else {
         "xdg-open"
-    };
-    let _ = crate::start_agent::spawn_detached(std::path::Path::new(opener), &[folder]);
+    }
 }
 
 /// Runs `future` to its end on this thread (the folder picker's, which has nothing else to do meanwhile).
