@@ -311,6 +311,12 @@ async fn the_crate_finds_no_agent_and_signs_in_and_out_the_one_it_finds() {
     // A file a crashed agent left behind: nobody answers on its port.
     let stale = serde_json::json!({ "schema": 1, "port": 1, "token": "x", "pid": 1 });
     std::fs::write(empty.path().join("local-api.json"), stale.to_string()).unwrap();
+    // As the agent writes it, so that the client gets as far as asking the port.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(empty.path().join("local-api.json"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let dir = empty.path().to_owned();
     assert!(matches!(off(move || Client::connect_in(&dir)).await, Err(Error::NotRunning(_))));
 

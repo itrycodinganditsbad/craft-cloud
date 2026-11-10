@@ -60,6 +60,8 @@ pub enum AccountError {
     NoDataDir,
     #[error("{path}: {source}")]
     Io { path: PathBuf, source: io::Error },
+    #[error("the agent's data folder can't be used: {why}")]
+    Insecure { why: String },
     #[error("{path} is damaged ({message}); move it away to start over")]
     Damaged { path: PathBuf, message: String },
     #[error("the folder path {0} isn't valid UTF-8, so it can't be saved in the account; pick a folder whose path is plain text")]
@@ -389,13 +391,22 @@ impl DataDir {
 
     /// Creates the data folder (owner-only on Unix) if it doesn't exist. Folders above it that are missing (a fresh
     /// `~/.local/share`, say) are made as any program would make them; only the data folder itself is owner-only.
+    ///
+    /// A folder that exists is checked before it is used (see [`craft_cloud_proto::local::private`]): on Unix it must be
+    /// a real folder of the user's own that no one else can write to, in a place no one else can swap it in; one that
+    /// is not is refused with the reason. The token files in it are `0600`, but anyone who can write to the folder
+    /// can replace them. Windows has no such check here; the agent keeps to `%LOCALAPPDATA%` instead.
     pub fn create(&self) -> Result<(), AccountError> {
-        if self.0.is_dir() {
-            return Ok(());
+        let insecure = |why| AccountError::Insecure { why };
+        // On Unix a link counts as "there", and the check refuses it. Elsewhere only a folder does, so a file or a dangling
+        // link at the path still fails below, where the folder is made, with an error that names the path.
+        if self.0.is_dir() || (cfg!(unix) && fs::symlink_metadata(&self.0).is_ok()) {
+            return craft_cloud_proto::local::private::check_private_dir(&self.0).map_err(insecure);
         }
         if let Some(parent) = self.0.parent() {
             fs::create_dir_all(parent).map_err(io_at(parent))?;
         }
+        craft_cloud_proto::local::private::check_private_parents(&self.0).map_err(insecure)?;
         #[cfg(unix)]
         let builder = {
             use std::os::unix::fs::DirBuilderExt;
@@ -407,7 +418,9 @@ impl DataDir {
         let builder = fs::DirBuilder::new();
         match builder.create(&self.0) {
             // Made meanwhile (by another agent starting at the same moment): there is nothing more to do.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && self.0.is_dir() => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && self.0.is_dir() => {
+                craft_cloud_proto::local::private::check_private_dir(&self.0).map_err(insecure)
+            }
             other => other.map_err(io_at(&self.0)),
         }
     }
@@ -984,5 +997,58 @@ mod tests {
             assert_eq!(dir, Path::new("/home/ana/.local/share/craft-cloud-agent"));
         }
         assert_eq!(default_data_dir(|_| None), None);
+    }
+
+    /// An existing data folder is used only when it is the user's own and nobody else can write to it: files in it are
+    /// `0600`, but whoever can write to the folder can replace them (and point apps at a listener of their own).
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_data_folder_others_can_write_to_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path().join("data"));
+        let mode = |path: &Path, mode: u32| fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        // Made by the agent: fine, and fine again when it is there.
+        data.create().unwrap();
+        assert_eq!(fs::metadata(data.path()).unwrap().permissions().mode() & 0o777, 0o700);
+        data.create().unwrap();
+        for bad in [0o770, 0o707, 0o777] {
+            mode(data.path(), bad);
+            let refused = data.create().unwrap_err();
+            assert!(matches!(&refused, AccountError::Insecure { why } if why.contains("written by other users")), "{bad:o}: {refused}");
+            // Nothing is written into it: not a token, not an account.
+            assert!(data.save_state(&SavedState { schema: STATE_SCHEMA, ..SavedState::default() }).is_err());
+            assert!(!data.path().join(STATE_FILE).exists());
+        }
+        mode(data.path(), 0o700);
+        data.create().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_data_folder_that_is_a_link_or_sits_in_an_open_folder_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mode = |path: &Path, mode: u32| fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        mode(&real, 0o700);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let refused = DataDir::new(&link).create().unwrap_err();
+        assert!(matches!(&refused, AccountError::Insecure { why } if why.contains("is a link")), "{refused}");
+        // A folder everyone can write to, without the sticky bit: anything below it can be swapped. New or existing.
+        let open = dir.path().join("open");
+        fs::create_dir(&open).unwrap();
+        mode(&open, 0o777);
+        let fresh = DataDir::new(open.join("fresh"));
+        let refused = fresh.create().unwrap_err();
+        assert!(matches!(&refused, AccountError::Insecure { why } if why.contains("no sticky bit")), "{refused}");
+        assert!(!open.join("fresh").exists(), "not even made");
+        mode(&open, 0o1777);
+        fresh.create().unwrap();
+        mode(&open, 0o777);
+        assert!(fresh.create().is_err());
+        mode(&open, 0o700);
     }
 }

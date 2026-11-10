@@ -35,7 +35,14 @@ async fn an_old_agent_is_too_old_for_blobs_of_any_size() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let dir = tempfile::tempdir().unwrap();
     let file = LocalApiFile { schema: craft_cloud_proto::local::LOCAL_API_SCHEMA, port, token: "t".into(), pid: 1 };
-    std::fs::write(dir.path().join(LOCAL_API_FILE), serde_json::to_vec(&file).unwrap()).unwrap();
+    let discovery = dir.path().join(LOCAL_API_FILE);
+    std::fs::write(&discovery, serde_json::to_vec(&file).unwrap()).unwrap();
+    // As the agent writes it: for its user alone (the client refuses a file others can read).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&discovery, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let path = dir.path().to_owned();
     let results = tokio::task::spawn_blocking(move || {
         let client = craft_cloud_app::Client::connect_in(&path).unwrap();
