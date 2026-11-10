@@ -12,6 +12,7 @@ async-trait.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 craft-cloud-proto.workspace = true
+futures-util.workspace = true
 object_store.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
