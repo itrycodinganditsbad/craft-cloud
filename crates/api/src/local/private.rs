@@ -160,7 +160,9 @@ mod unix {
     }
 }
 
-#[cfg(all(test, unix))]
+// Two attributes, not `cfg(all(test, unix))`: clippy's `allow-unwrap-in-tests` only recognises a plain `cfg(test)`.
+#[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
