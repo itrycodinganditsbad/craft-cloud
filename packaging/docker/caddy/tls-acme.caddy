@@ -1,0 +1,3 @@
+# A certificate from Caddy's default public issuers (Let's Encrypt, ZeroSSL). Nothing to configure.
+# HSTS only with a real certificate, so not in the internal mode.
+header Strict-Transport-Security "max-age=31536000"

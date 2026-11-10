@@ -270,6 +270,7 @@ mod tests {
             autostart: None,
             last_sync_ms: None,
             removed: false,
+            spaces: Vec::new(),
         };
         assert!(matches!(AgentState::from_status(&status), AgentState::SignedIn { paused: true, ref server, .. } if server == "cloud.example.com"));
     }
