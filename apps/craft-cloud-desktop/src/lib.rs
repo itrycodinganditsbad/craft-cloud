@@ -2,18 +2,27 @@
 //! another computer, pauses and quits. It never syncs or touches the synced files itself: all of that is the agent's
 //! (`craft-cloud-agent run`), which it reaches through `craft-cloud-app` and starts when none answers.
 //!
-//! - [`model`]: the state and every way between its screens, pure (unit-tested against a fake agent).
+//! - [`model`]: the state and every way between its screens, pure (unit-tested against a fake agent); [`admin`]: the
+//!   admin pages' part of it.
+//! - [`security`]: the Security page and the code a join asks for (two-factor sign-in).
 //! - [`agent`]: the agent's calls behind a trait, run off the UI thread.
 //! - [`start_agent`]: starting the agent from this app's folder.
 //! - [`single_instance`]: one app per user; a second start brings the first window forward.
 //! - [`ui`]: the window, a view of the model; [`app`]: the app on eframe.
 //! - [`tray`]: the tray icon where there is one; [`autostart`]: the app's own start-at-login entry.
+//!
+//! The app bundles font data (Archivo, Inter and Geist Mono, `assets/fonts/`) under the SIL Open Font License 1.1,
+//! unmodified; the texts sit beside the files and go in the package's `LICENSES.txt`.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod admin;
 pub mod agent;
 pub mod app;
+pub mod audit;
 pub mod autostart;
 pub mod model;
+pub mod names;
+pub mod security;
 pub mod single_instance;
 pub mod start_agent;
 pub mod tray;

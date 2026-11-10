@@ -7,9 +7,19 @@
 
 use std::path::Path;
 
-use craft_cloud_app::{DeviceId, DeviceInfo, Error, JoinRequest, PairingInfo, PairingState, PairingStatus, RunState, Status, Uuid, codes};
+use craft_cloud_app::{
+    AccountUsage, AuditEvent, AuditPage, DeviceId, DeviceInfo, Error, HistoryResponse, JoinRequest, LoginRequest, NodeId, PairingInfo, PairingState,
+    PairingStatus, RestoreResponse, RunState, SecondFactorLoginRequest, Status, TrashResponse, TrashRestoreResponse, UserQuery, Uuid, VersionId,
+    codes,
+};
+use craft_cloud_proto::api::AdminConfirm;
 use craft_cloud_proto::api::codes as api_codes;
 use craft_cloud_proto::join::JoinString;
+
+use crate::admin::{Access, Action, AdminEvent, AdminScreen};
+use crate::audit::{ActivityScreen, AuditMsg};
+use crate::names::Names;
+use crate::security::{SecondFactorForm, SecurityAnswer, SecurityCall, SecurityEvent, SecurityPage, Step as SecurityStep};
 
 /// A code that is wrong, expired or used (the server never says which).
 pub const INVALID_CODE: &str = "This code doesn't work any more. Make a new one on a signed-in computer.";
@@ -21,6 +31,16 @@ pub const STOPPED: &str = "Craft Cloud's background service stopped";
 pub const REMOVED: &str = "This computer was removed from your cloud — Join again";
 /// Start at login couldn't be turned on after a join (the join stands).
 pub const NO_SYNC_AFTER_RESTART: &str = "This computer won't sync after a restart: starting at login couldn't be turned on";
+/// A sign-in needs its fields.
+pub const SERVER_EMPTY: &str = "Type the server's address";
+pub const USER_EMPTY: &str = "Type your user name";
+pub const SIGN_IN_PASSWORD_EMPTY: &str = "Type your password";
+/// The password of a sign-in is not kept: after "this folder has files in it" it is typed again.
+pub const PASSWORD_AGAIN: &str = "Type your password again to sync the folder's files";
+/// The server's answer to a password carried no challenge.
+pub const NO_CHALLENGE: &str = "The server didn't ask for a code the way it should. Try signing in again.";
+/// The challenge of a sign-in ran out.
+pub const CHALLENGE_EXPIRED: &str = "This sign-in can't go on any more (it took too long or had too many wrong codes). Sign in again.";
 /// The two new passwords differ.
 pub const PASSWORDS_DIFFER: &str = "The two passwords aren't the same";
 /// No new password was typed.
@@ -48,10 +68,22 @@ pub enum Screen {
     Joining { form: JoinForm, password: Option<PasswordForm> },
     /// An invite to a new account: its password, twice.
     PasswordNeeded(PasswordForm),
+    /// The account has two-factor sign-in: the join asks for the code ([`SecondFactorForm`]).
+    SecondFactor(SecondFactorForm),
     /// Signed in: the account, the sync, the computers.
     SignedIn(Overview),
+    /// The Security page ([`SecurityPage`]): two-factor sign-in, the password, the other computers. Boxed: it is large.
+    Security(Box<SecurityPage>),
+    /// File version history for a path inside the sync root.
+    Versions(Versions),
+    /// Deleted files and folders awaiting retention expiry.
+    Trash(Trash),
     /// Showing an add-a-computer code.
     AddingComputer(Adding),
+    /// The admin pages (an admin's only): the users, one user, a new account, the audit log.
+    Admin(Box<AdminScreen>),
+    /// The signed-in account's own activity: its security events ([`crate::audit`]).
+    Activity(Box<ActivityScreen>),
     /// The server refused this computer: it was removed from the account.
     Removed,
     /// Something the agent can't put right by itself (a damaged account file), or that this app can't work with.
@@ -78,11 +110,75 @@ pub enum ProblemAction {
     None,
 }
 
+/// How the first-start screen joins: with the account's name and password, or with a join string.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum JoinMode {
+    /// Server, user name and password (and the second factor when the account has one).
+    #[default]
+    SignIn,
+    /// An invite, or the code of a computer that is signed in.
+    JoinString,
+}
+
+/// The page of the first start's form: one of the three steps of the rail.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum JoinStep {
+    /// 01: the server's address (a sign-in; a join string names its server itself).
+    #[default]
+    Server,
+    /// 02: user name and password, or the join string.
+    Account,
+    /// 03: the folder and this computer's name; its Continue signs in or joins.
+    Folder,
+}
+
+impl JoinStep {
+    /// Where the step stands in the rail (0 to 2).
+    pub fn index(self) -> usize {
+        match self {
+            Self::Server => 0,
+            Self::Account => 1,
+            Self::Folder => 2,
+        }
+    }
+
+    fn next(self) -> Option<Self> {
+        match self {
+            Self::Server => Some(Self::Account),
+            Self::Account => Some(Self::Folder),
+            Self::Folder => None,
+        }
+    }
+
+    fn prev(self) -> Option<Self> {
+        match self {
+            Self::Server => None,
+            Self::Account => Some(Self::Server),
+            Self::Folder => Some(Self::Account),
+        }
+    }
+}
+
 /// The join form, as typed.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct JoinForm {
+    /// The page being shown. The sign-in or join is made from the last one; a problem with an earlier step's field puts
+    /// the form back on that step.
+    pub step: JoinStep,
+    pub mode: JoinMode,
     /// The join string (or the link) as typed or pasted.
     pub join: String,
+    /// Sign-in: the server's address as typed (`https://` is assumed when it has no scheme).
+    pub server: String,
+    /// Sign-in: the account's user name.
+    pub user: String,
+    /// Sign-in: the account's password. Only held while it is typed: it is taken out of the form when the request is
+    /// made, and cleared when the mode changes.
+    pub password: String,
+    /// Sign-in: the server's challenge between the password and the second factor, kept while the code is asked for.
+    pub challenge: Option<String>,
+    /// When the challenge ends (milliseconds since the Unix epoch, as the server said), while there is one.
+    pub challenge_expires_ms: i64,
     pub folder: String,
     pub device_name: String,
     /// What went wrong with the last try, for people.
@@ -94,6 +190,65 @@ pub struct JoinForm {
     pub adopt_for: Option<String>,
 }
 
+impl std::fmt::Debug for JoinForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinForm")
+            .field("step", &self.step)
+            .field("mode", &self.mode)
+            .field("join", &"<redacted>")
+            .field("server", &self.server)
+            .field("user", &self.user)
+            .field("password", &"<redacted>")
+            .field("challenge", &self.challenge.as_ref().map(|_| "<redacted>"))
+            .field("challenge_expires_ms", &self.challenge_expires_ms)
+            .field("folder", &self.folder)
+            .field("device_name", &self.device_name)
+            .field("error", &self.error)
+            .field("ask_adopt", &self.ask_adopt)
+            .field("adopt_for", &self.adopt_for)
+            .finish()
+    }
+}
+
+/// Whether `address` (`host[:port][/path]`, no scheme) names this computer.
+fn is_loopback_host(address: &str) -> bool {
+    let authority = address.split('/').next().unwrap_or_default();
+    let authority = authority.rsplit('@').next().unwrap_or_default();
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
+        || host.parse::<std::net::Ipv6Addr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Whether a challenge that ends at `expires_ms` lasts longer than a wait of `retry_after_secs` (unknown: yes).
+fn wait_fits(retry_after_secs: Option<u64>, expires_ms: i64, now_ms: i64) -> bool {
+    let left_ms = u64::try_from(expires_ms.saturating_sub(now_ms)).unwrap_or(0);
+    retry_after_secs.is_none_or(|secs| secs.saturating_mul(1000) < left_ms)
+}
+
+/// Where a step of the first start's rail stands: the steps are strictly in sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RailState {
+    /// Passed.
+    Done,
+    /// The one being asked for.
+    Current,
+    /// Still to come.
+    Later,
+}
+
+/// One step of the first start's rail: what is known of it so far.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RailStep {
+    pub title: &'static str,
+    /// What is known (or what the step is for, while it is not).
+    pub detail: String,
+    pub state: RailState,
+}
+
 impl JoinForm {
     fn new(defaults: &JoinDefaults) -> Self {
         Self { folder: defaults.folder.clone(), device_name: defaults.device_name.clone(), ..Self::default() }
@@ -102,15 +257,92 @@ impl JoinForm {
     /// The request for the agent: the join string as read (a link, spaces and lower case put right), the folder, the
     /// name (the agent's default when empty), and `adopt` if the user agreed to it for this folder.
     fn request(&self, password: Option<String>) -> JoinRequest {
+        let (folder, device_name, adopt) = self.destination();
+        JoinRequest { join: self.join.clone(), adopt, folder: Some(folder), device_name, password, totp_code: None, recovery_code: None }
+    }
+
+    /// [`JoinForm::request`] with the second factor of an account that has two-factor sign-in.
+    fn request_with_factor(&self, password: Option<String>, factor: (Option<String>, Option<String>)) -> JoinRequest {
+        JoinRequest { totp_code: factor.0, recovery_code: factor.1, ..self.request(password) }
+    }
+
+    /// The folder, the computer's name (`None`: the agent's default) and whether the user agreed to sync the folder's files.
+    fn destination(&self) -> (String, Option<String>, bool) {
         let folder = self.folder.trim().to_owned();
         let name = self.device_name.trim();
-        JoinRequest {
-            join: self.join.clone(),
-            adopt: self.adopt_for.as_deref() == Some(folder.as_str()),
-            folder: Some(folder),
-            device_name: (!name.is_empty()).then(|| name.to_owned()),
-            password,
+        let adopt = self.adopt_for.as_deref() == Some(folder.as_str());
+        (folder, (!name.is_empty()).then(|| name.to_owned()), adopt)
+    }
+
+    /// The server's address for the agent: as typed, with a scheme when it has none: `http://` for a server on this computer
+    /// (`localhost`, `127.x.x.x`, `[::1]`: the only ones the agent takes without TLS), `https://` for every other.
+    fn server_address(&self) -> String {
+        let typed = self.server.trim();
+        if typed.contains("://") {
+            typed.to_owned()
+        } else if is_loopback_host(typed) {
+            format!("http://{typed}")
+        } else {
+            format!("https://{typed}")
         }
+    }
+
+    /// The first step of a sign-in; `password` is the one typed (taken out of the form by the caller).
+    fn login_request(&self, password: String) -> LoginRequest {
+        let (folder, device_name, adopt) = self.destination();
+        LoginRequest { server: self.server_address(), user: self.user.trim().to_owned(), password, folder: Some(folder), device_name, adopt }
+    }
+
+    /// The second step of a sign-in, with the code; `None` without a challenge.
+    fn second_step_request(&self, factor: (Option<String>, Option<String>)) -> Option<SecondFactorLoginRequest> {
+        let (folder, device_name, adopt) = self.destination();
+        Some(SecondFactorLoginRequest {
+            server: self.server_address(),
+            user: self.user.trim().to_owned(),
+            folder: Some(folder),
+            device_name,
+            adopt,
+            challenge: self.challenge.clone()?,
+            totp_code: factor.0,
+            recovery_code: factor.1,
+        })
+    }
+
+    /// The rail with the form's own step current.
+    pub fn rail(&self) -> [RailStep; 3] {
+        self.rail_at(self.step.index())
+    }
+
+    /// The three steps of the first start with what is known of each; the steps before `current` are done, the ones after it
+    /// are to come, whatever was typed. No probe of the server is made, so the server is shown as typed (or as the join
+    /// string names it), never as "reachable".
+    pub fn rail_at(&self, current: usize) -> [RailStep; 3] {
+        let state = |n: usize| match n.cmp(&current) {
+            std::cmp::Ordering::Less => RailState::Done,
+            std::cmp::Ordering::Equal => RailState::Current,
+            std::cmp::Ordering::Greater => RailState::Later,
+        };
+        let parsed = JoinString::parse(&self.join).ok();
+        let (server, account) = match self.mode {
+            JoinMode::SignIn => {
+                let server = self.server.trim();
+                let user = self.user.trim();
+                ((!server.is_empty()).then(|| crate::ui::host(server).to_owned()), (!user.is_empty()).then(|| user.to_owned()))
+            }
+            JoinMode::JoinString => {
+                (parsed.as_ref().map(|p| crate::ui::host(&p.server).to_owned()), parsed.as_ref().map(|_| "Join string".to_owned()))
+            }
+        };
+        let folder = self.folder.trim();
+        [
+            RailStep { title: "Server", state: state(0), detail: server.unwrap_or_else(|| "Where your Craft Cloud lives".into()) },
+            RailStep { title: "Account", state: state(1), detail: account.unwrap_or_else(|| "Sign in, or use a join string".into()) },
+            RailStep {
+                title: "Folder and name",
+                state: state(2),
+                detail: if folder.is_empty() { "Where your files live on this computer".into() } else { folder.to_owned() },
+            },
+        ]
     }
 }
 
@@ -129,24 +361,197 @@ impl std::fmt::Debug for PasswordForm {
     }
 }
 
+/// The pages of the signed-in window, as the header's tabs list them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Overview,
+    /// File version history ([`Screen::Versions`]).
+    Versions,
+    Trash,
+    /// The account's computers, in full ([`OverviewPage::Computers`]).
+    Computers,
+    Security,
+    /// The account's own activity ([`Screen::Activity`]).
+    Activity,
+    /// The admin pages; offered to an admin only.
+    Admin,
+}
+
+impl Tab {
+    /// The tab's name in the header.
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::Overview => "Overview",
+            Tab::Versions => "Versions",
+            Tab::Trash => "Trash",
+            Tab::Computers => "Computers",
+            Tab::Security => "Security",
+            Tab::Activity => "Activity",
+            Tab::Admin => "Admin",
+        }
+    }
+}
+
+/// What [`Screen::SignedIn`] shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OverviewPage {
+    /// The sync, the storage and a short list of the computers.
+    #[default]
+    Home,
+    /// All the computers, with Remove and Add a computer.
+    Computers,
+}
+
 /// The signed-in view.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Overview {
+    /// Which page of the signed-in view is shown.
+    pub page: OverviewPage,
     pub status: Status,
     /// The account's computers, once asked.
     pub devices: Option<Vec<DeviceInfo>>,
     pub devices_error: Option<String>,
+    pub usage: Option<AccountUsage>,
+    pub usage_loading: bool,
+    pub usage_error: Option<String>,
     /// The computer being removed.
     pub removing: Option<DeviceId>,
-    /// What went wrong with the last action (sign out, pause), for people.
+    /// What went wrong with the last action (pause), for people.
     pub error: Option<String>,
-    /// Signing out failed because the server can't be reached: offer to forget the account here only.
-    pub offer_local_sign_out: bool,
+    /// Whether the server lets this account use the admin pages (asked at sign-in).
+    pub access: Access,
+    /// Which sign-in this view is of: answers to the admin check made for another one are ignored.
+    pub session: u64,
+    /// The newest events of the account's activity, for the home page.
+    pub recent: Recent,
+}
+
+/// The home page's short list of the account's newest activity.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Recent {
+    /// Asked for, not answered yet.
+    Loading,
+    /// The newest events, newest first (at most [`RECENT_ACTIVITY`]).
+    Loaded(Vec<AuditEvent>),
+    /// The server couldn't tell.
+    Failed(String),
+}
+
+/// How many events the home page's recent activity shows.
+pub const RECENT_ACTIVITY: u32 = 5;
+
+/// File history and restore state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Versions {
+    pub path: String,
+    pub page: Option<HistoryResponse>,
+    pub current_version: Option<VersionId>,
+    pub loading: bool,
+    pub restoring: bool,
+    pub error: Option<String>,
+    pub notice: Option<String>,
+    pub confirm: Option<VersionId>,
+    pub ticket: u64,
+}
+
+/// Trash list and action state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Trash {
+    pub page: Option<TrashResponse>,
+    pub loading: bool,
+    pub action: Option<TrashAction>,
+    pub error: Option<String>,
+    pub notice: Option<String>,
+    pub confirm: Option<NodeId>,
+    pub ticket: u64,
+    /// Which kind of item the list shows (a filter of the loaded items; nothing is asked of the server).
+    pub kind: TrashKind,
+    /// What the name or the path of a shown item contains (any case).
+    pub search: String,
+}
+
+/// The trash list's kind filter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TrashKind {
+    #[default]
+    All,
+    Folders,
+    Files,
+}
+
+impl Trash {
+    /// A trash list, nothing loaded.
+    pub fn new() -> Self {
+        Self {
+            page: None,
+            loading: false,
+            action: None,
+            error: None,
+            notice: None,
+            confirm: None,
+            ticket: 0,
+            kind: TrashKind::All,
+            search: String::new(),
+        }
+    }
+
+    /// The loaded items that pass the kind filter and the search.
+    pub fn visible(&self) -> Vec<&craft_cloud_app::TrashItem> {
+        let needle = self.search.trim().to_lowercase();
+        self.page
+            .iter()
+            .flat_map(|p| p.items.iter())
+            .filter(|i| match self.kind {
+                TrashKind::All => true,
+                TrashKind::Folders => i.is_dir,
+                TrashKind::Files => !i.is_dir,
+            })
+            .filter(|i| {
+                needle.is_empty() || i.name.to_lowercase().contains(&needle) || i.path.as_deref().is_some_and(|p| p.to_lowercase().contains(&needle))
+            })
+            .collect()
+    }
+
+    /// How many loaded items there are: all, folders, files.
+    pub fn counts(&self) -> (usize, usize, usize) {
+        let items = self.page.as_ref().map_or(&[][..], |p| p.items.as_slice());
+        let folders = items.iter().filter(|i| i.is_dir).count();
+        (items.len(), folders, items.len() - folders)
+    }
+}
+
+impl Default for Trash {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TrashAction {
+    /// `parent_path` is `None` without a path hint and empty for an item whose hint is a file in the sync root.
+    Restore {
+        path: Option<String>,
+        parent_path: Option<String>,
+    },
+    Remove,
 }
 
 impl Overview {
     fn new(status: Status) -> Self {
-        Self { status, devices: None, devices_error: None, removing: None, error: None, offer_local_sign_out: false }
+        Self {
+            page: OverviewPage::Home,
+            status,
+            devices: None,
+            devices_error: None,
+            usage: None,
+            usage_loading: true,
+            usage_error: None,
+            removing: None,
+            error: None,
+            access: Access::Unknown,
+            session: crate::admin::fresh(),
+            recent: Recent::Loading,
+        }
     }
 }
 
@@ -197,10 +602,41 @@ pub enum Event {
     /// [`Effect::Status`]'s answer.
     Polled(Result<Status, Error>),
     Joined(Result<Status, Error>),
+    /// [`Effect::Login`]'s and [`Effect::LoginSecondFactor`]'s answer.
+    LoggedIn(Result<Status, Error>),
     AutostartSet(Result<Status, Error>),
     PairingMade(Result<PairingInfo, Error>),
     PairingPolled(Result<PairingStatus, Error>),
     Devices(Result<Vec<DeviceInfo>, Error>),
+    History {
+        ticket: u64,
+        result: Result<HistoryResponse, Error>,
+    },
+    Restored {
+        ticket: u64,
+        result: Result<RestoreResponse, Error>,
+    },
+    TrashPage {
+        ticket: u64,
+        result: Result<TrashResponse, Error>,
+    },
+    TrashRestored {
+        ticket: u64,
+        result: Result<TrashRestoreResponse, Error>,
+    },
+    TrashRemoved {
+        ticket: u64,
+        result: Result<(), Error>,
+    },
+    Usage {
+        request_id: u64,
+        result: Result<AccountUsage, Error>,
+    },
+    /// [`Effect::Recent`]'s answer: the newest events of the account's activity.
+    Recent {
+        session: u64,
+        result: Result<AuditPage, Error>,
+    },
     SignedOut(Result<Status, Error>),
     /// [`Effect::Pause`]'s or [`Effect::Resume`]'s answer.
     Answered(Result<Status, Error>),
@@ -209,19 +645,57 @@ pub enum Event {
     /// [`Effect::AppAutostart`]'s outcome.
     AppAutostartSet(Result<(), String>),
 
-    /// Join (the form's button, or Enter).
+    /// The Security button of the signed-in view.
+    OpenSecurity,
+    /// A button of the Security page.
+    Security(SecurityEvent),
+    /// An answer to one of the page's calls.
+    SecurityAnswer(SecurityAnswer),
+    /// The code of a join that asked for one (the button, or Enter).
+    SubmitSecondFactor,
+    /// Back from the code field to the join form.
+    CancelSecondFactor,
+    /// Join or sign in (the form's button, or Enter).
     SubmitJoin,
+    /// Continue (the button, or Enter) on a step of the first start: checks the step's fields and moves on; on the last step
+    /// it signs in or joins like [`Event::SubmitJoin`].
+    JoinNext,
+    /// Back (the button, or Esc) to the step before; nothing typed is lost.
+    JoinBack,
+    /// The form's switch between Sign in and Join string.
+    SetJoinMode(JoinMode),
     /// The answer to "this folder has files in it: sync them too?".
     SyncExistingFiles(bool),
     SubmitPassword,
     CancelPassword,
     OpenFolder,
+    OpenVersions,
+    OpenTrash,
+    VersionsPath(String),
+    LoadVersions,
+    NextVersions,
+    BackVersions,
+    ConfirmRestore(VersionId),
+    CancelRestore,
+    RestoreVersion,
+    LoadTrash,
+    /// The trash list's kind filter.
+    TrashKind(TrashKind),
+    /// The trash list's search field, as typed.
+    TrashSearch(String),
+    NextTrash,
+    BackTrash,
+    RestoreTrash(NodeId),
+    ConfirmRemoveTrash(NodeId),
+    CancelRemoveTrash,
+    RemoveTrash,
     AddComputer,
     /// Done or Cancel on the add-a-computer view.
     CloseAdding,
     RemoveDevice(DeviceId),
     /// Ask for the computer list again.
     RefreshDevices,
+    RefreshUsage,
     SignOut,
     /// Sign out on this computer only (the server can't be reached).
     SignOutHere,
@@ -246,6 +720,12 @@ pub enum Event {
     CloseRequested,
     /// Linux: the tray process quit Craft Cloud (it stopped the agent): the window ends too.
     Exit,
+    /// A tab of the header: leaves the page shown for that one.
+    Tab(Tab),
+    /// Something on the admin pages, or the answer to one of their calls ([`crate::admin`]).
+    Admin(AdminEvent),
+    /// Something on the audit pages (the admin's log, or the account's own activity), or an answer to one of their calls.
+    Audit(AuditMsg),
 }
 
 /// What to do.
@@ -255,13 +735,43 @@ pub enum Effect {
     Connect,
     /// Start the agent hidden from this app's folder and wait up to 5 s for it ([`Event::AgentStarted`]).
     StartAgent,
+    /// A call of the Security page ([`Event::SecurityAnswer`]).
+    Security(SecurityCall),
     Status,
     Join(JoinRequest),
+    /// The first step of a sign-in with a password ([`Event::LoggedIn`]).
+    Login(LoginRequest),
+    /// The second step of a sign-in, with the code ([`Event::LoggedIn`]).
+    LoginSecondFactor(SecondFactorLoginRequest),
     SetAutostart(bool),
     Pairing,
     PairingState(Uuid),
     CancelPairing(Uuid),
     Devices,
+    History {
+        path: String,
+        cursor: Option<String>,
+        ticket: u64,
+    },
+    Restore {
+        path: String,
+        version: VersionId,
+        expected_version: VersionId,
+        ticket: u64,
+    },
+    Trash {
+        cursor: Option<String>,
+        ticket: u64,
+    },
+    RestoreTrash {
+        id: NodeId,
+        ticket: u64,
+    },
+    RemoveTrash {
+        id: NodeId,
+        ticket: u64,
+    },
+    Usage(u64),
     RemoveDevice(DeviceId),
     Logout {
         local: bool,
@@ -279,6 +789,60 @@ pub enum Effect {
     QuitApp,
     /// Write (`true`) or remove the app's own start-at-login entry.
     AppAutostart(bool),
+    /// The signed-in account, as the server says it: how the app finds out whether it is an admin ([`AdminEvent::Account`]).
+    Account {
+        session: u64,
+    },
+    /// The newest events of the account's activity, for the home page ([`Event::Recent`]).
+    Recent {
+        session: u64,
+    },
+    /// The server's counters, for the admin pages ([`AdminEvent::Server`]).
+    AdminServer {
+        session: u64,
+    },
+    /// The server-wide storage overview for the admin pages.
+    AdminStorage {
+        session: u64,
+        ticket: u64,
+    },
+    /// A page of the user list ([`AdminEvent::Users`] with the same `ticket`).
+    AdminUsers {
+        query: UserQuery,
+        ticket: u64,
+    },
+    /// A user's devices ([`AdminEvent::Devices`]).
+    AdminDevices {
+        user: Uuid,
+        ticket: u64,
+    },
+    /// One account's effective quota and overlapping storage estimates.
+    AdminUserUsage {
+        user: Uuid,
+        ticket: u64,
+    },
+    /// A page of the audit log or of the account's own activity ([`AuditMsg::Page`] with the same `ticket`).
+    AuditPage {
+        own: bool,
+        query: craft_cloud_app::AuditQuery,
+        ticket: u64,
+    },
+    /// The audit export, written to `path` ([`AuditMsg::Exported`]).
+    AuditExport {
+        query: craft_cloud_app::AuditQuery,
+        path: String,
+        ticket: u64,
+    },
+    /// Ask for the file an export goes to, with the OS's save dialog, starting at this name ([`AuditMsg::ExportPicked`]).
+    PickExportFile {
+        suggested: String,
+        ticket: u64,
+    },
+    /// A change, with the admin's confirmation ([`AdminEvent::Done`]). Its `Debug` output hides the password.
+    AdminDo {
+        action: Action,
+        confirm: AdminConfirm,
+    },
 }
 
 /// Whether the app should start at login, in the tray, given the agent's status: while signed in with the agent
@@ -313,12 +877,24 @@ pub struct Model {
     pub log_path: String,
     /// A small note about the app itself (its own start-at-login entry couldn't be written).
     pub note: Option<String>,
+    /// What went wrong with the last Sign out, for people; shown on every page of the signed-in window.
+    pub sign_out_error: Option<String>,
+    /// Signing out failed because the server can't be reached: offer to forget the account here only.
+    pub offer_local_sign_out: bool,
+    /// The names of the computers and accounts the pages have met, for the IDs events and versions carry.
+    pub names: Names,
     defaults: JoinDefaults,
     polling: bool,
     polling_pairing: bool,
     failed_polls: u32,
     /// The app's start-at-login entry as last asked for.
     app_autostart: Option<bool>,
+    versions_ticket: u64,
+    trash_ticket: u64,
+    usage_request_id: u64,
+    /// What the last admin check said for the sign-in. The pages that don't carry the signed-in view (versions, trash)
+    /// read it for the header's Admin tab, and a view made when they are left starts with it.
+    pub(crate) access: Access,
 }
 
 impl Model {
@@ -334,11 +910,18 @@ impl Model {
             busy: None,
             log_path,
             note: None,
+            sign_out_error: None,
+            offer_local_sign_out: false,
             defaults,
             polling: false,
             polling_pairing: false,
             failed_polls: 0,
             app_autostart: None,
+            versions_ticket: 0,
+            trash_ticket: 0,
+            usage_request_id: 0,
+            access: Access::Unknown,
+            names: Names::default(),
         }
     }
 
@@ -346,15 +929,119 @@ impl Model {
     pub fn overview(&self) -> Option<&Overview> {
         match &self.screen {
             Screen::SignedIn(overview) => Some(overview),
+            Screen::Security(page) => Some(&page.overview),
             Screen::AddingComputer(adding) => Some(&adding.overview),
+            Screen::Admin(admin) => Some(&admin.overview),
+            Screen::Activity(activity) => Some(&activity.overview),
             _ => None,
         }
     }
 
-    fn overview_mut(&mut self) -> Option<&mut Overview> {
+    /// Leaves a page for a fresh overview, which asks again for everything it shows: the computers, the admin
+    /// check and the storage usage. Without the last two the view would wait for answers nobody asked for.
+    fn back_to_overview(&mut self) -> Vec<Effect> {
+        let Some(status) = self.status.clone().filter(|s| s.signed_in) else {
+            self.screen = Screen::Starting;
+            return Vec::new();
+        };
+        let mut overview = Overview::new(status);
+        // Asked again below; until it is answered the tabs keep what was known.
+        overview.access = self.access.clone();
+        let session = overview.session;
+        self.screen = Screen::SignedIn(overview);
+        vec![Effect::Devices, Effect::Account { session }, self.next_usage_request(), Effect::Recent { session }]
+    }
+
+    /// The first start's rail and the step current in it (0 to 2), on the screens of the first start. The code of a
+    /// two-factor sign-in and an invite's new password belong to the account step; the join in progress after them as well.
+    pub fn first_run_rail(&self) -> Option<(usize, [RailStep; 3])> {
+        let (form, current) = match &self.screen {
+            Screen::Join(form) => (form, form.step.index()),
+            Screen::Joining { form, password: None } => (form, form.step.index()),
+            Screen::Joining { form, password: Some(_) } => (form, JoinStep::Account.index()),
+            Screen::PasswordNeeded(pw) => (&pw.form, JoinStep::Account.index()),
+            Screen::SecondFactor(second) => (&second.form, JoinStep::Account.index()),
+            _ => return None,
+        };
+        Some((current, form.rail_at(current)))
+    }
+
+    /// The tab of the page shown, in the signed-in window.
+    pub fn tab(&self) -> Option<Tab> {
+        match &self.screen {
+            Screen::SignedIn(o) => Some(match o.page {
+                OverviewPage::Home => Tab::Overview,
+                OverviewPage::Computers => Tab::Computers,
+            }),
+            Screen::AddingComputer(_) => Some(Tab::Computers),
+            Screen::Versions(_) => Some(Tab::Versions),
+            Screen::Trash(_) => Some(Tab::Trash),
+            Screen::Security(_) => Some(Tab::Security),
+            Screen::Activity(_) => Some(Tab::Activity),
+            Screen::Admin(_) => Some(Tab::Admin),
+            _ => None,
+        }
+    }
+
+    /// The header's tabs: all the pages, the admin pages for an admin only.
+    pub fn tabs(&self) -> Vec<Tab> {
+        let all = [Tab::Overview, Tab::Versions, Tab::Trash, Tab::Computers, Tab::Security, Tab::Activity, Tab::Admin];
+        all.into_iter().filter(|t| *t != Tab::Admin || self.is_admin()).collect()
+    }
+
+    /// Whether the page shown can't be left by a tab now: a call of the security page is under way or it shows one-time
+    /// recovery codes, or the admin pages wait for a call's answer or show a one-time code. Leaving would drop what the
+    /// answer or the screen holds.
+    pub fn tabs_locked(&self) -> bool {
+        match &self.screen {
+            Screen::Security(page) => page.busy || matches!(page.step, SecurityStep::Codes { .. }),
+            Screen::Admin(admin) => admin.code.is_some() || admin.dialog.as_ref().is_some_and(|d| d.busy),
+            _ => false,
+        }
+    }
+
+    /// A tab of the header: the page shown is left as its own way back would (a computer code still waiting is
+    /// cancelled, what the security page showed dropped, the tickets of versions and trash answers moved on), then the
+    /// tab's page is opened as the button that opened it did.
+    fn open_tab(&mut self, tab: Tab) -> Vec<Effect> {
+        let Some(current) = self.tab() else { return Vec::new() };
+        if current == tab || self.tabs_locked() || (tab == Tab::Admin && !self.is_admin()) {
+            return Vec::new();
+        }
+        let mut effects = match &self.screen {
+            Screen::Versions(_) => self.update(Event::BackVersions),
+            Screen::Trash(_) => self.update(Event::BackTrash),
+            Screen::Security(_) => self.security(SecurityEvent::Close),
+            Screen::Activity(_) => self.audit(AuditMsg::CloseActivity),
+            Screen::Admin(_) => self.admin(AdminEvent::Close),
+            Screen::AddingComputer(_) => self.update(Event::CloseAdding),
+            _ => Vec::new(),
+        };
+        let Screen::SignedIn(overview) = &mut self.screen else { return effects };
+        overview.page = if tab == Tab::Computers { OverviewPage::Computers } else { OverviewPage::Home };
+        effects.extend(match tab {
+            Tab::Overview | Tab::Computers => Vec::new(),
+            Tab::Versions => self.update(Event::OpenVersions),
+            Tab::Trash => self.update(Event::OpenTrash),
+            Tab::Security => self.update(Event::OpenSecurity),
+            Tab::Activity => self.audit(AuditMsg::OpenActivity),
+            Tab::Admin => self.admin(AdminEvent::Open),
+        });
+        effects
+    }
+
+    fn next_usage_request(&mut self) -> Effect {
+        self.usage_request_id = self.usage_request_id.wrapping_add(1);
+        Effect::Usage(self.usage_request_id)
+    }
+
+    pub(crate) fn overview_mut(&mut self) -> Option<&mut Overview> {
         match &mut self.screen {
             Screen::SignedIn(overview) => Some(overview),
+            Screen::Security(page) => Some(&mut page.overview),
             Screen::AddingComputer(adding) => Some(&mut adding.overview),
+            Screen::Admin(admin) => Some(&mut admin.overview),
+            Screen::Activity(activity) => Some(&mut activity.overview),
             _ => None,
         }
     }
@@ -395,7 +1082,7 @@ impl Model {
                     }
                 }
             }
-            Event::Joined(result) => self.joined(result),
+            Event::Joined(result) | Event::LoggedIn(result) => self.joined(result),
             Event::AutostartSet(Ok(status)) => {
                 self.autostart_problem = (status.autostart == Some(false)).then(|| NO_SYNC_AFTER_RESTART.to_owned());
                 self.status_came(status)
@@ -420,6 +1107,9 @@ impl Model {
             }
             Event::PairingPolled(result) => self.pairing_polled(result),
             Event::Devices(result) => {
+                if let Ok(list) = &result {
+                    self.names.learn_computers(list);
+                }
                 if let Some(overview) = self.overview_mut() {
                     overview.removing = None;
                     match result {
@@ -428,6 +1118,151 @@ impl Model {
                             overview.devices_error = None;
                         }
                         Err(e) => overview.devices_error = Some(message(&e)),
+                    }
+                }
+                Vec::new()
+            }
+            Event::History { ticket, result } => {
+                let Screen::Versions(versions) = &mut self.screen else { return Vec::new() };
+                if versions.ticket != ticket {
+                    return Vec::new();
+                }
+                versions.loading = false;
+                match result {
+                    Ok(page) => {
+                        if versions.current_version.is_none() {
+                            versions.current_version = page.versions.first().map(|row| row.id);
+                        }
+                        versions.page = Some(page);
+                        versions.error = None;
+                    }
+                    Err(e) => versions.error = Some(message(&e)),
+                }
+                Vec::new()
+            }
+            Event::Restored { ticket, result } => {
+                let Screen::Versions(versions) = &mut self.screen else { return Vec::new() };
+                if versions.ticket != ticket {
+                    return Vec::new();
+                }
+                versions.restoring = false;
+                versions.confirm = None;
+                match result {
+                    Ok(_) => {
+                        versions.notice = Some("Version restored. Sync will update this file.".into());
+                        versions.current_version = None;
+                        self.request_history(None)
+                    }
+                    Err(Error::Refused { code, .. }) if code == api_codes::CONFLICT => {
+                        versions.notice = Some("The file changed meanwhile. Version list reloaded.".into());
+                        versions.current_version = None;
+                        self.request_history(None)
+                    }
+                    Err(Error::Refused { code, .. }) if code == api_codes::INVALID => {
+                        versions.error = Some("This file can't be restored: it may be a live document or deleted.".into());
+                        Vec::new()
+                    }
+                    Err(e) => {
+                        versions.error = Some(message(&e));
+                        Vec::new()
+                    }
+                }
+            }
+            Event::TrashPage { ticket, result } => {
+                let Screen::Trash(trash) = &mut self.screen else { return Vec::new() };
+                if trash.ticket != ticket {
+                    return Vec::new();
+                }
+                trash.loading = false;
+                match result {
+                    Ok(page) => {
+                        trash.page = Some(page);
+                        trash.error = None;
+                    }
+                    Err(e) => trash.error = Some(message(&e)),
+                }
+                Vec::new()
+            }
+            Event::TrashRestored { ticket, result } => {
+                let Screen::Trash(trash) = &mut self.screen else { return Vec::new() };
+                if trash.ticket != ticket {
+                    return Vec::new();
+                }
+                let prior = trash.action.take();
+                match result {
+                    Ok(response) => {
+                        let (path, parent_path) = prior
+                            .and_then(|action| match action {
+                                TrashAction::Restore { path, parent_path, .. } => Some((path, parent_path)),
+                                _ => None,
+                            })
+                            .unwrap_or((None, None));
+                        trash.notice = Some(if response.renamed {
+                            match parent_path {
+                                Some(parent) if parent.is_empty() => format!("Restored as {} in the sync folder.", response.name),
+                                Some(parent) => format!("Restored as {} in {}.", response.name, parent),
+                                None => format!("Restored as {}. The destination path is unavailable.", response.name),
+                            }
+                        } else {
+                            match path {
+                                Some(path) => format!("Restored to {}.", path),
+                                None => format!("Restored {}. The destination path is unavailable.", response.name),
+                            }
+                        });
+                        self.request_trash(None)
+                    }
+                    Err(Error::Refused { code, name_taken, .. }) if code == api_codes::CONFLICT => {
+                        trash.error = Some(if name_taken == Some(true) {
+                            "This item couldn't be restored because another item already has that name.".into()
+                        } else {
+                            "This item couldn't be restored because it conflicts with the current folder contents.".into()
+                        });
+                        Vec::new()
+                    }
+                    Err(e) => {
+                        trash.error = Some(message(&e));
+                        Vec::new()
+                    }
+                }
+            }
+            Event::TrashRemoved { ticket, result } => {
+                let Screen::Trash(trash) = &mut self.screen else { return Vec::new() };
+                if trash.ticket != ticket {
+                    return Vec::new();
+                }
+                trash.action = None;
+                match result {
+                    Ok(()) => {
+                        trash.notice = Some("Removed from trash. It can no longer be restored from the trash.".into());
+                        self.request_trash(None)
+                    }
+                    Err(e) => {
+                        trash.error = Some(message(&e));
+                        Vec::new()
+                    }
+                }
+            }
+            Event::Recent { session, result } => {
+                if let Some(overview) = self.overview_mut().filter(|o| o.session == session) {
+                    overview.recent = match result {
+                        Ok(page) => Recent::Loaded(page.events.into_iter().take(RECENT_ACTIVITY as usize).collect()),
+                        Err(e) => Recent::Failed(message(&e)),
+                    };
+                }
+                Vec::new()
+            }
+            Event::Usage { request_id, result } => {
+                if request_id != self.usage_request_id {
+                    return Vec::new();
+                }
+                if let Some(overview) = self.overview_mut() {
+                    overview.usage_loading = false;
+                    match result {
+                        Ok(usage) => {
+                            overview.usage = Some(usage);
+                            overview.usage_error = None;
+                        }
+                        Err(e) => overview.usage_error = Some(message(&e)),
                     }
                 }
                 Vec::new()
@@ -451,7 +1286,56 @@ impl Model {
                 Vec::new()
             }
 
+            Event::OpenSecurity => {
+                let Screen::SignedIn(overview) = &self.screen else { return Vec::new() };
+                let (page, calls) = SecurityPage::open(overview.clone());
+                self.screen = Screen::Security(Box::new(page));
+                calls.into_iter().map(Effect::Security).collect()
+            }
+            Event::Security(event) => self.security(event),
+            Event::SecurityAnswer(answer) => {
+                let now_ms = self.now_ms;
+                let Screen::Security(page) = &mut self.screen else { return Vec::new() };
+                page.answer(answer, now_ms).into_iter().map(Effect::Security).collect()
+            }
+            Event::SubmitSecondFactor => self.submit_second_factor(),
+            Event::CancelSecondFactor => {
+                if let Screen::SecondFactor(form) = &self.screen {
+                    self.screen = match &form.password {
+                        Some(pw) => Screen::PasswordNeeded(pw.clone()),
+                        None => {
+                            // A sign-in's password is not kept: it is typed again on the account step.
+                            let step = if form.form.mode == JoinMode::SignIn { JoinStep::Account } else { form.form.step };
+                            Screen::Join(JoinForm { challenge: None, password: String::new(), step, ..form.form.clone() })
+                        }
+                    };
+                }
+                Vec::new()
+            }
             Event::SubmitJoin => self.submit_join(),
+            Event::JoinNext => self.join_next(),
+            Event::JoinBack => {
+                if let Screen::Join(form) = &mut self.screen
+                    && let Some(step) = form.step.prev()
+                {
+                    form.step = step;
+                    form.error = None;
+                    form.ask_adopt = false;
+                }
+                Vec::new()
+            }
+            Event::SetJoinMode(mode) => {
+                if let Screen::Join(form) = &mut self.screen
+                    && form.mode != mode
+                {
+                    // The folder and the computer's name stay; what belonged to the other way does not.
+                    form.mode = mode;
+                    form.password.clear();
+                    form.error = None;
+                    form.ask_adopt = false;
+                }
+                Vec::new()
+            }
             Event::SyncExistingFiles(yes) => {
                 let Screen::Join(form) = &mut self.screen else { return Vec::new() };
                 form.ask_adopt = false;
@@ -459,6 +1343,12 @@ impl Model {
                     return Vec::new();
                 }
                 form.adopt_for = Some(form.folder.trim().to_owned());
+                if form.mode == JoinMode::SignIn && form.password.is_empty() {
+                    // The password went with the first try and is not kept.
+                    form.error = Some(PASSWORD_AGAIN.to_owned());
+                    form.step = JoinStep::Account;
+                    return Vec::new();
+                }
                 self.submit_join()
             }
             Event::SubmitPassword => self.submit_password(),
@@ -469,6 +1359,150 @@ impl Model {
                 Vec::new()
             }
             Event::OpenFolder => self.status.as_ref().and_then(|s| s.folder.clone()).map(Effect::OpenFolder).into_iter().collect(),
+            Event::OpenVersions => {
+                if !matches!(self.screen, Screen::SignedIn(_)) {
+                    return Vec::new();
+                }
+                self.screen = Screen::Versions(Versions {
+                    path: String::new(),
+                    page: None,
+                    current_version: None,
+                    loading: false,
+                    restoring: false,
+                    error: None,
+                    notice: None,
+                    confirm: None,
+                    ticket: 0,
+                });
+                Vec::new()
+            }
+            Event::OpenTrash => {
+                if !matches!(self.screen, Screen::SignedIn(_)) {
+                    return Vec::new();
+                }
+                self.screen = Screen::Trash(Trash::new());
+                self.request_trash(None)
+            }
+            Event::TrashKind(kind) => {
+                if let Screen::Trash(t) = &mut self.screen {
+                    t.kind = kind;
+                }
+                Vec::new()
+            }
+            Event::TrashSearch(search) => {
+                if let Screen::Trash(t) = &mut self.screen {
+                    t.search = search;
+                }
+                Vec::new()
+            }
+            Event::LoadTrash => self.request_trash(None),
+            Event::NextTrash => {
+                let cursor = match &self.screen {
+                    Screen::Trash(t) if t.action.is_none() && !t.loading => t.page.as_ref().and_then(|p| p.next.clone()),
+                    _ => None,
+                };
+                cursor.map(|cursor| self.request_trash(Some(cursor))).unwrap_or_default()
+            }
+            Event::BackTrash => {
+                if matches!(self.screen, Screen::Trash(_)) {
+                    self.trash_ticket = self.trash_ticket.saturating_add(1);
+                    return self.back_to_overview();
+                }
+                Vec::new()
+            }
+            Event::RestoreTrash(id) => {
+                let Screen::Trash(t) = &mut self.screen else { return Vec::new() };
+                if t.loading || t.action.is_some() {
+                    return Vec::new();
+                }
+                let Some(item) = t.page.as_ref().and_then(|p| p.items.iter().find(|item| item.id == id)) else { return Vec::new() };
+                let path = item.path.clone();
+                let parent_path = path.as_deref().map(|p| p.rsplit_once('/').map(|(parent, _)| parent.to_owned()).unwrap_or_default());
+                self.begin_trash_action(id, TrashAction::Restore { path, parent_path })
+            }
+            Event::ConfirmRemoveTrash(id) => {
+                if let Screen::Trash(t) = &mut self.screen
+                    && !t.loading
+                    && t.action.is_none()
+                    && t.page.as_ref().is_some_and(|p| p.items.iter().any(|i| i.id == id))
+                {
+                    t.confirm = Some(id);
+                }
+                Vec::new()
+            }
+            Event::CancelRemoveTrash => {
+                if let Screen::Trash(t) = &mut self.screen {
+                    t.confirm = None;
+                }
+                Vec::new()
+            }
+            Event::RemoveTrash => {
+                let Screen::Trash(t) = &mut self.screen else { return Vec::new() };
+                if t.loading || t.action.is_some() {
+                    return Vec::new();
+                }
+                let Some(id) = t.confirm.take() else { return Vec::new() };
+                self.begin_trash_action(id, TrashAction::Remove)
+            }
+            Event::VersionsPath(path) => {
+                if let Screen::Versions(v) = &mut self.screen {
+                    if v.path != path {
+                        self.versions_ticket = self.versions_ticket.saturating_add(1);
+                        v.ticket = self.versions_ticket;
+                        v.page = None;
+                        v.current_version = None;
+                        v.loading = false;
+                        v.restoring = false;
+                        v.confirm = None;
+                        v.notice = None;
+                    }
+                    v.path = path;
+                    v.error = None;
+                }
+                Vec::new()
+            }
+            Event::LoadVersions => {
+                if let Screen::Versions(v) = &mut self.screen {
+                    if v.restoring || v.loading {
+                        return Vec::new();
+                    }
+                    v.notice = None;
+                    v.current_version = None;
+                }
+                self.request_history(None)
+            }
+            Event::NextVersions => {
+                let cursor = match &self.screen {
+                    Screen::Versions(v) => v.page.as_ref().and_then(|p| p.next.clone()),
+                    _ => None,
+                };
+                cursor.map(|c| self.request_history(Some(c))).unwrap_or_default()
+            }
+            Event::BackVersions => {
+                if let Screen::Versions(_) = self.screen {
+                    self.versions_ticket = self.versions_ticket.saturating_add(1);
+                    return self.back_to_overview();
+                }
+                Vec::new()
+            }
+            Event::ConfirmRestore(version) => {
+                if let Screen::Versions(v) = &mut self.screen
+                    && !v.restoring
+                    && !v.loading
+                    && Some(version) != v.current_version
+                    && v.page.as_ref().is_some_and(|page| page.versions.iter().any(|row| row.id == version && !row.pruned))
+                {
+                    v.confirm = Some(version);
+                }
+                Vec::new()
+            }
+            Event::CancelRestore => {
+                if let Screen::Versions(v) = &mut self.screen {
+                    v.confirm = None;
+                }
+                Vec::new()
+            }
+            Event::RestoreVersion => self.restore_version(),
             Event::AddComputer => {
                 let Screen::SignedIn(overview) = &self.screen else { return Vec::new() };
                 self.screen = Screen::AddingComputer(Adding { overview: overview.clone(), info: None, state: AddState::Asking });
@@ -494,7 +1528,24 @@ impl Model {
                 overview.removing = Some(id);
                 vec![Effect::RemoveDevice(id)]
             }
-            Event::RefreshDevices => self.overview().map(|_| Effect::Devices).into_iter().collect(),
+            Event::RefreshDevices => {
+                let Some(overview) = self.overview() else { return Vec::new() };
+                // An admin check that couldn't be made at sign-in is made again.
+                let again = (overview.access == Access::Unknown).then_some(Effect::Account { session: overview.session });
+                std::iter::once(Effect::Devices).chain(again).collect()
+            }
+            Event::Tab(tab) => self.open_tab(tab),
+            Event::Admin(event) => self.admin(event),
+            Event::Audit(msg) => self.audit(msg),
+            Event::RefreshUsage => {
+                let Some(overview) = self.overview_mut() else { return Vec::new() };
+                if overview.usage_loading {
+                    return Vec::new();
+                }
+                overview.usage_loading = true;
+                overview.usage_error = None;
+                vec![self.next_usage_request()]
+            }
             Event::SignOut => self.sign_out(false),
             Event::SignOutHere => self.sign_out(true),
             Event::Pause | Event::Resume => {
@@ -506,7 +1557,7 @@ impl Model {
                 vec![if event == Event::Pause { Effect::Pause } else { Effect::Resume }]
             }
             Event::Quit => {
-                if self.busy == Some(Busy::Quitting) {
+                if self.busy == Some(Busy::Quitting) || self.tabs_locked() {
                     return Vec::new();
                 }
                 self.busy = Some(Busy::Quitting);
@@ -587,6 +1638,17 @@ impl Model {
 
     /// A status from the agent: the screen follows it, and the app's start-at-login entry follows the agent's.
     fn status_came(&mut self, status: Status) -> Vec<Effect> {
+        let account_changed =
+            self.overview().is_some_and(|overview| overview.status.account != status.account || overview.status.server != status.server);
+        if !status.signed_in {
+            self.usage_request_id = self.usage_request_id.wrapping_add(1);
+        }
+        // What the admin check said belongs to the account it was made for.
+        let other_account = self.status.as_ref().is_some_and(|old| old.account != status.account || old.server != status.server);
+        if !status.signed_in || other_account {
+            self.access = Access::Unknown;
+        }
+        let new_usage_request = (status.signed_in && account_changed).then(|| self.next_usage_request());
         let mut effects = Vec::new();
         self.status = Some(status.clone());
         if let Some(wanted) = app_autostart_wanted(&status, self.login_entry)
@@ -601,14 +1663,41 @@ impl Model {
         }
         if status.signed_in {
             match &mut self.screen {
-                Screen::SignedIn(overview) => overview.status = status,
-                Screen::AddingComputer(adding) => adding.overview.status = status,
+                Screen::SignedIn(overview) => {
+                    overview.status = status;
+                    if account_changed {
+                        overview.usage = None;
+                        overview.usage_loading = true;
+                        overview.usage_error = None;
+                    }
+                }
+                Screen::AddingComputer(adding) => {
+                    adding.overview.status = status;
+                    if account_changed {
+                        adding.overview.usage = None;
+                        adding.overview.usage_loading = true;
+                        adding.overview.usage_error = None;
+                    }
+                }
+                Screen::Security(page) => page.overview.status = status,
+                Screen::Admin(admin) => admin.overview.status = status,
+                Screen::Activity(activity) => activity.overview.status = status,
                 // The join's own answer moves on from there.
                 Screen::Joining { .. } => {}
+                Screen::Versions(_) | Screen::Trash(_) => {}
                 _ => {
-                    self.screen = Screen::SignedIn(Overview::new(status));
+                    let overview = Overview::new(status);
+                    let session = overview.session;
+                    self.screen = Screen::SignedIn(overview);
                     effects.push(Effect::Devices);
+                    // Whether the account is an admin, for the admin pages.
+                    effects.push(Effect::Account { session });
+                    effects.push(self.next_usage_request());
+                    effects.push(Effect::Recent { session });
                 }
+            }
+            if let Some(effect) = new_usage_request {
+                effects.push(effect);
             }
             return effects;
         }
@@ -619,7 +1708,7 @@ impl Model {
                     self.screen = Screen::Error(problem);
                 }
             }
-            (_, Screen::Join(_) | Screen::Joining { .. } | Screen::PasswordNeeded(_)) => {}
+            (_, Screen::Join(_) | Screen::Joining { .. } | Screen::PasswordNeeded(_) | Screen::SecondFactor(_)) => {}
             _ => self.screen = Screen::Join(JoinForm::new(&self.defaults)),
         }
         effects
@@ -650,7 +1739,7 @@ impl Model {
                 self.version_problem(*v);
                 return;
             }
-            Error::Refused { .. } => false,
+            Error::Refused { .. } | Error::RefusedWith { .. } => false,
         };
         if !gone || matches!(self.screen, Screen::Starting | Screen::NotRunning(_)) || self.busy == Some(Busy::Quitting) {
             return;
@@ -659,23 +1748,126 @@ impl Model {
         self.screen = Screen::NotRunning(self.not_running(STOPPED, &e.to_string()));
     }
 
+    /// Continue on the step the form shows: its fields are checked (with the messages of the whole form), then the next step
+    /// is shown; the last step signs in or joins.
+    fn join_next(&mut self) -> Vec<Effect> {
+        let Screen::Join(form) = &mut self.screen else { return Vec::new() };
+        form.error = None;
+        let problem = match form.step {
+            // A join string names its server itself.
+            JoinStep::Server if form.mode == JoinMode::SignIn && form.server.trim().is_empty() => Some(SERVER_EMPTY.to_owned()),
+            JoinStep::Account if form.mode == JoinMode::SignIn => {
+                if form.user.trim().is_empty() {
+                    Some(USER_EMPTY.to_owned())
+                } else if form.password.is_empty() {
+                    Some(SIGN_IN_PASSWORD_EMPTY.to_owned())
+                } else {
+                    None
+                }
+            }
+            JoinStep::Account => JoinString::parse(&form.join).err().map(|e| sentence(&e.to_string())),
+            _ => None,
+        };
+        if problem.is_some() {
+            form.error = problem;
+            return Vec::new();
+        }
+        match form.step.next() {
+            Some(step) => {
+                form.step = step;
+                Vec::new()
+            }
+            None => self.submit_join(),
+        }
+    }
+
     fn submit_join(&mut self) -> Vec<Effect> {
         let Screen::Join(form) = &mut self.screen else { return Vec::new() };
         form.error = None;
+        if form.mode == JoinMode::SignIn {
+            return self.submit_sign_in();
+        }
         match JoinString::parse(&form.join) {
             Ok(parsed) => form.join = parsed.join(),
             Err(e) => {
                 form.error = Some(sentence(&e.to_string()));
+                form.step = JoinStep::Account;
                 return Vec::new();
             }
         }
         if !Path::new(form.folder.trim()).is_absolute() {
             form.error = Some(FOLDER_NOT_ABSOLUTE.to_owned());
+            form.step = JoinStep::Folder;
             return Vec::new();
         }
         let request = form.request(None);
         self.screen = Screen::Joining { form: form.clone(), password: None };
         vec![Effect::Join(request)]
+    }
+
+    /// The password sign-in: the fields are checked, then the password leaves the form with the request.
+    fn submit_sign_in(&mut self) -> Vec<Effect> {
+        let Screen::Join(form) = &mut self.screen else { return Vec::new() };
+        // The message, and the step that has the field it is about.
+        let problem = if form.server.trim().is_empty() {
+            Some((SERVER_EMPTY, JoinStep::Server))
+        } else if form.user.trim().is_empty() {
+            Some((USER_EMPTY, JoinStep::Account))
+        } else if form.password.is_empty() {
+            Some((SIGN_IN_PASSWORD_EMPTY, JoinStep::Account))
+        } else if !Path::new(form.folder.trim()).is_absolute() {
+            Some((FOLDER_NOT_ABSOLUTE, JoinStep::Folder))
+        } else {
+            None
+        };
+        if let Some((problem, step)) = problem {
+            form.error = Some(problem.to_owned());
+            form.step = step;
+            return Vec::new();
+        }
+        let password = std::mem::take(&mut form.password);
+        let request = form.login_request(password);
+        form.challenge = None;
+        self.screen = Screen::Joining { form: form.clone(), password: None };
+        vec![Effect::Login(request)]
+    }
+
+    /// The code of a join that asked for one: the same join, with the code, goes to the agent again.
+    fn submit_second_factor(&mut self) -> Vec<Effect> {
+        let Screen::SecondFactor(second) = &mut self.screen else { return Vec::new() };
+        let factor = match second.factor() {
+            Ok(factor) => factor,
+            Err(why) => {
+                second.error = Some(why);
+                return Vec::new();
+            }
+        };
+        if second.form.mode == JoinMode::SignIn {
+            // The password is not asked for again: the challenge stands for it.
+            let Some(request) = second.form.second_step_request(factor) else {
+                second.error = Some(NO_CHALLENGE.to_owned());
+                return Vec::new();
+            };
+            let form = second.form.clone();
+            self.screen = Screen::Joining { form, password: None };
+            return vec![Effect::LoginSecondFactor(request)];
+        }
+        let request = second.form.request_with_factor(second.password.as_ref().map(|pw| pw.password.clone()), factor);
+        let (form, password) = (second.form.clone(), second.password.clone());
+        self.screen = Screen::Joining { form, password };
+        vec![Effect::Join(request)]
+    }
+
+    /// A button of the Security page.
+    fn security(&mut self, event: SecurityEvent) -> Vec<Effect> {
+        let Screen::Security(page) = &mut self.screen else { return Vec::new() };
+        if event == SecurityEvent::Close {
+            // Whatever the page showed (a secret, recovery codes) goes with it.
+            let overview = page.overview.clone();
+            self.screen = Screen::SignedIn(overview);
+            return vec![Effect::Devices];
+        }
+        page.update(event).into_iter().map(Effect::Security).collect()
     }
 
     fn submit_password(&mut self) -> Vec<Effect> {
@@ -698,18 +1890,24 @@ impl Model {
     fn joined(&mut self, result: Result<Status, Error>) -> Vec<Effect> {
         let Screen::Joining { form, password } = &self.screen else { return Vec::new() };
         let (mut form, password) = (form.clone(), password.clone());
+        let signing_in = form.mode == JoinMode::SignIn;
+        // The challenge is kept only for a second step that is still asked for.
+        let challenge = form.challenge.take();
         let e = match result {
             Ok(status) => {
                 self.screen = Screen::SignedIn(Overview::new(status.clone()));
                 let mut effects = self.status_came(status);
                 // Start at login: the agent's entry (the app's follows it).
                 effects.extend([Effect::SetAutostart(true), Effect::Devices]);
+                effects.extend(self.overview().map(|o| Effect::Account { session: o.session }));
+                effects.extend(self.overview().map(|o| Effect::Recent { session: o.session }));
+                effects.push(self.next_usage_request());
                 return effects;
             }
             Err(e) => e,
         };
         let (code, text) = match &e {
-            Error::Refused { code, message } => (code.as_str(), message.clone()),
+            Error::Refused { code, message, .. } | Error::RefusedWith { code, message, .. } => (code.as_str(), message.clone()),
             Error::NotRunning(_) => {
                 self.status = None;
                 self.screen = Screen::NotRunning(self.not_running(STOPPED, &e.to_string()));
@@ -724,6 +1922,33 @@ impl Model {
             Screen::PasswordNeeded(pw)
         };
         self.screen = match (code, password) {
+            // A sign-in's password was right and the account has two-factor sign-in: the code goes with the challenge.
+            (codes::TWO_FACTOR_REQUIRED, _) if signing_in => match e.challenge() {
+                Some(c) => {
+                    form.challenge = Some(c.challenge.clone());
+                    form.challenge_expires_ms = c.expires_ms;
+                    Screen::SecondFactor(SecondFactorForm::new(form, None, None))
+                }
+                None => {
+                    form.error = Some(NO_CHALLENGE.to_owned());
+                    Screen::Join(form)
+                }
+            },
+            (codes::TWO_FACTOR_EXPIRED, _) if signing_in => {
+                form.error = Some(CHALLENGE_EXPIRED.to_owned());
+                Screen::Join(form)
+            }
+            // The account has two-factor sign-in: the same join goes again with its code (the invite was not used up).
+            (codes::TWO_FACTOR_REQUIRED, password) => Screen::SecondFactor(SecondFactorForm::new(form, password, None)),
+            // A lock outlasts the challenge: a sign-in starts over then, and says how long to wait.
+            (codes::TWO_FACTOR_LOCKED, _) if signing_in && !wait_fits(e.retry_after_secs(), form.challenge_expires_ms, self.now_ms) => {
+                form.error = Some(crate::security::explain(&e));
+                Screen::Join(form)
+            }
+            (codes::TWO_FACTOR_INVALID | codes::TWO_FACTOR_LOCKED, password) => {
+                form.challenge = challenge;
+                Screen::SecondFactor(SecondFactorForm::new(form, password, Some(crate::security::explain(&e))))
+            }
             (codes::PASSWORD_REQUIRED, _) => {
                 Screen::PasswordNeeded(PasswordForm { form, password: String::new(), again: String::new(), error: None })
             }
@@ -742,11 +1967,33 @@ impl Model {
                 return vec![Effect::Status];
             }
             (_, Some(pw)) => back_to_password(pw, text),
+            // The agent says `offline` for anything that kept the server from answering, a busy server (429) included, and
+            // its message says which: a sign-in shows it. A second step goes on with its challenge while that lasts.
+            (codes::OFFLINE, None) if signing_in => {
+                let said = if text.trim().is_empty() { crate::security::explain(&e) } else { text };
+                if challenge.is_some() && form.challenge_expires_ms > self.now_ms {
+                    form.challenge = challenge;
+                    Screen::SecondFactor(SecondFactorForm::new(form, None, Some(said)))
+                } else {
+                    form.error = Some(said);
+                    Screen::Join(form)
+                }
+            }
             (_, None) => {
-                form.error = Some(text);
+                form.error = Some(if signing_in { crate::security::explain(&e) } else { text });
                 Screen::Join(form)
             }
         };
+        // What the problem is about is on the account step: a sign-in's password has to be typed again (it is not kept), and
+        // a join string that doesn't work is changed there. For the rest (the folder has files) the step stays.
+        if let Screen::Join(form) = &mut self.screen
+            && form.error.is_some()
+            && !form.ask_adopt
+            && form.step == JoinStep::Folder
+            && (form.mode == JoinMode::SignIn || form.error.as_deref() == Some(INVALID_CODE))
+        {
+            form.step = JoinStep::Account;
+        }
         Vec::new()
     }
 
@@ -775,14 +2022,86 @@ impl Model {
     }
 
     fn sign_out(&mut self, local: bool) -> Vec<Effect> {
-        if self.busy.is_some() {
+        // Signing out drops the page as a tab would: not while it holds a one-time code or waits for a call.
+        if self.busy.is_some() || self.tabs_locked() {
             return Vec::new();
         }
-        let Some(overview) = self.overview_mut() else { return Vec::new() };
-        overview.error = None;
-        overview.offer_local_sign_out = false;
+        // From every page of the signed-in window, the footer's Sign out included.
+        if self.tab().is_none() {
+            return Vec::new();
+        }
+        self.sign_out_error = None;
+        self.offer_local_sign_out = false;
         self.busy = Some(Busy::SigningOut);
         vec![Effect::Logout { local }]
+    }
+
+    fn request_history(&mut self, cursor: Option<String>) -> Vec<Effect> {
+        let Screen::Versions(versions) = &mut self.screen else { return Vec::new() };
+        if versions.restoring || versions.loading {
+            return Vec::new();
+        }
+        // The path is sent exactly as typed: a leading or trailing space can be part of a real file name.
+        let path = versions.path.as_str();
+        if path.is_empty()
+            || Path::new(path).is_absolute()
+            || Path::new(path)
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_)))
+        {
+            versions.error = Some("Enter a file path inside the sync folder.".into());
+            return Vec::new();
+        }
+        self.versions_ticket = self.versions_ticket.saturating_add(1);
+        versions.ticket = self.versions_ticket;
+        versions.loading = true;
+        versions.error = None;
+        vec![Effect::History { path: path.to_owned(), cursor, ticket: versions.ticket }]
+    }
+
+    fn request_trash(&mut self, cursor: Option<String>) -> Vec<Effect> {
+        let Screen::Trash(trash) = &mut self.screen else { return Vec::new() };
+        if trash.loading || trash.action.is_some() {
+            return Vec::new();
+        }
+        self.trash_ticket = self.trash_ticket.saturating_add(1);
+        trash.ticket = self.trash_ticket;
+        trash.loading = true;
+        trash.error = None;
+        vec![Effect::Trash { cursor, ticket: trash.ticket }]
+    }
+
+    fn begin_trash_action(&mut self, id: NodeId, action: TrashAction) -> Vec<Effect> {
+        let Screen::Trash(trash) = &mut self.screen else { return Vec::new() };
+        if trash.loading || trash.action.is_some() {
+            return Vec::new();
+        }
+        self.trash_ticket = self.trash_ticket.saturating_add(1);
+        trash.ticket = self.trash_ticket;
+        trash.error = None;
+        trash.action = Some(action);
+        match &trash.action {
+            Some(TrashAction::Restore { .. }) => vec![Effect::RestoreTrash { id, ticket: trash.ticket }],
+            Some(TrashAction::Remove) => vec![Effect::RemoveTrash { id, ticket: trash.ticket }],
+            None => Vec::new(),
+        }
+    }
+
+    fn restore_version(&mut self) -> Vec<Effect> {
+        let Screen::Versions(versions) = &mut self.screen else { return Vec::new() };
+        // A restore takes a new ticket, which would discard the answer of a page still loading and leave `loading` set.
+        if versions.restoring || versions.loading {
+            return Vec::new();
+        }
+        let Some(version) = versions.confirm else { return Vec::new() };
+        let Some(expected_version) = versions.current_version else {
+            versions.error = Some("Current version unavailable. Reload the version list.".into());
+            return Vec::new();
+        };
+        self.versions_ticket = self.versions_ticket.saturating_add(1);
+        versions.ticket = self.versions_ticket;
+        versions.restoring = true;
+        vec![Effect::Restore { path: versions.path.clone(), version, expected_version, ticket: versions.ticket }]
     }
 
     fn signed_out(&mut self, result: Result<Status, Error>) -> Vec<Effect> {
@@ -802,14 +2121,11 @@ impl Model {
             Err(e) => {
                 let offline = matches!(&e, Error::Refused { code, .. } if code == codes::OFFLINE);
                 let text = message(&e);
-                match &mut self.screen {
-                    Screen::SignedIn(overview) => {
-                        overview.error = Some(text);
-                        overview.offer_local_sign_out = offline;
-                    }
-                    Screen::AddingComputer(adding) => adding.overview.error = Some(text),
-                    Screen::Error(problem) => problem.details = format!("{}\n\nSigning out failed: {text}", problem.details),
-                    _ => {}
+                if let Screen::Error(problem) = &mut self.screen {
+                    problem.details = format!("{}\n\nSigning out failed: {text}", problem.details);
+                } else if self.tab().is_some() {
+                    self.sign_out_error = Some(text);
+                    self.offer_local_sign_out = offline;
                 }
                 Vec::new()
             }
@@ -820,7 +2136,7 @@ impl Model {
 /// An error's message, for people.
 fn message(e: &Error) -> String {
     match e {
-        Error::Refused { message, .. } => message.clone(),
+        Error::Refused { message, .. } | Error::RefusedWith { message, .. } => message.clone(),
         other => other.to_string(),
     }
 }
@@ -852,6 +2168,40 @@ pub(crate) mod tests {
         Model::new(defaults(), true, "/home/ana/.local/share/craft-cloud-agent/run.log".into())
     }
 
+    fn history_page() -> HistoryResponse {
+        HistoryResponse {
+            versions: vec![craft_cloud_app::HistoryVersion {
+                id: VersionId::generate(),
+                parent_version: None,
+                epoch: craft_cloud_proto::Epoch::generate(),
+                seq: 3,
+                size: 12,
+                mtime_ms: 0,
+                device: craft_cloud_app::DeviceId::generate(),
+                created_ms: 0,
+                save: false,
+                pruned: false,
+            }],
+            next: Some("opaque-cursor".into()),
+        }
+    }
+
+    fn trash_page() -> TrashResponse {
+        TrashResponse {
+            items: vec![craft_cloud_app::TrashItem {
+                id: NodeId::generate(),
+                parent: NodeId::generate(),
+                name: "painting.png".into(),
+                is_dir: false,
+                size: Some(42_000),
+                deleted_ms: 1_790_000_000_000,
+                purge_after_ms: 1_792_000_000_000,
+                path: Some("Projects/painting.png".into()),
+            }],
+            next: Some("trash-cursor".into()),
+        }
+    }
+
     pub(crate) fn status(signed_in: bool) -> Status {
         Status {
             api: 1,
@@ -868,8 +2218,527 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn versions_load_page_and_restore_with_ticket_guard() {
+        let mut m = model();
+        m.screen = Screen::SignedIn(Overview::new(status(true)));
+        m.update(Event::OpenVersions);
+        m.update(Event::VersionsPath("art/file.png".into()));
+        assert_eq!(m.update(Event::LoadVersions), vec![Effect::History { path: "art/file.png".into(), cursor: None, ticket: 2 }]);
+        assert!(m.update(Event::History { ticket: 1, result: Ok(history_page()) }).is_empty());
+        let mut page = history_page();
+        let current = page.versions[0].id;
+        let old = VersionId::generate();
+        page.versions.push(craft_cloud_app::HistoryVersion {
+            id: old,
+            parent_version: Some(current),
+            epoch: craft_cloud_proto::Epoch::generate(),
+            seq: 2,
+            size: 10,
+            mtime_ms: 0,
+            device: craft_cloud_app::DeviceId::generate(),
+            created_ms: 0,
+            save: false,
+            pruned: false,
+        });
+        assert!(m.update(Event::History { ticket: 2, result: Ok(page.clone()) }).is_empty());
+        assert_eq!(
+            m.update(Event::NextVersions),
+            vec![Effect::History { path: "art/file.png".into(), cursor: Some("opaque-cursor".into()), ticket: 3 }]
+        );
+        m.update(Event::History { ticket: 3, result: Ok(page.clone()) });
+        m.update(Event::ConfirmRestore(old));
+        assert_eq!(
+            m.update(Event::RestoreVersion),
+            vec![Effect::Restore { path: "art/file.png".into(), version: old, expected_version: current, ticket: 4 }]
+        );
+        assert!(m.update(Event::LoadVersions).is_empty());
+        assert!(m.update(Event::NextVersions).is_empty());
+        assert!(
+            m.update(Event::Restored {
+                ticket: 3,
+                result: Ok(craft_cloud_app::RestoreResponse {
+                    version: old,
+                    parent_version: current,
+                    seq: 5,
+                    epoch: craft_cloud_proto::Epoch::generate()
+                })
+            })
+            .is_empty()
+        );
+        assert!(
+            m.update(Event::Restored {
+                ticket: 4,
+                result: Err(Error::Refused { code: api_codes::CONFLICT.into(), message: "conflict".into(), name_taken: None })
+            })
+            .iter()
+            .any(|e| matches!(e, Effect::History { cursor: None, .. }))
+        );
+        let Screen::Versions(v) = &m.screen else { panic!("expected versions screen") };
+        assert_eq!(v.notice.as_deref(), Some("The file changed meanwhile. Version list reloaded."));
+    }
+
+    #[test]
+    fn trash_pages_restore_remove_confirmation_and_stale_tickets() {
+        let mut m = model();
+        m.screen = Screen::SignedIn(Overview::new(status(true)));
+        assert_eq!(m.update(Event::OpenTrash), vec![Effect::Trash { cursor: None, ticket: 1 }]);
+        let page = trash_page();
+        let id = page.items[0].id;
+        assert!(m.update(Event::TrashPage { ticket: 0, result: Ok(page.clone()) }).is_empty());
+        assert!(matches!(&m.screen, Screen::Trash(t) if t.loading && t.page.is_none()));
+        m.update(Event::TrashPage { ticket: 1, result: Ok(page.clone()) });
+        assert_eq!(m.update(Event::NextTrash), vec![Effect::Trash { cursor: Some("trash-cursor".into()), ticket: 2 }]);
+        assert!(m.update(Event::RestoreTrash(id)).is_empty()); // page load excludes actions
+        assert!(m.update(Event::ConfirmRemoveTrash(id)).is_empty());
+        assert!(m.update(Event::RemoveTrash).is_empty());
+        m.update(Event::TrashPage { ticket: 2, result: Ok(page.clone()) });
+        assert_eq!(m.update(Event::RestoreTrash(id)), vec![Effect::RestoreTrash { id, ticket: 3 }]);
+        assert!(m.update(Event::LoadTrash).is_empty()); // action excludes page loads
+        assert!(m.update(Event::TrashRestored { ticket: 2, result: Err(Error::Io("stale".into())) }).is_empty());
+        assert!(matches!(&m.screen, Screen::Trash(t) if t.action.is_some() && !t.loading));
+        let restored = TrashRestoreResponse {
+            node: id,
+            parent: page.items[0].parent,
+            name: "painting (1).png".into(),
+            renamed: true,
+            version: None,
+            seq: 2,
+            epoch: craft_cloud_proto::Epoch::generate(),
+        };
+        assert_eq!(m.update(Event::TrashRestored { ticket: 3, result: Ok(restored) }), vec![Effect::Trash { cursor: None, ticket: 4 }]);
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert_eq!(t.notice.as_deref(), Some("Restored as painting (1).png in Projects."));
+        m.update(Event::TrashPage { ticket: 4, result: Ok(page.clone()) });
+        assert!(m.update(Event::ConfirmRemoveTrash(id)).is_empty());
+        assert!(matches!(&m.screen, Screen::Trash(t) if t.confirm == Some(id)));
+        assert_eq!(m.update(Event::RemoveTrash), vec![Effect::RemoveTrash { id, ticket: 5 }]);
+        assert!(m.update(Event::LoadTrash).is_empty()); // removal excludes page loads too
+        assert!(m.update(Event::TrashRemoved { ticket: 4, result: Ok(()) }).is_empty());
+        assert_eq!(m.update(Event::TrashRemoved { ticket: 5, result: Ok(()) }), vec![Effect::Trash { cursor: None, ticket: 6 }]);
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert_eq!(t.notice.as_deref(), Some("Removed from trash. It can no longer be restored from the trash."));
+    }
+
+    #[test]
+    fn trash_restore_name_taken_is_clear_and_returns_to_idle_without_reload() {
+        let mut m = model();
+        let page = trash_page();
+        let id = page.items[0].id;
+        m.screen = Screen::Trash(Trash { page: Some(page), ticket: 0, ..Trash::new() });
+        assert!(m.update(Event::RemoveTrash).is_empty());
+        assert!(matches!(m.update(Event::RestoreTrash(id)).first(), Some(Effect::RestoreTrash { .. })));
+        let ticket = match &m.screen {
+            Screen::Trash(t) => t.ticket,
+            _ => 0,
+        };
+        assert!(
+            m.update(Event::TrashRestored {
+                ticket,
+                result: Err(Error::Refused { code: api_codes::CONFLICT.into(), message: "conflict".into(), name_taken: Some(true) })
+            })
+            .is_empty()
+        );
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert!(t.error.as_deref().unwrap_or_default().contains("another item already has that name"));
+        assert!(!t.loading);
+        assert!(t.action.is_none());
+    }
+
+    #[test]
+    fn trash_restore_without_path_does_not_invent_a_destination() {
+        let mut m = model();
+        let mut page = trash_page();
+        page.items[0].path = None;
+        let id = page.items[0].id;
+        m.screen = Screen::Trash(Trash { page: Some(page), ticket: 0, ..Trash::new() });
+        assert!(matches!(m.update(Event::RestoreTrash(id)).first(), Some(Effect::RestoreTrash { .. })));
+        let ticket = match &m.screen {
+            Screen::Trash(t) => t.ticket,
+            _ => 0,
+        };
+        assert_eq!(
+            m.update(Event::TrashRestored {
+                ticket,
+                result: Ok(TrashRestoreResponse {
+                    node: id,
+                    parent: NodeId::generate(),
+                    name: "painting.png".into(),
+                    renamed: false,
+                    version: None,
+                    seq: 1,
+                    epoch: craft_cloud_proto::Epoch::generate(),
+                })
+            }),
+            vec![Effect::Trash { cursor: None, ticket: ticket + 1 }]
+        );
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert_eq!(t.notice.as_deref(), Some("Restored painting.png. The destination path is unavailable."));
+    }
+
+    #[test]
+    fn other_trash_conflicts_are_generic_and_do_not_reload() {
+        let mut m = model();
+        let page = trash_page();
+        let id = page.items[0].id;
+        m.screen = Screen::Trash(Trash { page: Some(page), ticket: 0, ..Trash::new() });
+        assert!(matches!(m.update(Event::RestoreTrash(id)).first(), Some(Effect::RestoreTrash { .. })));
+        let ticket = match &m.screen {
+            Screen::Trash(t) => t.ticket,
+            _ => 0,
+        };
+        assert!(
+            m.update(Event::TrashRestored {
+                ticket,
+                result: Err(Error::Refused { code: api_codes::CONFLICT.into(), message: "conflict".into(), name_taken: Some(false) })
+            })
+            .is_empty()
+        );
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert!(t.error.as_deref().unwrap_or_default().contains("conflicts with the current folder contents"));
+        assert!(!t.loading);
+        assert!(t.action.is_none());
+    }
+
+    fn trash_restore_response(node: NodeId, name: &str, renamed: bool) -> TrashRestoreResponse {
+        TrashRestoreResponse {
+            node,
+            parent: NodeId::generate(),
+            name: name.into(),
+            renamed,
+            version: None,
+            seq: 1,
+            epoch: craft_cloud_proto::Epoch::generate(),
+        }
+    }
+
+    fn trash_ticket(m: &Model) -> u64 {
+        match &m.screen {
+            Screen::Trash(t) => t.ticket,
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn trash_restore_at_the_sync_root_says_so_even_when_renamed() {
+        let mut m = model();
+        let mut page = trash_page();
+        page.items[0].path = Some("painting.png".into());
+        let id = page.items[0].id;
+        m.screen = Screen::Trash(Trash { page: Some(page), ticket: 0, ..Trash::new() });
+        assert!(matches!(m.update(Event::RestoreTrash(id)).first(), Some(Effect::RestoreTrash { .. })));
+        let ticket = trash_ticket(&m);
+        m.update(Event::TrashRestored { ticket, result: Ok(trash_restore_response(id, "painting (1).png", true)) });
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert_eq!(t.notice.as_deref(), Some("Restored as painting (1).png in the sync folder."));
+    }
+
+    #[test]
+    fn trash_restore_renamed_without_path_keeps_the_unavailable_notice() {
+        let mut m = model();
+        let mut page = trash_page();
+        page.items[0].path = None;
+        let id = page.items[0].id;
+        m.screen = Screen::Trash(Trash { page: Some(page), ticket: 0, ..Trash::new() });
+        m.update(Event::RestoreTrash(id));
+        let ticket = trash_ticket(&m);
+        m.update(Event::TrashRestored { ticket, result: Ok(trash_restore_response(id, "painting (1).png", true)) });
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert_eq!(t.notice.as_deref(), Some("Restored as painting (1).png. The destination path is unavailable."));
+    }
+
+    #[test]
+    fn back_from_trash_or_versions_asks_again_for_usage_and_admin_access() {
+        for (open, back) in [(Event::OpenTrash, Event::BackTrash), (Event::OpenVersions, Event::BackVersions)] {
+            let mut m = model();
+            m.status = Some(status(true));
+            m.screen = Screen::SignedIn(Overview::new(status(true)));
+            m.update(open);
+            let effects = m.update(back);
+            let overview = m.overview().expect("back on the overview");
+            assert!(overview.usage_loading, "{effects:?}");
+            let session = overview.session;
+            assert!(effects.contains(&Effect::Devices), "{effects:?}");
+            assert!(effects.contains(&Effect::Account { session }), "{effects:?}");
+            let Some(&Effect::Usage(id)) = effects.iter().find(|e| matches!(e, Effect::Usage(_))) else { panic!("{effects:?}") };
+            let usage = craft_cloud_app::AccountUsage {
+                stored_bytes: 1,
+                quota_bytes: None,
+                trash_bytes: None,
+                history_bytes: None,
+                estimates: craft_cloud_app::UsageEstimates { index_complete: true, reason: None },
+            };
+            m.update(Event::Usage { request_id: id, result: Ok(usage) });
+            let overview = m.overview().unwrap();
+            assert!(!overview.usage_loading && overview.usage.is_some(), "the overview doesn't stay loading");
+        }
+    }
+
+    #[test]
+    fn trash_late_page_reply_after_back_and_reopen_is_dropped() {
+        let mut m = model();
+        m.status = Some(status(true));
+        m.screen = Screen::SignedIn(Overview::new(status(true)));
+        assert_eq!(m.update(Event::OpenTrash), vec![Effect::Trash { cursor: None, ticket: 1 }]);
+        m.update(Event::BackTrash);
+        assert!(matches!(m.screen, Screen::SignedIn(_)));
+        let reopened = m.update(Event::OpenTrash);
+        let Some(Effect::Trash { ticket: fresh, .. }) = reopened.first().cloned() else { panic!("{reopened:?}") };
+        assert_ne!(fresh, 1);
+        assert!(m.update(Event::TrashPage { ticket: 1, result: Ok(trash_page()) }).is_empty());
+        assert!(matches!(&m.screen, Screen::Trash(t) if t.loading && t.page.is_none()));
+        m.update(Event::TrashPage { ticket: fresh, result: Ok(trash_page()) });
+        assert!(matches!(&m.screen, Screen::Trash(t) if !t.loading && t.page.is_some() && t.error.is_none()));
+    }
+
+    #[test]
+    fn trash_late_action_reply_after_back_and_reopen_is_dropped() {
+        let mut m = model();
+        let page = trash_page();
+        let id = page.items[0].id;
+        m.status = Some(status(true));
+        m.screen = Screen::SignedIn(Overview::new(status(true)));
+        m.update(Event::OpenTrash);
+        m.update(Event::TrashPage { ticket: 1, result: Ok(page.clone()) });
+        assert_eq!(m.update(Event::RestoreTrash(id)), vec![Effect::RestoreTrash { id, ticket: 2 }]);
+        m.update(Event::BackTrash);
+        let reopened = m.update(Event::OpenTrash);
+        let Some(Effect::Trash { ticket: fresh, .. }) = reopened.first().cloned() else { panic!("{reopened:?}") };
+        assert!(m.update(Event::TrashRestored { ticket: 2, result: Ok(trash_restore_response(id, "painting.png", false)) }).is_empty());
+        assert!(m.update(Event::TrashRemoved { ticket: 2, result: Ok(()) }).is_empty());
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert!(t.loading && t.notice.is_none());
+        m.update(Event::TrashPage { ticket: fresh, result: Ok(page) });
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert!(!t.loading && t.action.is_none() && t.page.is_some() && t.error.is_none());
+        assert!(matches!(m.update(Event::RestoreTrash(id)).first(), Some(Effect::RestoreTrash { .. })));
+    }
+
+    #[test]
+    fn trash_remove_failure_shows_the_error_and_frees_the_buttons() {
+        let mut m = model();
+        let page = trash_page();
+        let id = page.items[0].id;
+        m.screen = Screen::Trash(Trash { page: Some(page), ticket: 0, ..Trash::new() });
+        m.update(Event::ConfirmRemoveTrash(id));
+        assert!(matches!(m.update(Event::RemoveTrash).first(), Some(Effect::RemoveTrash { .. })));
+        let ticket = trash_ticket(&m);
+        assert!(
+            m.update(Event::TrashRemoved {
+                ticket,
+                result: Err(Error::Refused { code: api_codes::INTERNAL.into(), message: "server broke".into(), name_taken: None })
+            })
+            .is_empty()
+        );
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert!(t.error.is_some());
+        assert!(t.action.is_none() && !t.loading && t.confirm.is_none());
+        assert!(t.page.is_some());
+        assert!(matches!(m.update(Event::RestoreTrash(id)).first(), Some(Effect::RestoreTrash { .. })));
+    }
+
+    #[test]
+    fn trash_failed_next_page_keeps_rows_clears_loading_and_can_retry() {
+        let mut m = model();
+        m.screen = Screen::SignedIn(Overview::new(status(true)));
+        m.update(Event::OpenTrash);
+        let page = trash_page();
+        m.update(Event::TrashPage { ticket: 1, result: Ok(page.clone()) });
+        assert_eq!(m.update(Event::NextTrash), vec![Effect::Trash { cursor: Some("trash-cursor".into()), ticket: 2 }]);
+        assert!(m.update(Event::TrashPage { ticket: 2, result: Err(Error::Io("offline".into())) }).is_empty());
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert!(t.error.is_some());
+        assert!(!t.loading);
+        assert_eq!(t.page.as_ref(), Some(&page));
+        assert_eq!(m.update(Event::NextTrash), vec![Effect::Trash { cursor: Some("trash-cursor".into()), ticket: 3 }]);
+        let Screen::Trash(t) = &m.screen else { panic!("expected trash screen") };
+        assert!(t.loading && t.error.is_none());
+    }
+
+    #[test]
+    fn versions_refuse_unsafe_paths_and_explain_invalid_restore() {
+        let mut m = model();
+        m.screen = Screen::Versions(Versions {
+            path: "../secret".into(),
+            page: None,
+            current_version: None,
+            loading: false,
+            restoring: false,
+            error: None,
+            notice: None,
+            confirm: None,
+            ticket: 0,
+        });
+        assert!(m.update(Event::LoadVersions).is_empty());
+        let Screen::Versions(v) = &m.screen else { panic!("expected versions screen") };
+        assert!(v.error.as_deref().unwrap_or_default().contains("inside the sync folder"));
+        let mut page = history_page();
+        let current_version = page.versions.first().map(|version| version.id);
+        let old_version = VersionId::generate();
+        if let Some(current) = current_version {
+            page.versions.push(craft_cloud_app::HistoryVersion {
+                id: old_version,
+                parent_version: Some(current),
+                epoch: craft_cloud_proto::Epoch::generate(),
+                seq: 2,
+                size: 10,
+                mtime_ms: 0,
+                device: craft_cloud_app::DeviceId::generate(),
+                created_ms: 0,
+                save: false,
+                pruned: false,
+            });
+        }
+        m.screen = Screen::Versions(Versions {
+            path: "file.txt".into(),
+            page: Some(page),
+            current_version,
+            loading: false,
+            restoring: false,
+            error: None,
+            notice: None,
+            confirm: Some(old_version),
+            ticket: 0,
+        });
+        let effect = m.update(Event::RestoreVersion);
+        let ticket = match effect.first() {
+            Some(Effect::Restore { ticket, .. }) => *ticket,
+            other => panic!("{other:?}"),
+        };
+        m.update(Event::Restored {
+            ticket,
+            result: Err(Error::Refused { code: api_codes::INVALID.into(), message: "invalid".into(), name_taken: None }),
+        });
+        let Screen::Versions(v) = &m.screen else { panic!("expected versions screen") };
+        assert!(v.error.as_deref().unwrap_or_default().contains("live document or deleted"));
+    }
+
+    #[test]
+    fn versions_path_change_discards_answers_for_previous_path() {
+        let mut m = model();
+        m.screen = Screen::Versions(Versions {
+            path: "old.txt".into(),
+            page: None,
+            current_version: None,
+            loading: false,
+            restoring: false,
+            error: None,
+            notice: None,
+            confirm: None,
+            ticket: 0,
+        });
+        assert_eq!(m.update(Event::LoadVersions), vec![Effect::History { path: "old.txt".into(), cursor: None, ticket: 1 }]);
+        m.update(Event::VersionsPath("new.txt".into()));
+        assert!(m.update(Event::History { ticket: 1, result: Ok(history_page()) }).is_empty());
+        let Screen::Versions(v) = &m.screen else { panic!("expected versions screen") };
+        assert_eq!(v.path, "new.txt");
+        assert!(v.page.is_none());
+        assert!(!v.loading);
+    }
+
+    /// A versions screen for `path` with two loaded versions, the older one awaiting restore confirmation.
+    fn versions_ready_to_restore(path: &str) -> (Model, VersionId, VersionId) {
+        let mut page = history_page();
+        let current = page.versions[0].id;
+        let old = VersionId::generate();
+        page.versions.push(craft_cloud_app::HistoryVersion {
+            id: old,
+            parent_version: Some(current),
+            epoch: craft_cloud_proto::Epoch::generate(),
+            seq: 2,
+            size: 10,
+            mtime_ms: 0,
+            device: craft_cloud_app::DeviceId::generate(),
+            created_ms: 0,
+            save: false,
+            pruned: false,
+        });
+        let mut m = model();
+        m.screen = Screen::Versions(Versions {
+            path: path.into(),
+            page: Some(page),
+            current_version: Some(current),
+            loading: false,
+            restoring: false,
+            error: None,
+            notice: None,
+            confirm: Some(old),
+            ticket: 0,
+        });
+        (m, current, old)
+    }
+
+    #[test]
+    fn versions_restore_is_refused_while_a_page_loads_and_never_sticks() {
+        let (mut m, current, old) = versions_ready_to_restore("file.txt");
+        let more = m.update(Event::NextVersions);
+        assert_eq!(more, vec![Effect::History { path: "file.txt".into(), cursor: Some("opaque-cursor".into()), ticket: 1 }]);
+        assert!(m.update(Event::RestoreVersion).is_empty(), "restore must not start while a page loads");
+        let Screen::Versions(v) = &m.screen else { panic!("expected versions screen") };
+        assert!(v.loading && !v.restoring);
+        assert_eq!(v.ticket, 1, "a refused restore must not take a ticket");
+        assert!(m.update(Event::History { ticket: 1, result: Ok(history_page()) }).is_empty());
+        let Screen::Versions(v) = &m.screen else { panic!("expected versions screen") };
+        assert!(!v.loading);
+        // Not stuck: the confirmation is still open and the restore now goes through.
+        assert_eq!(v.confirm, Some(old));
+        assert_eq!(
+            m.update(Event::RestoreVersion),
+            vec![Effect::Restore { path: "file.txt".into(), version: old, expected_version: current, ticket: 2 }]
+        );
+    }
+
+    #[test]
+    fn versions_page_request_during_restore_is_ignored_and_reload_follows() {
+        let (mut m, current, old) = versions_ready_to_restore("file.txt");
+        assert_eq!(
+            m.update(Event::RestoreVersion),
+            vec![Effect::Restore { path: "file.txt".into(), version: old, expected_version: current, ticket: 1 }]
+        );
+        assert!(m.update(Event::NextVersions).is_empty());
+        assert!(m.update(Event::LoadVersions).is_empty());
+        let Screen::Versions(v) = &m.screen else { panic!("expected versions screen") };
+        assert!(v.restoring && !v.loading);
+        let restored =
+            craft_cloud_app::RestoreResponse { version: old, parent_version: current, seq: 5, epoch: craft_cloud_proto::Epoch::generate() };
+        let effects = m.update(Event::Restored { ticket: 1, result: Ok(restored) });
+        assert_eq!(effects, vec![Effect::History { path: "file.txt".into(), cursor: None, ticket: 2 }]);
+        assert!(m.update(Event::History { ticket: 2, result: Ok(history_page()) }).is_empty());
+        let Screen::Versions(v) = &m.screen else { panic!("expected versions screen") };
+        assert!(!v.loading && !v.restoring);
+    }
+
+    #[test]
+    fn versions_send_the_path_exactly_as_typed() {
+        let (mut m, current, old) = versions_ready_to_restore(" Projects/file.txt ");
+        assert_eq!(
+            m.update(Event::RestoreVersion),
+            vec![Effect::Restore { path: " Projects/file.txt ".into(), version: old, expected_version: current, ticket: 1 }]
+        );
+        m.update(Event::Restored { ticket: 1, result: Err(refused(api_codes::CONFLICT, "conflict")) });
+        let Screen::Versions(v) = &m.screen else { panic!("expected versions screen") };
+        assert!(v.loading, "the conflict reload is under way");
+        let mut m = model();
+        m.screen = Screen::Versions(Versions {
+            path: " Projects/file.txt".into(),
+            page: None,
+            current_version: None,
+            loading: false,
+            restoring: false,
+            error: None,
+            notice: None,
+            confirm: None,
+            ticket: 0,
+        });
+        assert_eq!(m.update(Event::LoadVersions), vec![Effect::History { path: " Projects/file.txt".into(), cursor: None, ticket: 1 }]);
+        m.update(Event::VersionsPath("   ".into()));
+        assert_eq!(m.update(Event::LoadVersions), vec![Effect::History { path: "   ".into(), cursor: None, ticket: 3 }]);
+        m.update(Event::VersionsPath(String::new()));
+        assert!(m.update(Event::LoadVersions).is_empty());
+    }
+
     fn refused(code: &str, message: &str) -> Error {
-        Error::Refused { code: code.into(), message: message.into() }
+        Error::Refused { code: code.into(), message: message.into(), name_taken: None }
     }
 
     /// A model past the start, on the join form.
@@ -878,7 +2747,522 @@ pub(crate) mod tests {
         assert_eq!(m.update(Event::Start), vec![Effect::Connect]);
         m.update(Event::Found(Ok(status(false))));
         assert!(matches!(m.screen, Screen::Join(_)), "{:?}", m.screen);
+        // The tests below this one are about the join string; the sign-in has `on_sign_in_form`.
+        m.update(Event::SetJoinMode(JoinMode::JoinString));
         m
+    }
+
+    /// A model past the start, on the sign-in form (the first screen) with a server, a user name and a password typed.
+    fn on_sign_in_form() -> Model {
+        let mut m = model();
+        m.update(Event::Start);
+        m.update(Event::Found(Ok(status(false))));
+        let f = form(&mut m);
+        assert_eq!(f.mode, JoinMode::SignIn, "sign-in is the first choice");
+        f.server = "cloud.shadows.ch".into();
+        f.user = "fabio".into();
+        f.password = "correct horse battery".into();
+        m
+    }
+
+    fn login_request(effects: &[Effect]) -> LoginRequest {
+        match effects {
+            [Effect::Login(request)] => request.clone(),
+            other => panic!("no login: {other:?}"),
+        }
+    }
+
+    fn second_step(effects: &[Effect]) -> SecondFactorLoginRequest {
+        match effects {
+            [Effect::LoginSecondFactor(request)] => request.clone(),
+            other => panic!("no second step: {other:?}"),
+        }
+    }
+
+    fn two_factor_required() -> Error {
+        Error::RefusedWith {
+            code: codes::TWO_FACTOR_REQUIRED.into(),
+            message: "needs a code".into(),
+            two_factor: Some(craft_cloud_app::TwoFactorChallenge { challenge: "challenge-secret".into(), expires_ms: 5 }),
+            retry_after_secs: None,
+        }
+    }
+
+    #[test]
+    fn a_sign_in_sends_the_password_once_and_does_not_keep_it() {
+        let mut m = on_sign_in_form();
+        let request = login_request(&m.update(Event::SubmitJoin));
+        assert_eq!(
+            (request.server.as_str(), request.user.as_str(), request.password.as_str()),
+            ("https://cloud.shadows.ch", "fabio", "correct horse battery")
+        );
+        assert_eq!(request.folder.as_deref(), Some(defaults().folder.as_str()));
+        assert_eq!(request.device_name.as_deref(), Some("lptp1"));
+        assert!(!request.adopt);
+        let Screen::Joining { form: shown, password: None } = &m.screen else { panic!("{:?}", m.screen) };
+        assert!(shown.password.is_empty(), "the password left the form with the request");
+        assert!(!format!("{:?}", m.screen).contains("correct horse"));
+        // It can't be sent twice.
+        assert!(m.update(Event::SubmitJoin).is_empty());
+        // Signed in: the signed-in view, as a join does.
+        let effects = m.update(Event::LoggedIn(Ok(status(true))));
+        assert!(matches!(m.screen, Screen::SignedIn(_)), "{:?}", m.screen);
+        assert!(effects.contains(&Effect::SetAutostart(true)), "{effects:?}");
+    }
+
+    #[test]
+    fn a_sign_in_with_a_field_missing_says_so_and_keeps_what_was_typed() {
+        for (clear, said) in [("server", SERVER_EMPTY), ("user", USER_EMPTY), ("password", SIGN_IN_PASSWORD_EMPTY)] {
+            let mut m = on_sign_in_form();
+            let f = form(&mut m);
+            match clear {
+                "server" => f.server = "  ".into(),
+                "user" => f.user.clear(),
+                _ => f.password.clear(),
+            }
+            assert!(m.update(Event::SubmitJoin).is_empty());
+            assert_eq!(form(&mut m).error.as_deref(), Some(said));
+        }
+        let mut m = on_sign_in_form();
+        form(&mut m).folder = "relative/folder".into();
+        assert!(m.update(Event::SubmitJoin).is_empty());
+        let f = form(&mut m);
+        assert_eq!(f.error.as_deref(), Some(FOLDER_NOT_ABSOLUTE));
+        assert_eq!(f.password, "correct horse battery", "nothing was sent, so nothing was taken");
+        // A scheme the user typed stays.
+        let mut m = on_sign_in_form();
+        form(&mut m).server = " http://127.0.0.1:18080/ ".into();
+        assert_eq!(login_request(&m.update(Event::SubmitJoin)).server, "http://127.0.0.1:18080/");
+    }
+
+    #[test]
+    fn a_sign_in_with_two_factor_asks_for_the_code_and_then_signs_in() {
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        assert!(m.update(Event::LoggedIn(Err(two_factor_required()))).is_empty());
+        let Screen::SecondFactor(second) = &mut m.screen else { panic!("{:?}", m.screen) };
+        assert_eq!(second.form.challenge.as_deref(), Some("challenge-secret"));
+        assert!(second.form.password.is_empty() && second.password.is_none());
+        let shown = format!("{:?}", m.screen);
+        assert!(!shown.contains("challenge-secret") && !shown.contains("correct horse"), "{shown}");
+        let Screen::SecondFactor(second) = &mut m.screen else { panic!() };
+        // A code that is not six digits is said before anything is sent.
+        second.code = "12".into();
+        assert!(m.update(Event::SubmitSecondFactor).is_empty());
+        let Screen::SecondFactor(second) = &mut m.screen else { panic!() };
+        second.code = "654 321".into();
+        let request = second_step(&m.update(Event::SubmitSecondFactor));
+        assert_eq!(
+            (request.server.as_str(), request.user.as_str(), request.challenge.as_str()),
+            ("https://cloud.shadows.ch", "fabio", "challenge-secret")
+        );
+        assert_eq!((request.totp_code.as_deref(), request.recovery_code.as_deref()), (Some("654321"), None));
+        assert_eq!(request.folder.as_deref(), Some(defaults().folder.as_str()));
+        m.update(Event::LoggedIn(Ok(status(true))));
+        assert!(matches!(m.screen, Screen::SignedIn(_)), "{:?}", m.screen);
+    }
+
+    #[test]
+    fn a_wrong_code_keeps_the_challenge_for_the_next_try_and_a_recovery_code_works() {
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        m.update(Event::LoggedIn(Err(two_factor_required())));
+        let Screen::SecondFactor(second) = &mut m.screen else { panic!("{:?}", m.screen) };
+        second.code = "111111".into();
+        m.update(Event::SubmitSecondFactor);
+        m.update(Event::LoggedIn(Err(refused(codes::TWO_FACTOR_INVALID, "wrong"))));
+        let Screen::SecondFactor(second) = &mut m.screen else { panic!("{:?}", m.screen) };
+        assert!(second.error.as_deref().is_some_and(|e| e.contains("isn't right")), "{:?}", second.error);
+        assert!(second.code.is_empty());
+        assert_eq!(second.form.challenge.as_deref(), Some("challenge-secret"));
+        second.recovery = true;
+        second.code = "ABCD-EFGH-JKMN-PQRS".into();
+        let request = second_step(&m.update(Event::SubmitSecondFactor));
+        assert_eq!(request.challenge, "challenge-secret");
+        assert_eq!((request.recovery_code.as_deref(), request.totp_code.as_deref()), (Some("ABCD-EFGH-JKMN-PQRS"), None));
+    }
+
+    #[test]
+    fn a_locked_second_step_says_how_long_to_wait() {
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        m.update(Event::LoggedIn(Err(two_factor_required())));
+        let Screen::SecondFactor(second) = &mut m.screen else { panic!("{:?}", m.screen) };
+        second.code = "123456".into();
+        m.update(Event::SubmitSecondFactor);
+        let locked = |secs| Error::RefusedWith {
+            code: codes::TWO_FACTOR_LOCKED.into(),
+            message: "locked".into(),
+            two_factor: None,
+            retry_after_secs: Some(secs),
+        };
+        // The challenge (5 ms left here) ends before the lock does: back to the form, with the wait said, nothing kept.
+        m.update(Event::LoggedIn(Err(locked(840))));
+        let f = form(&mut m);
+        assert_eq!(f.error.as_deref(), Some("Too many wrong codes. Try again in 14 minutes."));
+        assert!(f.challenge.is_none() && f.password.is_empty());
+        // A wait that is over before the challenge is: the code field stays, with the wait.
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        let long_lived = Error::RefusedWith {
+            code: codes::TWO_FACTOR_REQUIRED.into(),
+            message: "needs a code".into(),
+            two_factor: Some(craft_cloud_app::TwoFactorChallenge { challenge: "challenge-secret".into(), expires_ms: 300_000 }),
+            retry_after_secs: None,
+        };
+        m.update(Event::LoggedIn(Err(long_lived)));
+        let Screen::SecondFactor(second) = &mut m.screen else { panic!("{:?}", m.screen) };
+        second.code = "123456".into();
+        m.update(Event::SubmitSecondFactor);
+        m.update(Event::LoggedIn(Err(locked(30))));
+        let Screen::SecondFactor(second) = &m.screen else { panic!("{:?}", m.screen) };
+        assert_eq!(second.error.as_deref(), Some("Too many wrong codes. Try again in 30 seconds."));
+        assert_eq!(second.form.challenge.as_deref(), Some("challenge-secret"));
+    }
+
+    #[test]
+    fn a_busy_server_during_the_second_step_keeps_the_challenge_while_it_lives() {
+        // The agent answers a server's 429 as `offline`; its message says what happened.
+        let busy = || refused("offline", "the server is busy: too many sign-in attempts");
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        m.update(Event::LoggedIn(Err(two_factor_required())));
+        m.now_ms = 1;
+        let Screen::SecondFactor(second) = &mut m.screen else { panic!("{:?}", m.screen) };
+        second.code = "123456".into();
+        m.update(Event::SubmitSecondFactor);
+        m.update(Event::LoggedIn(Err(busy())));
+        let Screen::SecondFactor(second) = &m.screen else { panic!("{:?}", m.screen) };
+        assert_eq!(second.error.as_deref(), Some("the server is busy: too many sign-in attempts"));
+        assert_eq!(second.form.challenge.as_deref(), Some("challenge-secret"));
+        // Past the challenge's end (5 ms): back to the form.
+        let Screen::SecondFactor(second) = &mut m.screen else { panic!() };
+        second.code = "123456".into();
+        m.update(Event::SubmitSecondFactor);
+        m.now_ms = 10;
+        m.update(Event::LoggedIn(Err(busy())));
+        let f = form(&mut m);
+        assert_eq!(f.error.as_deref(), Some("the server is busy: too many sign-in attempts"));
+        assert!(f.challenge.is_none());
+    }
+
+    #[test]
+    fn a_server_without_a_scheme_is_https_unless_it_is_this_computer() {
+        for (typed, sent) in [
+            ("cloud.shadows.ch", "https://cloud.shadows.ch"),
+            ("cloud.shadows.ch:8443/cloud", "https://cloud.shadows.ch:8443/cloud"),
+            ("localhost:18080", "http://localhost:18080"),
+            ("LOCALHOST", "http://LOCALHOST"),
+            ("127.0.0.1:18080", "http://127.0.0.1:18080"),
+            ("127.3.4.5", "http://127.3.4.5"),
+            ("[::1]:18080", "http://[::1]:18080"),
+            ("192.168.1.5:18080", "https://192.168.1.5:18080"),
+            ("localhost.example.com", "https://localhost.example.com"),
+            ("127.0.0.1.example.com", "https://127.0.0.1.example.com"),
+            ("http://nas.local:18080", "http://nas.local:18080"),
+        ] {
+            let mut m = on_sign_in_form();
+            form(&mut m).server = typed.into();
+            assert_eq!(login_request(&m.update(Event::SubmitJoin)).server, sent, "{typed}");
+        }
+    }
+
+    #[test]
+    fn an_expired_challenge_goes_back_to_the_form_without_a_password() {
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        m.update(Event::LoggedIn(Err(two_factor_required())));
+        let Screen::SecondFactor(second) = &mut m.screen else { panic!("{:?}", m.screen) };
+        second.code = "123456".into();
+        m.update(Event::SubmitSecondFactor);
+        m.update(Event::LoggedIn(Err(refused(codes::TWO_FACTOR_EXPIRED, "gone"))));
+        let f = form(&mut m);
+        assert_eq!(f.error.as_deref(), Some(CHALLENGE_EXPIRED));
+        assert!(f.challenge.is_none() && f.password.is_empty() && f.user == "fabio");
+    }
+
+    #[test]
+    fn a_challenge_missing_from_the_answer_is_said() {
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        m.update(Event::LoggedIn(Err(refused(codes::TWO_FACTOR_REQUIRED, "needs a code"))));
+        assert_eq!(form(&mut m).error.as_deref(), Some(NO_CHALLENGE));
+    }
+
+    #[test]
+    fn sign_in_refusals_are_explained_and_leave_no_password() {
+        let rate_limited = Error::RefusedWith { code: "rate_limited".into(), message: "m".into(), two_factor: None, retry_after_secs: Some(120) };
+        for (error, said) in [
+            (refused("wrong_password", "wrong user name or password"), "That password isn't right."),
+            (rate_limited, "Too many tries. Try again in 2 minutes."),
+            (refused("offline", "the server is busy: too many sign-in attempts"), "the server is busy: too many sign-in attempts"),
+        ] {
+            let mut m = on_sign_in_form();
+            m.update(Event::SubmitJoin);
+            m.update(Event::LoggedIn(Err(error)));
+            let f = form(&mut m);
+            assert_eq!(f.error.as_deref(), Some(said));
+            assert!(f.password.is_empty());
+            assert_eq!((f.server.as_str(), f.user.as_str()), ("cloud.shadows.ch", "fabio"), "what was typed stays");
+        }
+        // Said as the agent says it when there is no better text.
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        m.update(Event::LoggedIn(Err(refused("usage", "cloud.shadows.ch is not a URL"))));
+        assert_eq!(form(&mut m).error.as_deref(), Some("cloud.shadows.ch is not a URL"));
+    }
+
+    #[test]
+    fn a_sign_in_to_a_folder_with_files_asks_and_then_needs_the_password_again() {
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        m.update(Event::LoggedIn(Err(refused(codes::FOLDER_HAS_FILES, "has files"))));
+        let f = form(&mut m);
+        assert!(f.ask_adopt && f.password.is_empty());
+        // Sync them: the password is not kept, so it is asked for again, and then goes with `adopt`.
+        assert!(m.update(Event::SyncExistingFiles(true)).is_empty());
+        let f = form(&mut m);
+        assert_eq!(f.error.as_deref(), Some(PASSWORD_AGAIN));
+        assert!(!f.ask_adopt);
+        f.password = "correct horse battery".into();
+        let request = login_request(&m.update(Event::SubmitJoin));
+        assert!(request.adopt);
+        // Another folder is asked about again.
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        m.update(Event::LoggedIn(Err(refused(codes::FOLDER_HAS_FILES, "has files"))));
+        m.update(Event::SyncExistingFiles(false));
+        form(&mut m).password = "x".into();
+        assert!(!login_request(&m.update(Event::SubmitJoin)).adopt);
+    }
+
+    #[test]
+    fn going_back_from_the_code_drops_the_challenge() {
+        let mut m = on_sign_in_form();
+        m.update(Event::SubmitJoin);
+        m.update(Event::LoggedIn(Err(two_factor_required())));
+        m.update(Event::CancelSecondFactor);
+        let f = form(&mut m);
+        assert!(f.challenge.is_none() && f.password.is_empty());
+        assert_eq!((f.server.as_str(), f.user.as_str()), ("cloud.shadows.ch", "fabio"));
+    }
+
+    #[test]
+    fn switching_between_sign_in_and_join_string_keeps_the_folder_and_drops_the_password() {
+        let mut m = on_sign_in_form();
+        let f = form(&mut m);
+        f.folder = "/data/cloud".into();
+        f.device_name = "studio".into();
+        f.error = Some("old".into());
+        m.update(Event::SetJoinMode(JoinMode::JoinString));
+        let f = form(&mut m);
+        assert_eq!((f.mode, f.folder.as_str(), f.device_name.as_str()), (JoinMode::JoinString, "/data/cloud", "studio"));
+        assert!(f.password.is_empty() && f.error.is_none());
+        assert_eq!(f.user, "fabio", "the sign-in's other fields are kept for the way back");
+        m.update(Event::SetJoinMode(JoinMode::SignIn));
+        assert_eq!(form(&mut m).folder, "/data/cloud");
+        // Only on the form.
+        let mut m = signed_in();
+        assert!(m.update(Event::SetJoinMode(JoinMode::JoinString)).is_empty());
+    }
+
+    #[test]
+    fn the_rail_shows_what_is_known_and_never_a_probe() {
+        let mut m = on_sign_in_form();
+        let steps = form(&mut m).rail();
+        assert_eq!((steps[0].title, steps[0].detail.as_str()), ("Server", "cloud.shadows.ch"));
+        assert_eq!(steps[1].detail.as_str(), "fabio");
+        assert_eq!(steps[2].detail, defaults().folder);
+        let f = form(&mut m);
+        f.server.clear();
+        f.user.clear();
+        f.folder.clear();
+        let steps = f.rail();
+        assert_eq!(steps[0].detail, "Where your Craft Cloud lives");
+        assert_eq!(steps[2].detail, "Where your files live on this computer");
+        m.update(Event::SetJoinMode(JoinMode::JoinString));
+        form(&mut m).join = "https://cloud.shadows.ch/join/k7m4-q9tx".into();
+        let steps = form(&mut m).rail();
+        assert_eq!((steps[0].detail.as_str(), steps[1].detail.as_str()), ("cloud.shadows.ch", "Join string"));
+    }
+
+    fn states(m: &Model) -> Vec<RailState> {
+        let (_, rail) = m.first_run_rail().expect("a screen of the first start");
+        rail.iter().map(|s| s.state).collect()
+    }
+
+    const DONE: RailState = RailState::Done;
+    const NOW: RailState = RailState::Current;
+    const LATER: RailState = RailState::Later;
+
+    /// Continue on the sign-in form three times: the sign-in is sent.
+    fn signed_in_through_the_steps(m: &mut Model) {
+        for _ in 0..3 {
+            m.update(Event::JoinNext);
+        }
+    }
+
+    #[test]
+    fn the_steps_go_forward_one_page_at_a_time_and_the_rail_follows_in_sequence() {
+        let mut m = on_sign_in_form();
+        assert_eq!(form(&mut m).step, JoinStep::Server, "the first start begins at the server");
+        // Typed values never move the rail: only the step does.
+        assert_eq!(states(&m), [NOW, LATER, LATER]);
+        assert!(m.update(Event::JoinNext).is_empty());
+        assert_eq!((form(&mut m).step, form(&mut m).error.clone()), (JoinStep::Account, None));
+        assert_eq!(states(&m), [DONE, NOW, LATER]);
+        assert!(m.update(Event::JoinNext).is_empty());
+        assert_eq!(form(&mut m).step, JoinStep::Folder);
+        assert_eq!(states(&m), [DONE, DONE, NOW]);
+        // The last step's Continue signs in exactly as SubmitJoin does.
+        let request = login_request(&m.update(Event::JoinNext));
+        assert_eq!(
+            (request.server.as_str(), request.user.as_str(), request.password.as_str()),
+            ("https://cloud.shadows.ch", "fabio", "correct horse battery")
+        );
+        assert!(matches!(m.screen, Screen::Joining { .. }), "{:?}", m.screen);
+        // Nothing is sent twice, and a step button does nothing then.
+        assert!(m.update(Event::JoinNext).is_empty() && m.update(Event::JoinBack).is_empty());
+    }
+
+    #[test]
+    fn a_step_is_not_left_forward_with_its_field_missing() {
+        let mut m = on_sign_in_form();
+        form(&mut m).server = "  ".into();
+        assert!(m.update(Event::JoinNext).is_empty());
+        let f = form(&mut m);
+        assert_eq!((f.step, f.error.as_deref()), (JoinStep::Server, Some(SERVER_EMPTY)));
+        f.server = "cloud.shadows.ch".into();
+        m.update(Event::JoinNext);
+        assert_eq!((form(&mut m).step, form(&mut m).error.clone()), (JoinStep::Account, None), "the message goes with a fixed field");
+
+        form(&mut m).user.clear();
+        m.update(Event::JoinNext);
+        assert_eq!((form(&mut m).step, form(&mut m).error.as_deref()), (JoinStep::Account, Some(USER_EMPTY)));
+        let f = form(&mut m);
+        f.user = "fabio".into();
+        f.password.clear();
+        m.update(Event::JoinNext);
+        assert_eq!((form(&mut m).step, form(&mut m).error.as_deref()), (JoinStep::Account, Some(SIGN_IN_PASSWORD_EMPTY)));
+        assert_eq!(states(&m), [DONE, NOW, LATER], "an error keeps the current step current");
+
+        // The join string is read on the account step, with the message of the whole form.
+        let mut m = on_join_form();
+        form(&mut m).step = JoinStep::Account;
+        form(&mut m).join = "not a code".into();
+        m.update(Event::JoinNext);
+        assert_eq!(form(&mut m).step, JoinStep::Account);
+        assert!(form(&mut m).error.is_some());
+        form(&mut m).join = "cloud.shadows.ch/K7M4-Q9TX".into();
+        m.update(Event::JoinNext);
+        assert_eq!((form(&mut m).step, form(&mut m).error.clone()), (JoinStep::Folder, None));
+        // The last step checks the folder and stays.
+        form(&mut m).folder = "relative/folder".into();
+        assert!(m.update(Event::JoinNext).is_empty());
+        assert_eq!((form(&mut m).step, form(&mut m).error.as_deref()), (JoinStep::Folder, Some(FOLDER_NOT_ABSOLUTE)));
+        assert_eq!(states(&m), [DONE, DONE, NOW]);
+    }
+
+    #[test]
+    fn a_join_string_does_not_need_a_server_address_on_the_first_step() {
+        let mut m = on_join_form();
+        assert_eq!(form(&mut m).step, JoinStep::Server);
+        assert!(form(&mut m).server.is_empty());
+        m.update(Event::JoinNext);
+        assert_eq!((form(&mut m).step, form(&mut m).error.clone()), (JoinStep::Account, None));
+    }
+
+    #[test]
+    fn back_goes_to_the_step_before_and_keeps_what_was_typed() {
+        let mut m = on_sign_in_form();
+        m.update(Event::JoinNext);
+        m.update(Event::JoinNext);
+        form(&mut m).folder = "/data/cloud".into();
+        form(&mut m).device_name = "studio".into();
+        m.update(Event::JoinBack);
+        assert_eq!(form(&mut m).step, JoinStep::Account);
+        assert_eq!(states(&m), [DONE, NOW, LATER]);
+        let f = form(&mut m);
+        assert_eq!((f.password.as_str(), f.user.as_str(), f.server.as_str()), ("correct horse battery", "fabio", "cloud.shadows.ch"));
+        m.update(Event::JoinBack);
+        assert_eq!(form(&mut m).step, JoinStep::Server);
+        // There is nothing before the first step.
+        assert!(m.update(Event::JoinBack).is_empty());
+        assert_eq!(form(&mut m).step, JoinStep::Server);
+        m.update(Event::JoinNext);
+        m.update(Event::JoinNext);
+        let f = form(&mut m);
+        assert_eq!((f.folder.as_str(), f.device_name.as_str()), ("/data/cloud", "studio"));
+    }
+
+    #[test]
+    fn a_problem_puts_the_form_on_the_step_whose_field_it_is_about() {
+        // The password is gone after a try: a wrong one is typed again on the account step.
+        let mut m = on_sign_in_form();
+        signed_in_through_the_steps(&mut m);
+        m.update(Event::LoggedIn(Err(refused("wrong_password", "wrong user name or password"))));
+        let f = form(&mut m);
+        assert_eq!(f.step, JoinStep::Account);
+        assert!(f.error.is_some() && f.password.is_empty());
+        assert_eq!(states(&m), [DONE, NOW, LATER], "never every step done after an error");
+        // The folder has files: the question is on the folder step.
+        let mut m = on_sign_in_form();
+        signed_in_through_the_steps(&mut m);
+        m.update(Event::LoggedIn(Err(refused(codes::FOLDER_HAS_FILES, "has files"))));
+        let f = form(&mut m);
+        assert_eq!((f.step, f.ask_adopt), (JoinStep::Folder, true));
+        // Agreeing needs the password again (it is not kept): the account step.
+        m.update(Event::SyncExistingFiles(true));
+        let f = form(&mut m);
+        assert_eq!((f.step, f.error.as_deref()), (JoinStep::Account, Some(PASSWORD_AGAIN)));
+    }
+
+    #[test]
+    fn the_code_and_the_new_password_are_pages_of_the_account_step() {
+        let mut m = on_sign_in_form();
+        signed_in_through_the_steps(&mut m);
+        m.update(Event::LoggedIn(Err(two_factor_required())));
+        assert!(matches!(m.screen, Screen::SecondFactor(_)), "{:?}", m.screen);
+        assert_eq!(m.first_run_rail().map(|(n, _)| n), Some(1));
+        assert_eq!(states(&m), [DONE, NOW, LATER]);
+        // Back from the code is the account step, with the password to type again; the other values are kept.
+        m.update(Event::CancelSecondFactor);
+        let f = form(&mut m);
+        assert_eq!((f.step, f.user.as_str(), f.server.as_str()), (JoinStep::Account, "fabio", "cloud.shadows.ch"));
+        assert!(f.password.is_empty() && f.challenge.is_none());
+
+        // An invite that wants a new password.
+        let mut m = on_join_form();
+        form(&mut m).join = "cloud.shadows.ch/K7M4-Q9TX-K7M4-Q9TX".into();
+        form(&mut m).step = JoinStep::Folder;
+        m.update(Event::JoinNext);
+        m.update(Event::Joined(Err(refused(codes::PASSWORD_REQUIRED, "x"))));
+        assert!(matches!(m.screen, Screen::PasswordNeeded(_)), "{:?}", m.screen);
+        assert_eq!(states(&m), [DONE, NOW, LATER]);
+        m.update(Event::CancelPassword);
+        assert_eq!(form(&mut m).step, JoinStep::Folder, "Back from the password is the page it came from");
+    }
+
+    #[test]
+    fn the_step_buttons_only_work_on_the_join_form() {
+        let mut m = signed_in();
+        assert!(m.update(Event::JoinNext).is_empty() && m.update(Event::JoinBack).is_empty());
+        assert!(matches!(m.screen, Screen::SignedIn(_)));
+        assert!(m.first_run_rail().is_none());
+    }
+
+    #[test]
+    fn secrets_of_the_form_stay_out_of_debug_output() {
+        let f = JoinForm {
+            password: "pw-secret-1".into(),
+            challenge: Some("challenge-secret".into()),
+            join: "cloud.shadows.ch/K7M4-Q9TX".into(),
+            user: "fabio".into(),
+            ..JoinForm::default()
+        };
+        let shown = format!("{f:?}");
+        assert!(!shown.contains("pw-secret") && !shown.contains("challenge-secret") && !shown.contains("K7M4"), "{shown}");
+        assert!(shown.contains("fabio"));
     }
 
     fn signed_in() -> Model {
@@ -1105,8 +3489,32 @@ pub(crate) mod tests {
         let Screen::SignedIn(o) = &m.screen else { panic!() };
         assert_eq!(o.status.account.as_deref(), Some("fabio"));
         let devices = vec![
-            DeviceInfo { id: DeviceId::generate(), name: "lptp1".into(), created_ms: 1, last_used_ms: 2, revoked: false, current: true },
-            DeviceInfo { id: DeviceId::generate(), name: "BEAST".into(), created_ms: 1, last_used_ms: 3, revoked: false, current: false },
+            DeviceInfo {
+                id: DeviceId::generate(),
+                name: "lptp1".into(),
+                created_ms: 1,
+                last_used_ms: 2,
+                revoked: false,
+                current: true,
+                client_kind: String::new(),
+                platform: String::new(),
+                app_version: String::new(),
+                revoked_ms: None,
+                revoke_reason: None,
+            },
+            DeviceInfo {
+                id: DeviceId::generate(),
+                name: "BEAST".into(),
+                created_ms: 1,
+                last_used_ms: 3,
+                revoked: false,
+                current: false,
+                client_kind: String::new(),
+                platform: String::new(),
+                app_version: String::new(),
+                revoked_ms: None,
+                revoke_reason: None,
+            },
         ];
         m.update(Event::Devices(Ok(devices.clone())));
         // This computer can't be removed from here; another one can, once at a time.
@@ -1246,9 +3654,85 @@ pub(crate) mod tests {
         assert_eq!(m.update(Event::SignOut), vec![Effect::Logout { local: false }]);
         assert!(m.update(Event::SignOut).is_empty());
         m.update(Event::SignedOut(Err(refused(codes::OFFLINE, "can't reach the server to sign this device out"))));
-        let o = m.overview().unwrap();
-        assert!(o.offer_local_sign_out && o.error.is_some());
+        assert!(m.offer_local_sign_out && m.sign_out_error.is_some());
         assert_eq!(m.update(Event::SignOutHere), vec![Effect::Logout { local: true }]);
+    }
+
+    /// The footer's Sign out is there on every page of the signed-in window, and so are its problem and the offer.
+    #[test]
+    fn sign_out_works_from_every_page_and_its_problem_is_kept_there() {
+        for tab in [Tab::Versions, Tab::Trash, Tab::Security, Tab::Activity, Tab::Computers] {
+            let mut m = signed_in();
+            m.update(Event::Tab(tab));
+            assert_eq!(m.tab(), Some(tab));
+            assert_eq!(m.update(Event::SignOut), vec![Effect::Logout { local: false }], "{tab:?}");
+            assert_eq!(m.busy, Some(Busy::SigningOut));
+            assert!(m.update(Event::SignOut).is_empty(), "{tab:?}: once at a time");
+            m.update(Event::SignedOut(Err(refused(codes::OFFLINE, "can't reach the server to sign this device out"))));
+            assert_eq!(m.busy, None);
+            assert!(m.sign_out_error.is_some() && m.offer_local_sign_out, "{tab:?}");
+            assert_eq!(m.update(Event::SignOutHere), vec![Effect::Logout { local: true }], "{tab:?}");
+            // A new try clears the problem.
+            m.update(Event::SignedOut(Err(refused("other", "no"))));
+            assert!(!m.offer_local_sign_out);
+            m.update(Event::SignOut);
+            assert!(m.sign_out_error.is_none(), "{tab:?}");
+        }
+        assert!(model().update(Event::SignOut).is_empty(), "not signed in");
+    }
+
+    #[test]
+    fn a_tab_does_not_leave_the_security_page_while_it_works_or_shows_recovery_codes() {
+        let mut m = signed_in();
+        m.update(Event::Tab(Tab::Security));
+        assert!(!m.tabs_locked());
+        let Screen::Security(page) = &mut m.screen else { panic!() };
+        page.busy = true;
+        assert!(m.tabs_locked());
+        assert!(m.update(Event::Tab(Tab::Trash)).is_empty());
+        assert_eq!(m.tab(), Some(Tab::Security));
+        let Screen::Security(page) = &mut m.screen else { panic!() };
+        page.busy = false;
+        page.step = SecurityStep::Codes { codes: vec!["AAAA-BBBB".into()], why: crate::security::CodesWhy::TurnedOn };
+        assert!(m.tabs_locked());
+        assert!(m.update(Event::Tab(Tab::Overview)).is_empty());
+        assert_eq!(m.tab(), Some(Tab::Security));
+        // Done with the codes: the page is free again.
+        m.update(Event::Security(SecurityEvent::Home));
+        assert!(!m.tabs_locked());
+        m.update(Event::Tab(Tab::Overview));
+        assert_eq!(m.tab(), Some(Tab::Overview));
+    }
+
+    /// Sign out and Quit would drop the page like a tab does, so they wait too while the page holds a one-time code or a
+    /// call is under way.
+    #[test]
+    fn sign_out_and_quit_wait_while_the_tabs_are_locked() {
+        let mut m = signed_in();
+        m.update(Event::Tab(Tab::Security));
+        let Screen::Security(page) = &mut m.screen else { panic!() };
+        page.step = SecurityStep::Codes { codes: vec!["AAAA-BBBB".into()], why: crate::security::CodesWhy::TurnedOn };
+        assert!(m.tabs_locked());
+        for event in [Event::SignOut, Event::SignOutHere, Event::Quit] {
+            assert!(m.update(event.clone()).is_empty(), "{event:?}");
+        }
+        assert_eq!(m.busy, None);
+        // Done with the codes: both work again.
+        m.update(Event::Security(SecurityEvent::Home));
+        assert!(!m.tabs_locked());
+        assert_eq!(m.update(Event::SignOut), vec![Effect::Logout { local: false }]);
+        let mut m = signed_in();
+        m.update(Event::Tab(Tab::Security));
+        assert_eq!(m.update(Event::Quit), vec![Effect::QuitTray, Effect::QuitAgent]);
+    }
+
+    #[test]
+    fn the_admin_check_is_forgotten_when_the_account_changes() {
+        let mut m = signed_in_admin();
+        assert!(m.is_admin());
+        let other = Status { account: Some("ana".into()), ..status(true) };
+        m.update(Event::Polled(Ok(other)));
+        assert_eq!(m.access, Access::Unknown);
     }
 
     /// Quit stops the agent, then the app; the close button only hides the window when there is a tray.
@@ -1308,7 +3792,16 @@ pub(crate) mod tests {
         // At each start, matched once; again only when it changes.
         let mut m = model();
         m.update(Event::Start);
-        assert_eq!(m.update(Event::Found(Ok(on.clone()))), vec![Effect::AppAutostart(true), Effect::Devices]);
+        assert_eq!(
+            m.update(Event::Found(Ok(on.clone()))),
+            vec![
+                Effect::AppAutostart(true),
+                Effect::Devices,
+                Effect::Account { session: m.overview().unwrap().session },
+                Effect::Usage(1),
+                Effect::Recent { session: m.overview().unwrap().session }
+            ]
+        );
         assert!(m.update(Event::Polled(Ok(on.clone()))).is_empty());
         assert_eq!(m.update(Event::Polled(Ok(Status { autostart: Some(false), ..on }))), vec![Effect::AppAutostart(false)]);
     }
@@ -1318,5 +3811,270 @@ pub(crate) mod tests {
         assert_eq!(first_sentence("can't reach it. Try later"), "Can't reach it.");
         assert_eq!(first_sentence("no dot here"), "No dot here");
         assert_eq!(sentence(""), "");
+    }
+
+    /// A signed-in model whose admin check said admin.
+    fn signed_in_admin() -> Model {
+        let mut m = signed_in();
+        m.overview_mut().unwrap().access = Access::Admin { two_factor: false };
+        m.access = Access::Admin { two_factor: false };
+        assert!(m.is_admin());
+        m
+    }
+
+    #[test]
+    fn the_tabs_list_the_pages_and_the_admin_pages_for_an_admin_only() {
+        let member = [Tab::Overview, Tab::Versions, Tab::Trash, Tab::Computers, Tab::Security, Tab::Activity];
+        assert_eq!(signed_in().tabs(), member);
+        let mut admin = member.to_vec();
+        admin.push(Tab::Admin);
+        assert_eq!(signed_in_admin().tabs(), admin);
+        assert_eq!(model().tab(), None, "no tabs before sign-in");
+        assert_eq!(signed_in().tab(), Some(Tab::Overview));
+    }
+
+    #[test]
+    fn a_tab_asks_for_what_the_button_it_replaces_asked_for() {
+        let cases = [
+            (Tab::Versions, Event::OpenVersions),
+            (Tab::Trash, Event::OpenTrash),
+            (Tab::Security, Event::OpenSecurity),
+            (Tab::Activity, Event::Audit(AuditMsg::OpenActivity)),
+        ];
+        for (tab, old) in cases {
+            let (mut by_tab, mut by_button) = (signed_in(), signed_in());
+            let (got, want) = (by_tab.update(Event::Tab(tab)), by_button.update(old));
+            if tab == Tab::Activity {
+                // The tickets of the pages' answers count up over the whole run.
+                assert!(matches!(got.as_slice(), [Effect::AuditPage { own: true, .. }]) && got.len() == want.len(), "{got:?}");
+            } else {
+                assert_eq!(got, want, "{tab:?}");
+            }
+            assert_eq!(by_tab.tab(), Some(tab));
+            assert_eq!(std::mem::discriminant(&by_tab.screen), std::mem::discriminant(&by_button.screen), "{tab:?}");
+        }
+        let (mut by_tab, mut by_button) = (signed_in_admin(), signed_in_admin());
+        let effects = by_tab.update(Event::Tab(Tab::Admin));
+        assert!(!effects.is_empty());
+        assert_eq!(effects.len(), by_button.update(Event::Admin(AdminEvent::Open)).len());
+        assert_eq!(by_tab.tab(), Some(Tab::Admin));
+    }
+
+    #[test]
+    fn a_member_has_no_admin_tab_and_the_event_does_nothing() {
+        let mut m = signed_in();
+        assert!(m.update(Event::Tab(Tab::Admin)).is_empty());
+        assert!(matches!(m.screen, Screen::SignedIn(_)));
+        // Not from another page either.
+        m.update(Event::Tab(Tab::Trash));
+        assert!(m.update(Event::Tab(Tab::Admin)).is_empty());
+        assert!(matches!(m.screen, Screen::Trash(_)));
+    }
+
+    #[test]
+    fn the_overview_and_computers_tabs_swap_the_page_without_asking_for_anything() {
+        let mut m = signed_in();
+        assert!(m.update(Event::Tab(Tab::Computers)).is_empty());
+        assert!(matches!(&m.screen, Screen::SignedIn(o) if o.page == OverviewPage::Computers));
+        assert_eq!(m.tab(), Some(Tab::Computers));
+        assert!(m.update(Event::Tab(Tab::Computers)).is_empty(), "the tab shown does nothing");
+        assert!(m.update(Event::Tab(Tab::Overview)).is_empty());
+        assert!(matches!(&m.screen, Screen::SignedIn(o) if o.page == OverviewPage::Home));
+        // The computers page keeps its events: Add a computer and back.
+        m.update(Event::Tab(Tab::Computers));
+        assert_eq!(m.update(Event::AddComputer), vec![Effect::Pairing]);
+        assert_eq!(m.tab(), Some(Tab::Computers));
+        assert!(m.update(Event::Tab(Tab::Computers)).is_empty(), "the tab shown does nothing, the code page and its wait stay");
+        assert!(matches!(m.screen, Screen::AddingComputer(_)));
+        assert_eq!(m.update(Event::Tab(Tab::Overview)), vec![Effect::Devices], "another tab leaves it");
+        assert!(matches!(&m.screen, Screen::SignedIn(o) if o.page == OverviewPage::Home));
+    }
+
+    #[test]
+    fn a_tab_leaves_the_page_the_way_its_back_button_did() {
+        // From trash: the answers still on their way are dropped, and the overview asks again for what it shows.
+        let mut m = signed_in();
+        m.update(Event::Tab(Tab::Trash));
+        let ticket = m.trash_ticket;
+        let effects = m.update(Event::Tab(Tab::Overview));
+        assert!(matches!(m.screen, Screen::SignedIn(_)));
+        assert!(matches!(effects.as_slice(), [Effect::Devices, Effect::Account { .. }, Effect::Usage(_), Effect::Recent { .. }]), "{effects:?}");
+        assert_eq!(m.trash_ticket, ticket + 1);
+        // From the security page to trash: the page's secrets go and the trash is asked for.
+        m.update(Event::Tab(Tab::Security));
+        let effects = m.update(Event::Tab(Tab::Trash));
+        assert!(matches!(m.screen, Screen::Trash(_)));
+        assert_eq!(effects.first(), Some(&Effect::Devices));
+        assert!(effects.iter().any(|e| matches!(e, Effect::Trash { .. })), "{effects:?}");
+        // From versions to the activity page.
+        m.update(Event::Tab(Tab::Versions));
+        let effects = m.update(Event::Tab(Tab::Activity));
+        assert!(matches!(m.screen, Screen::Activity(_)));
+        assert!(effects.iter().any(|e| matches!(e, Effect::AuditPage { own: true, .. })), "{effects:?}");
+        // A wait for a computer's code is cancelled by leaving it.
+        let mut m = signed_in();
+        m.update(Event::AddComputer);
+        let info = PairingInfo { id: Uuid::nil(), join: "x".into(), link: "x".into(), expires_ms: 1 };
+        m.update(Event::PairingMade(Ok(info)));
+        let effects = m.update(Event::Tab(Tab::Security));
+        assert!(effects.contains(&Effect::CancelPairing(Uuid::nil())), "{effects:?}");
+        assert!(matches!(m.screen, Screen::Security(_)));
+    }
+
+    #[test]
+    fn the_admin_tab_is_still_there_from_trash_and_versions() {
+        let mut m = signed_in_admin();
+        m.update(Event::Tab(Tab::Trash));
+        assert!(m.is_admin());
+        assert!(m.tabs().contains(&Tab::Admin));
+        let effects = m.update(Event::Tab(Tab::Admin));
+        assert!(matches!(m.screen, Screen::Admin(_)), "{:?}", m.screen);
+        assert!(!effects.is_empty());
+        m.update(Event::Tab(Tab::Versions));
+        assert!(m.tabs().contains(&Tab::Admin));
+        // Signed out, nothing is remembered for the next account.
+        m.update(Event::Polled(Ok(status(false))));
+        assert_eq!(m.access, Access::Unknown);
+    }
+    fn trash_item(n: u128, name: &str, is_dir: bool, path: Option<&str>) -> craft_cloud_app::TrashItem {
+        craft_cloud_app::TrashItem {
+            id: NodeId::from_uuid(Uuid::from_u128(n)),
+            parent: NodeId::from_uuid(Uuid::nil()),
+            name: name.into(),
+            is_dir,
+            size: Some(10),
+            deleted_ms: 0,
+            purge_after_ms: 0,
+            path: path.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn the_trash_list_is_filtered_by_kind_and_searched_by_name_or_path_in_any_case() {
+        let mut m = model();
+        let items = vec![
+            trash_item(1, "Sketch.PSD", false, Some("art/Sketch.PSD")),
+            trash_item(2, "Old exports", true, None),
+            trash_item(3, "notes.txt", false, Some("Projects/notes.txt")),
+        ];
+        m.screen = Screen::Trash(Trash { page: Some(TrashResponse { items, next: None }), ..Trash::new() });
+        let names = |m: &Model| match &m.screen {
+            Screen::Trash(t) => t.visible().iter().map(|i| i.name.clone()).collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        assert_eq!(names(&m), ["Sketch.PSD", "Old exports", "notes.txt"]);
+        let Screen::Trash(t) = &m.screen else { panic!("trash") };
+        assert_eq!(t.counts(), (3, 1, 2));
+        m.update(Event::TrashKind(TrashKind::Files));
+        assert_eq!(names(&m), ["Sketch.PSD", "notes.txt"]);
+        m.update(Event::TrashKind(TrashKind::Folders));
+        assert_eq!(names(&m), ["Old exports"]);
+        // The search looks at the path too, ignores the case and the spaces around, and works with the kind.
+        m.update(Event::TrashKind(TrashKind::All));
+        m.update(Event::TrashSearch("  projects/ ".into()));
+        assert_eq!(names(&m), ["notes.txt"]);
+        m.update(Event::TrashSearch("SKETCH".into()));
+        assert_eq!(names(&m), ["Sketch.PSD"]);
+        m.update(Event::TrashKind(TrashKind::Folders));
+        assert!(names(&m).is_empty(), "a folder that doesn't match is hidden");
+        m.update(Event::TrashSearch(String::new()));
+        m.update(Event::TrashKind(TrashKind::All));
+        assert_eq!(names(&m).len(), 3);
+        // The counts don't follow the search: they say what is loaded.
+        m.update(Event::TrashSearch("zzz".into()));
+        let Screen::Trash(t) = &m.screen else { panic!("trash") };
+        assert_eq!((t.visible().len(), t.counts()), (0, (3, 1, 2)));
+    }
+
+    #[test]
+    fn the_filter_does_nothing_off_the_trash_page_and_survives_a_reload() {
+        let mut m = signed_in();
+        assert!(m.update(Event::TrashKind(TrashKind::Files)).is_empty());
+        assert!(m.update(Event::TrashSearch("x".into())).is_empty());
+        m.update(Event::Tab(Tab::Trash));
+        m.update(Event::TrashSearch("x".into()));
+        m.update(Event::LoadTrash);
+        assert!(matches!(&m.screen, Screen::Trash(t) if t.search == "x"), "a refresh keeps what was typed");
+    }
+
+    #[test]
+    fn cancelling_a_removal_closes_the_confirmation_and_sends_nothing() {
+        let mut m = model();
+        let page = trash_page();
+        let id = page.items[0].id;
+        m.screen = Screen::Trash(Trash { page: Some(page), ..Trash::new() });
+        m.update(Event::ConfirmRemoveTrash(id));
+        assert!(matches!(&m.screen, Screen::Trash(t) if t.confirm == Some(id)));
+        assert!(m.update(Event::CancelRemoveTrash).is_empty());
+        assert!(matches!(&m.screen, Screen::Trash(t) if t.confirm.is_none()));
+        // With nothing to confirm, the remove button does nothing.
+        assert!(m.update(Event::RemoveTrash).is_empty());
+    }
+
+    #[test]
+    fn the_devices_answer_teaches_the_names_wherever_the_page_is() {
+        let mut m = signed_in();
+        let device = DeviceInfo {
+            id: DeviceId::generate(),
+            name: "BEAST".into(),
+            created_ms: 0,
+            last_used_ms: 0,
+            revoked: false,
+            current: false,
+            client_kind: String::new(),
+            platform: String::new(),
+            app_version: String::new(),
+            revoked_ms: None,
+            revoke_reason: None,
+        };
+        // On a page without the signed-in view (versions) the names are kept all the same.
+        m.update(Event::Tab(Tab::Versions));
+        assert!(m.overview().is_none());
+        m.update(Event::Devices(Ok(vec![device.clone()])));
+        assert_eq!(m.names.computer(device.id).text, "BEAST");
+        // The computer leaves the list: its name stays for the older entries.
+        m.update(Event::Devices(Ok(Vec::new())));
+        assert_eq!(m.names.computer(device.id).text, "BEAST");
+        assert!(!m.names.computer(DeviceId::generate()).known);
+    }
+
+    #[test]
+    fn the_account_answer_teaches_the_accounts_own_name() {
+        let mut m = signed_in();
+        let session = m.overview().unwrap().session;
+        let id = Uuid::from_u128(77);
+        m.update(Event::Admin(AdminEvent::Account {
+            session,
+            result: Ok(craft_cloud_proto::api::AccountInfo {
+                user_id: id,
+                username: "ana".into(),
+                role: "member".into(),
+                created_ms: 0,
+                password_changed_ms: None,
+                two_factor_enabled: false,
+            }),
+        }));
+        assert_eq!(m.names.account(id).text, "ana");
+    }
+
+    #[test]
+    fn the_recent_activity_loads_with_the_overview_and_keeps_the_newest_five() {
+        let mut m = signed_in();
+        let o = m.overview().unwrap();
+        assert_eq!(o.recent, Recent::Loading);
+        let session = o.session;
+        let events: Vec<_> = (0..8).map(|n| crate::agent::fake::FakeAgent::sample_event(n, "auth.login")).collect();
+        // An answer for another sign-in is ignored.
+        m.update(Event::Recent { session: session + 1, result: Ok(AuditPage { events: events.clone(), next: None }) });
+        assert_eq!(m.overview().unwrap().recent, Recent::Loading);
+        m.update(Event::Recent { session, result: Ok(AuditPage { events: events.clone(), next: Some("more".into()) }) });
+        assert!(matches!(&m.overview().unwrap().recent, Recent::Loaded(list) if list.len() == 5 && list[0].id == events[0].id));
+        m.update(Event::Recent { session, result: Err(Error::Io("down".into())) });
+        assert!(matches!(&m.overview().unwrap().recent, Recent::Failed(_)));
+        // A fresh overview asks again.
+        m.update(Event::Tab(Tab::Trash));
+        let effects = m.update(Event::Tab(Tab::Overview));
+        assert!(effects.iter().any(|e| matches!(e, Effect::Recent { .. })), "{effects:?}");
+        assert_eq!(m.overview().unwrap().recent, Recent::Loading);
     }
 }
