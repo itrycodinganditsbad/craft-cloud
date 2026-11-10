@@ -53,6 +53,8 @@ pub const MAX_MACHINE_BYTES: usize = 128;
 /// Largest JSON body or WebSocket message of the local API, either way.
 pub const MAX_LOCAL_JSON_BYTES: usize = 1024 * 1024;
 
+pub mod private;
+
 /// Error codes of the local API (the `error` field of [`ErrorAnswer`](crate::api::ErrorAnswer)), beside the HTTP API's
 /// `invalid`, `unauthorized` (the token), `not_found`, `too_large` and `internal`.
 pub mod codes {

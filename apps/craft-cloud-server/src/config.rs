@@ -110,17 +110,28 @@ impl std::fmt::Debug for DatabaseConfig {
     }
 }
 
-/// The URL with its user name and password replaced by `<redacted>`. The scheme, host, port and path stay.
-/// Everything up to the last `@` is treated as credentials, so a password containing `@` or `/` still
-/// doesn't show. A URL without `@` is returned as is.
+/// The URL as it may be shown: the scheme, host, port and path stay; the user name and password are replaced by
+/// `<redacted>`, and so is the whole query string and fragment (`?user=…&password=…` is a way to give credentials too).
+/// Everything up to the last `@` before the query is treated as credentials, so a password containing `@` or `/`
+/// still doesn't show. A URL with neither credentials nor a query is returned as is.
 pub fn redact_url(url: &str) -> String {
-    let Some(scheme_end) = url.find("://") else { return url.to_owned() };
-    let authority_start = scheme_end + 3;
-    let rest = &url[authority_start..];
-    match rest.rfind('@') {
-        Some(at) => format!("{}<redacted>{}", &url[..authority_start], &rest[at..]),
-        None => url.to_owned(),
-    }
+    // As a URL reads it: the query or fragment begins at the first `?` or `#`.
+    let (base, tail) = match url.find(['?', '#']) {
+        Some(at) => (&url[..at], "?<redacted>"),
+        None => (url, ""),
+    };
+    let shown = match base.find("://") {
+        Some(scheme_end) => {
+            let authority_start = scheme_end + 3;
+            let rest = &base[authority_start..];
+            match rest.rfind('@') {
+                Some(at) => format!("{}<redacted>{}", &base[..authority_start], &rest[at..]),
+                None => base.to_owned(),
+            }
+        }
+        None => base.to_owned(),
+    };
+    format!("{shown}{tail}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -353,6 +364,37 @@ secret_access_key = "very-secret-value"
     fn urls_without_credentials_print_as_they_are() {
         assert_eq!(redact_url("sqlite:/var/lib/meta.db"), "sqlite:/var/lib/meta.db");
         assert_eq!(redact_url("postgres://db:5432/cc"), "postgres://db:5432/cc");
+    }
+
+    #[test]
+    fn the_query_string_and_fragment_never_show() {
+        for (url, shown) in [
+            ("postgres://cc:topsecret@db/cc?sslmode=require&password=qsecret", "postgres://<redacted>@db/cc?<redacted>"),
+            ("postgres://db/cc?user=u&password=qsecret", "postgres://db/cc?<redacted>"),
+            ("postgres:///cc?host=/run/pg&password=qsecret", "postgres:///cc?<redacted>"),
+            ("postgres://u:p@db/cc#frag-secret", "postgres://<redacted>@db/cc?<redacted>"),
+            ("sqlite:/var/lib/meta.db?mode=rwc", "sqlite:/var/lib/meta.db?<redacted>"),
+            // An `@` in the query must not make the host and the start of the query count as credentials.
+            ("postgres://db/cc?password=a@qsecret", "postgres://db/cc?<redacted>"),
+        ] {
+            let got = redact_url(url);
+            assert_eq!(got, shown, "{url}");
+            assert!(!got.contains("secret") && !got.contains("topsecret"), "{got}");
+        }
+        // And through the config's Debug output, which is what a diagnostic dump prints.
+        let c = Config::parse(
+            "listen = \"127.0.0.1:9000\"
+[database]
+url = \"postgres://cc:topsecret@db/cc?password=qsecret\"
+[storage]
+kind = \"disk\"
+path = \"/tmp/b\"
+",
+        )
+        .unwrap();
+        let shown = format!("{c:?}");
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(shown.contains("postgres://<redacted>@db/cc?<redacted>"), "{shown}");
     }
 
     #[test]
