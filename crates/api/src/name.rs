@@ -91,6 +91,79 @@ impl From<Name> for String {
     }
 }
 
+/// The longest team space name, in characters.
+pub const MAX_SPACE_NAME_CHARS: usize = 64;
+
+/// Why a team space name was rejected.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SpaceNameError {
+    #[error("the name is empty")]
+    Empty,
+    #[error("the name is {len} characters long; the limit is {MAX_SPACE_NAME_CHARS}")]
+    TooLong { len: usize },
+    #[error("the name contains the control character U+{:04X}", u32::from(*ch))]
+    ControlChar { ch: char },
+    #[error("the name starts or ends with a space")]
+    EdgeSpace,
+}
+
+/// A team space's display name: NFC-normalised, 1 to [`MAX_SPACE_NAME_CHARS`] characters, no control characters, and
+/// no space at either end. Unlike a [`Name`] it may hold characters a file name may not (`/`, `:`), because it is not
+/// a path; the folder an agent makes for it goes through the node name rules separately.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct SpaceName(String);
+
+impl SpaceName {
+    /// Normalises `raw` to NFC and validates it.
+    pub fn new(raw: &str) -> Result<Self, SpaceNameError> {
+        let nfc: String = raw.nfc().collect();
+        let len = nfc.chars().count();
+        if len == 0 {
+            return Err(SpaceNameError::Empty);
+        }
+        if len > MAX_SPACE_NAME_CHARS {
+            return Err(SpaceNameError::TooLong { len });
+        }
+        if let Some(ch) = nfc.chars().find(|ch| ch.is_control()) {
+            return Err(SpaceNameError::ControlChar { ch });
+        }
+        if nfc.starts_with(char::is_whitespace) || nfc.ends_with(char::is_whitespace) {
+            return Err(SpaceNameError::EdgeSpace);
+        }
+        Ok(Self(nfc))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The caseless form two names must not share on one server.
+    pub fn fold_key(&self) -> FoldKey {
+        FoldKey(fold(&self.0))
+    }
+}
+
+impl std::fmt::Display for SpaceName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for SpaceName {
+    type Error = SpaceNameError;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::new(&raw)
+    }
+}
+
+impl From<SpaceName> for String {
+    fn from(name: SpaceName) -> Self {
+        name.0
+    }
+}
+
 /// Canonical caseless form: NFD, Unicode full case folding, then NFC.
 fn fold(s: &str) -> String {
     let nfd: String = s.nfd().collect();
@@ -204,6 +277,20 @@ mod tests {
         assert!(same("cafe\u{301}.txt", "CAFÉ.TXT"));
         assert!(same("Σίσυφος", "ΣΊΣΥΦΟΣ"));
         assert!(!same("a.psd", "b.psd"));
+    }
+
+    #[test]
+    fn space_names_are_nfc_text_of_one_to_64_characters() {
+        assert_eq!(SpaceName::new("Client: ACME / 2026").unwrap().as_str(), "Client: ACME / 2026");
+        assert_eq!(SpaceName::new("cafe\u{301}").unwrap().as_str(), "caf\u{e9}");
+        assert_eq!(SpaceName::new(""), Err(SpaceNameError::Empty));
+        assert!(SpaceName::new(&"日".repeat(64)).is_ok());
+        assert_eq!(SpaceName::new(&"日".repeat(65)), Err(SpaceNameError::TooLong { len: 65 }));
+        assert_eq!(SpaceName::new("a\tb"), Err(SpaceNameError::ControlChar { ch: '\t' }));
+        assert_eq!(SpaceName::new(" a"), Err(SpaceNameError::EdgeSpace));
+        assert_eq!(SpaceName::new("a "), Err(SpaceNameError::EdgeSpace));
+        assert_eq!(SpaceName::new("   "), Err(SpaceNameError::EdgeSpace));
+        assert_eq!(SpaceName::new("Straße").unwrap().fold_key(), SpaceName::new("STRASSE").unwrap().fold_key());
     }
 
     #[test]

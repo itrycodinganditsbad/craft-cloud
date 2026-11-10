@@ -1,0 +1,4 @@
+# Your own certificate: the directory CC_TLS_DIR holds fullchain.pem and private.key and is mounted read-only at
+# /certs. Keep the key readable by root only. Caddy reads the files at start; restart it to load a renewed one.
+tls /certs/fullchain.pem /certs/private.key
+header Strict-Transport-Security "max-age=31536000"

@@ -3,11 +3,16 @@
 //! Passwords are hashed by the caller (Argon2id, in the server); this module only stores the hash string. An account
 //! an invite created has an empty one until the invite is redeemed: no password matches it, since it is no hash.
 //! Device tokens are random 256-bit values; only their hash is stored, and a device is found by that hash.
+//!
+//! A device also records what client made it ([`DeviceClient`], shown in the device list and never a basis for a
+//! permission), and, once revoked, when and why ([`RevokeReason`]). The `revoked` flag is the one that is checked:
+//! the flag, the time and the reason are always set together, in one transaction, and only by the first revoke.
 
 use craft_cloud_proto::{DeviceId, Epoch, NodeId, SpaceId};
 use sqlx::Row;
 use uuid::Uuid;
 
+use crate::audit::{AuditAction, AuditDetails, NewEvent, Origin, record_in};
 use crate::codec::{flag, uuid_bytes, uuid_from};
 use crate::{Meta, MetaError};
 
@@ -21,14 +26,14 @@ pub enum Role {
 }
 
 impl Role {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Role::Admin => "admin",
             Role::Member => "member",
         }
     }
 
-    fn parse(s: &str) -> Result<Self, MetaError> {
+    pub(crate) fn parse(s: &str) -> Result<Self, MetaError> {
         match s {
             "admin" => Ok(Role::Admin),
             "member" => Ok(Role::Member),
@@ -44,6 +49,9 @@ pub struct UserRecord {
     pub password_hash: String,
     pub role: Role,
     pub space: SpaceId,
+    /// Counts the changes that end what a sign-in checked before them (a disable, an enable, a removal, a password
+    /// change or reset). Read together with the password hash, and handed back to [`Meta::sign_in_device`].
+    pub auth_gen: i64,
 }
 
 impl std::fmt::Debug for UserRecord {
@@ -54,7 +62,111 @@ impl std::fmt::Debug for UserRecord {
             .field("password_hash", &"<redacted>")
             .field("role", &self.role)
             .field("space", &self.space)
+            .field("auth_gen", &self.auth_gen)
             .finish()
+    }
+}
+
+/// What `GET /account` tells about a user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountRecord {
+    pub id: UserId,
+    pub username: String,
+    pub role: Role,
+    pub created_ms: i64,
+    /// When the password last changed through the server (`None`: never, the password is still the first one).
+    pub password_changed_ms: Option<i64>,
+    /// Whether signing in asks for a second factor.
+    pub two_factor_enabled: bool,
+}
+
+/// The client kinds a device may name when it signs in. Empty means the client didn't say.
+pub const CLIENT_KINDS: [&str; 3] = ["agent", "desktop", "cli"];
+/// The longest platform or app version, in bytes.
+pub const MAX_CLIENT_FIELD_BYTES: usize = 32;
+
+/// What a device says about the client it signed in with. Display only: no permission ever depends on it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeviceClient {
+    /// One of [`CLIENT_KINDS`], or empty.
+    pub kind: String,
+    pub platform: String,
+    pub app_version: String,
+}
+
+impl DeviceClient {
+    /// The client a sign-in names; a field left out is empty. An unknown kind, a field over
+    /// [`MAX_CLIENT_FIELD_BYTES`] or a control character is `Invalid`.
+    pub fn new(kind: Option<&str>, platform: Option<&str>, app_version: Option<&str>) -> Result<Self, MetaError> {
+        let client = Self {
+            kind: kind.unwrap_or_default().to_owned(),
+            platform: platform.unwrap_or_default().to_owned(),
+            app_version: app_version.unwrap_or_default().to_owned(),
+        };
+        client.check()?;
+        Ok(client)
+    }
+
+    pub(crate) fn check(&self) -> Result<(), MetaError> {
+        if !self.kind.is_empty() && !CLIENT_KINDS.contains(&self.kind.as_str()) {
+            return Err(MetaError::Invalid("client_kind is agent, desktop or cli"));
+        }
+        for field in [&self.platform, &self.app_version] {
+            if field.len() > MAX_CLIENT_FIELD_BYTES || field.chars().any(char::is_control) {
+                return Err(MetaError::Invalid("platform and app_version are at most 32 bytes without control characters"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Why a device was revoked, as stored in `devices.revoke_reason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevokeReason {
+    /// The user revoked this device (`DELETE /devices/{id}`).
+    User,
+    /// The user signed out every other device.
+    Others,
+    /// The user changed the password.
+    Password,
+    /// An admin revoked it, on the command line or through the admin API.
+    Admin,
+    /// The account was disabled or marked for removal by an admin.
+    Disabled,
+    /// Two-factor sign-in was set up or changed (reserved).
+    TwoFactor,
+    /// The device sat idle too long (reserved).
+    Idle,
+    /// An admin reset the password (on the command line), or a reset code the admin made was redeemed.
+    Reset,
+}
+
+impl RevokeReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RevokeReason::User => "user",
+            RevokeReason::Others => "others",
+            RevokeReason::Password => "password",
+            RevokeReason::Admin => "admin",
+            RevokeReason::Disabled => "disabled",
+            RevokeReason::TwoFactor => "two_factor",
+            RevokeReason::Idle => "idle",
+            RevokeReason::Reset => "reset",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self, MetaError> {
+        Ok(match s {
+            "user" => RevokeReason::User,
+            "others" => RevokeReason::Others,
+            "password" => RevokeReason::Password,
+            "admin" => RevokeReason::Admin,
+            "disabled" => RevokeReason::Disabled,
+            "two_factor" => RevokeReason::TwoFactor,
+            "idle" => RevokeReason::Idle,
+            "reset" => RevokeReason::Reset,
+            _ => return Err(MetaError::Corrupt("unknown revoke reason")),
+        })
     }
 }
 
@@ -65,6 +177,11 @@ pub struct DeviceRecord {
     pub created_ms: i64,
     pub last_used_ms: i64,
     pub revoked: bool,
+    /// What the device said about its client when it signed in (empty for devices from before it was recorded).
+    pub client: DeviceClient,
+    /// When it was revoked, and why; both `None` while it isn't (and for devices revoked before they were recorded).
+    pub revoked_ms: Option<i64>,
+    pub revoke_reason: Option<RevokeReason>,
 }
 
 /// Who a device token belongs to.
@@ -129,7 +246,7 @@ impl Meta {
     pub async fn user_by_name(&self, username: &str) -> Result<Option<UserRecord>, MetaError> {
         let username = username.to_ascii_lowercase();
         let row = sqlx::query(
-            "SELECT u.id, u.username, u.password_hash, u.role, s.id AS space FROM users u JOIN spaces s ON s.owner = u.id WHERE u.username = $1",
+            "SELECT u.id, u.username, u.password_hash, u.role, u.auth_gen, s.id AS space FROM users u JOIN spaces s ON s.owner = u.id WHERE u.username = $1",
         )
         .bind(username.as_str())
         .fetch_optional(&self.pool)
@@ -141,38 +258,93 @@ impl Meta {
             password_hash: row.try_get("password_hash")?,
             role: Role::parse(&row.try_get::<String, _>("role")?)?,
             space: SpaceId::from_uuid(uuid_from(&row.try_get::<Vec<u8>, _>("space")?)?),
+            auth_gen: row.try_get("auth_gen")?,
         }))
     }
 
-    pub async fn set_password_hash(&self, user: UserId, password_hash: &str) -> Result<(), MetaError> {
-        let w = self.begin_write().await?;
-        let mut w = w;
-        let done = sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
-            .bind(password_hash)
-            .bind(uuid_bytes(&user.0))
-            .execute(&mut *w.tx)
-            .await?;
-        if done.rows_affected() == 0 {
-            return Err(MetaError::NotFound("user"));
-        }
-        w.commit().await
+    /// Registers a device for `user` under the hash of its token, with no word on its client.
+    pub async fn create_device(&self, user: UserId, name: &str, token_hash: &[u8; 32], now_ms: i64) -> Result<DeviceId, MetaError> {
+        self.create_device_with(user, name, &DeviceClient::default(), token_hash, now_ms).await
     }
 
-    /// Registers a device for `user` under the hash of its token.
-    pub async fn create_device(&self, user: UserId, name: &str, token_hash: &[u8; 32], now_ms: i64) -> Result<DeviceId, MetaError> {
+    /// [`Meta::create_device`] for a device that says what client it is.
+    pub async fn create_device_with(
+        &self,
+        user: UserId,
+        name: &str,
+        client: &DeviceClient,
+        token_hash: &[u8; 32],
+        now_ms: i64,
+    ) -> Result<DeviceId, MetaError> {
         check_device_name(name)?;
+        client.check()?;
         let device = DeviceId::generate();
         let mut w = self.begin_write().await?;
-        insert_device(&mut w.tx, device, user, name, token_hash, now_ms).await?;
+        // The account first, as every transaction that disables it or revokes its devices takes it: a device is
+        // never added to an account that was disabled or marked for removal meanwhile.
+        if !lock_user(&mut w.tx, user).await? {
+            return Err(MetaError::NotFound("user"));
+        }
+        if account_blocked(&mut w.tx, user).await? {
+            return Err(MetaError::AccountDisabled);
+        }
+        insert_device(&mut w.tx, device, user, name, client, token_hash, now_ms).await?;
         w.commit().await?;
         Ok(device)
     }
 
-    /// The device holding this token hash, if any and not revoked.
+    /// Registers a device for `user` after a password sign-in, if the password it was checked against is still the
+    /// account's (an account with two-factor sign-in is [`MetaError::TwoFactorRequired`] here: it gets a device only from
+    /// [`Meta::complete_second_factor`], and [`Meta::sign_in`] is the call that knows both): `checked` is the stored hash and the generation ([`UserRecord::password_hash`], [`UserRecord::auth_gen`]) the caller read
+    /// before it verified the password. The account is locked first and both compared again in the same transaction, so a
+    /// password change or reset, or a disable followed by an enable (which leaves the hash as it was), that committed
+    /// while the (slow) check ran is not followed by a device that check let in. `None`: the user is gone or
+    /// something changed meanwhile; the caller answers as for a wrong password. An account that is disabled or marked for removal is
+    /// [`MetaError::AccountDisabled`], which the caller may only say after the password was right.
+    pub async fn sign_in_device(
+        &self,
+        user: UserId,
+        checked: (&str, i64),
+        name: &str,
+        client: &DeviceClient,
+        token_hash: &[u8; 32],
+        now_ms: i64,
+    ) -> Result<Option<DeviceId>, MetaError> {
+        check_device_name(name)?;
+        client.check()?;
+        let (hash, auth_gen) = checked;
+        let device = DeviceId::generate();
+        let mut w = self.begin_write().await?;
+        if !lock_user(&mut w.tx, user).await? {
+            return Ok(None);
+        }
+        let same = sqlx::query("SELECT 1 FROM users WHERE id = $1 AND password_hash = $2 AND auth_gen = $3")
+            .bind(uuid_bytes(&user.0))
+            .bind(hash)
+            .bind(auth_gen)
+            .fetch_optional(&mut *w.tx)
+            .await?;
+        if same.is_none() {
+            return Ok(None);
+        }
+        if account_blocked(&mut w.tx, user).await? {
+            return Err(MetaError::AccountDisabled);
+        }
+        if crate::two_factor::is_enabled(&mut w.tx, user).await? {
+            return Err(MetaError::TwoFactorRequired);
+        }
+        insert_device(&mut w.tx, device, user, name, client, token_hash, now_ms).await?;
+        let login = NewEvent::new(AuditAction::AuthLogin).by(user, Some(device)).on_device(device).with(AuditDetails::client(client));
+        record_in(&mut w.tx, now_ms, login).await?;
+        self.commit_audited(w, now_ms).await?;
+        Ok(Some(device))
+    }
+
+    /// The device holding this token hash, if any, not revoked and of an account that isn't disabled.
     pub async fn device_by_token(&self, token_hash: &[u8; 32]) -> Result<Option<DeviceAuth>, MetaError> {
         let row = sqlx::query(
             "SELECT d.id, d.user_id, u.role, u.username, s.id AS space FROM devices d JOIN users u ON u.id = d.user_id JOIN spaces s ON s.owner = u.id \
-             WHERE d.token_hash = $1 AND d.revoked = 0",
+             WHERE d.token_hash = $1 AND d.revoked = 0 AND u.disabled_ms IS NULL",
         )
         .bind(token_hash.to_vec())
         .fetch_optional(&self.pool)
@@ -195,21 +367,34 @@ impl Meta {
     }
 
     pub async fn list_devices(&self, user: UserId) -> Result<Vec<DeviceRecord>, MetaError> {
-        let rows = sqlx::query("SELECT id, name, created_ms, last_used_ms, revoked FROM devices WHERE user_id = $1 ORDER BY created_ms, id")
-            .bind(uuid_bytes(&user.0))
-            .fetch_all(&self.pool)
-            .await?;
-        rows.iter()
-            .map(|row| {
-                Ok(DeviceRecord {
-                    id: DeviceId::from_uuid(uuid_from(&row.try_get::<Vec<u8>, _>("id")?)?),
-                    name: row.try_get("name")?,
-                    created_ms: row.try_get("created_ms")?,
-                    last_used_ms: row.try_get("last_used_ms")?,
-                    revoked: flag(row, "revoked")?,
-                })
-            })
-            .collect()
+        let rows = sqlx::query(
+            "SELECT id, name, created_ms, last_used_ms, revoked, client_kind, platform, app_version, revoked_ms, revoke_reason \
+             FROM devices WHERE user_id = $1 ORDER BY created_ms, id",
+        )
+        .bind(uuid_bytes(&user.0))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(device_record).collect()
+    }
+
+    /// What `GET /account` tells about `user`; `NotFound` for a user that isn't there.
+    pub async fn account(&self, user: UserId) -> Result<AccountRecord, MetaError> {
+        let row = sqlx::query(
+            "SELECT username, role, created_ms, password_changed_ms, \
+             (SELECT COUNT(*) FROM user_two_factor t WHERE t.user_id = users.id AND t.enabled_ms IS NOT NULL) AS two_factor FROM users WHERE id = $1",
+        )
+        .bind(uuid_bytes(&user.0))
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(MetaError::NotFound("user"))?;
+        Ok(AccountRecord {
+            id: user,
+            username: row.try_get("username")?,
+            role: Role::parse(&row.try_get::<String, _>("role")?)?,
+            created_ms: row.try_get("created_ms")?,
+            password_changed_ms: row.try_get("password_changed_ms")?,
+            two_factor_enabled: row.try_get::<i64, _>("two_factor")? > 0,
+        })
     }
 
     /// Whether `device` exists and isn't revoked (a long-lived connection asks again now and then: the admin CLI may
@@ -220,11 +405,65 @@ impl Meta {
         Ok(row.is_some())
     }
 
-    /// Revokes one of `user`'s devices, and deletes the pairing it made, if any (its add-a-computer code dies with
-    /// it). Revoking another user's device is `NotFound`.
+    /// Revokes one of `user`'s devices as the user's own act ([`RevokeReason::User`]), by the system clock. See
+    /// [`Meta::revoke_device_as`].
     pub async fn revoke_device(&self, user: UserId, device: DeviceId) -> Result<(), MetaError> {
+        self.revoke_device_as(user, device, RevokeReason::User, wall_clock_ms()).await
+    }
+
+    /// Revokes one of `user`'s devices, and deletes the pairing it made, if any (its add-a-computer code dies with
+    /// it). Revoking another user's device is `NotFound`. A device that is revoked already stays as it is, with its
+    /// first time and reason, and the call succeeds. The audit event is `device.revoked` for the account's own act
+    /// ([`Origin::Account`]); [`Meta::revoke_device_by`] says which device asked, or that the command line did.
+    pub async fn revoke_device_as(&self, user: UserId, device: DeviceId, reason: RevokeReason, now_ms: i64) -> Result<(), MetaError> {
+        self.revoke_device_by(user, device, reason, Origin::Account, now_ms).await
+    }
+
+    /// [`Meta::revoke_device_as`] with who asked. A device that was revoked already is left as it is and writes no event:
+    /// nothing changed.
+    pub async fn revoke_device_by(&self, user: UserId, device: DeviceId, reason: RevokeReason, origin: Origin, now_ms: i64) -> Result<(), MetaError> {
         let mut w = self.begin_write().await?;
-        let done = sqlx::query("UPDATE devices SET revoked = 1 WHERE id = $1 AND user_id = $2")
+        if !lock_user(&mut w.tx, user).await? {
+            return Err(MetaError::NotFound("device"));
+        }
+        let done = sqlx::query("UPDATE devices SET revoked = 1, revoked_ms = $1, revoke_reason = $2 WHERE id = $3 AND user_id = $4 AND revoked = 0")
+            .bind(now_ms)
+            .bind(reason.as_str())
+            .bind(uuid_bytes(device.as_uuid()))
+            .bind(uuid_bytes(&user.0))
+            .execute(&mut *w.tx)
+            .await?;
+        if done.rows_affected() == 0 {
+            let owned = sqlx::query("SELECT 1 FROM devices WHERE id = $1 AND user_id = $2")
+                .bind(uuid_bytes(device.as_uuid()))
+                .bind(uuid_bytes(&user.0))
+                .fetch_optional(&mut *w.tx)
+                .await?;
+            if owned.is_none() {
+                return Err(MetaError::NotFound("device"));
+            }
+        }
+        sqlx::query("DELETE FROM pairings WHERE device_id = $1").bind(uuid_bytes(device.as_uuid())).execute(&mut *w.tx).await?;
+        if done.rows_affected() > 0 {
+            let details = AuditDetails { reason: Some(reason), device: Some(device), ..AuditDetails::default() };
+            let event = match origin {
+                Origin::Account => NewEvent::new(AuditAction::DeviceRevoked).by(user, None).on_device(device),
+                Origin::Device(by) => NewEvent::new(AuditAction::DeviceRevoked).by(user, Some(by)).on_device(device),
+                // The command line acts as no account. The event is about the account, whose own activity then shows it.
+                Origin::Cli => NewEvent::new(AuditAction::CliDeviceRevoked).on_user(user),
+            };
+            record_in(&mut w.tx, now_ms, event.with(details)).await?;
+        }
+        self.commit_audited(w, now_ms).await
+    }
+
+    /// Renames one of `user`'s devices that isn't revoked and returns it. Another user's, a revoked or a missing
+    /// device is `NotFound`, never a different answer, so nothing says which devices exist.
+    pub async fn rename_device(&self, user: UserId, device: DeviceId, name: &str) -> Result<DeviceRecord, MetaError> {
+        check_device_name(name)?;
+        let mut w = self.begin_write().await?;
+        let done = sqlx::query("UPDATE devices SET name = $1 WHERE id = $2 AND user_id = $3 AND revoked = 0")
+            .bind(name)
             .bind(uuid_bytes(device.as_uuid()))
             .bind(uuid_bytes(&user.0))
             .execute(&mut *w.tx)
@@ -232,9 +471,203 @@ impl Meta {
         if done.rows_affected() == 0 {
             return Err(MetaError::NotFound("device"));
         }
-        sqlx::query("DELETE FROM pairings WHERE device_id = $1").bind(uuid_bytes(device.as_uuid())).execute(&mut *w.tx).await?;
-        w.commit().await
+        let row = sqlx::query(
+            "SELECT id, name, created_ms, last_used_ms, revoked, client_kind, platform, app_version, revoked_ms, revoke_reason \
+             FROM devices WHERE id = $1",
+        )
+        .bind(uuid_bytes(device.as_uuid()))
+        .fetch_one(&mut *w.tx)
+        .await?;
+        let record = device_record(&row)?;
+        w.commit().await?;
+        Ok(record)
     }
+
+    /// Revokes every device of `user` but `keep` that isn't revoked (with `reason`), and deletes the pairings those
+    /// devices made, in one transaction. Returns the devices revoked, for the caller to end their live connections.
+    pub async fn revoke_other_devices(&self, user: UserId, keep: DeviceId, reason: RevokeReason, now_ms: i64) -> Result<Vec<DeviceId>, MetaError> {
+        let mut w = self.begin_write().await?;
+        if !lock_user(&mut w.tx, user).await? {
+            return Ok(Vec::new());
+        }
+        let revoked = revoke_devices(&mut w.tx, user, Some(keep), reason, now_ms).await?;
+        // One event with the count, however many devices went, and none when there was nobody to sign out.
+        if !revoked.is_empty() {
+            let details =
+                AuditDetails { reason: Some(reason), revoked: Some(u32::try_from(revoked.len()).unwrap_or(u32::MAX)), ..AuditDetails::default() };
+            record_in(&mut w.tx, now_ms, NewEvent::new(AuditAction::DeviceRevokedOthers).by(user, Some(keep)).on_user(user).with(details)).await?;
+        }
+        self.commit_audited(w, now_ms).await?;
+        Ok(revoked)
+    }
+
+    /// [`Meta::revoke_other_devices`] for every device of `user` (the admin's command line, which writes
+    /// `cli.devices_revoked_all` when there was a device to sign out).
+    pub async fn revoke_all_devices(&self, user: UserId, reason: RevokeReason, now_ms: i64) -> Result<Vec<DeviceId>, MetaError> {
+        let mut w = self.begin_write().await?;
+        if !lock_user(&mut w.tx, user).await? {
+            return Ok(Vec::new());
+        }
+        let revoked = revoke_devices(&mut w.tx, user, None, reason, now_ms).await?;
+        if !revoked.is_empty() {
+            record_in(&mut w.tx, now_ms, NewEvent::new(AuditAction::CliDevicesRevokedAll).on_user(user).with(AuditDetails::revoked(revoked.len())))
+                .await?;
+        }
+        self.commit_audited(w, now_ms).await?;
+        Ok(revoked)
+    }
+
+    /// Changes `user`'s password to `new_hash`, in one transaction: sets the hash and `password_changed_ms`,
+    /// revokes every device but `keep` ([`RevokeReason::Password`]), and deletes the account's open invite and all
+    /// its pairings (a code made before the change must not work after it). `current_hash` is the hash the caller
+    /// verified the current password against: if the password changed meanwhile, nothing changes and the answer is
+    /// `Conflict`; if `keep` was revoked meanwhile, it is `DeviceRevoked`. Returns the devices revoked. A failure at
+    /// any step changes nothing.
+    pub async fn change_password(
+        &self,
+        user: UserId,
+        current_hash: &str,
+        new_hash: &str,
+        keep: DeviceId,
+        now_ms: i64,
+    ) -> Result<Vec<DeviceId>, MetaError> {
+        let mut w = self.begin_write().await?;
+        // The user's row first, as everywhere (see `lock_user`).
+        lock_user(&mut w.tx, user).await?;
+        // The caller's device must still be signed in: its Argon2 checks took a while, and a revoke since would
+        // otherwise leave a password changed by a device that is signed out. The no-op update locks the row on
+        // both databases, so a revoke running now waits for this transaction (and then finds the device kept).
+        let kept = sqlx::query("UPDATE devices SET revoked = 0 WHERE id = $1 AND user_id = $2 AND revoked = 0")
+            .bind(uuid_bytes(keep.as_uuid()))
+            .bind(uuid_bytes(&user.0))
+            .execute(&mut *w.tx)
+            .await?;
+        if kept.rows_affected() == 0 || account_blocked(&mut w.tx, user).await? {
+            return Err(MetaError::DeviceRevoked);
+        }
+        let done = sqlx::query(
+            "UPDATE users SET password_hash = $1, password_changed_ms = $2, auth_gen = auth_gen + 1 WHERE id = $3 AND password_hash = $4",
+        )
+        .bind(new_hash)
+        .bind(now_ms)
+        .bind(uuid_bytes(&user.0))
+        .bind(current_hash)
+        .execute(&mut *w.tx)
+        .await?;
+        if done.rows_affected() == 0 {
+            return Err(MetaError::Conflict("the password changed while this request was running; try again"));
+        }
+        let revoked = revoke_devices(&mut w.tx, user, Some(keep), RevokeReason::Password, now_ms).await?;
+        delete_join_codes(&mut w.tx, user).await?;
+        // The devices signed out with it are counted in this one event, not in events of their own.
+        let changed =
+            NewEvent::new(AuditAction::AccountPasswordChanged).by(user, Some(keep)).on_user(user).with(AuditDetails::revoked(revoked.len()));
+        record_in(&mut w.tx, now_ms, changed).await?;
+        self.commit_audited(w, now_ms).await?;
+        Ok(revoked)
+    }
+
+    /// The admin's password reset on the command line (`cli.password_reset`): sets `new_hash` and `password_changed_ms`, deletes the account's open invite and
+    /// pairings, and, unless `keep_devices`, revokes every device ([`RevokeReason::Reset`]), all in one transaction.
+    /// `NotFound` for a user that isn't there. Returns the devices revoked.
+    pub async fn reset_password(&self, user: UserId, new_hash: &str, keep_devices: bool, now_ms: i64) -> Result<Vec<DeviceId>, MetaError> {
+        let mut w = self.begin_write().await?;
+        lock_user(&mut w.tx, user).await?;
+        let done = sqlx::query("UPDATE users SET password_hash = $1, password_changed_ms = $2, auth_gen = auth_gen + 1 WHERE id = $3")
+            .bind(new_hash)
+            .bind(now_ms)
+            .bind(uuid_bytes(&user.0))
+            .execute(&mut *w.tx)
+            .await?;
+        if done.rows_affected() == 0 {
+            return Err(MetaError::NotFound("user"));
+        }
+        let revoked = if keep_devices { Vec::new() } else { revoke_devices(&mut w.tx, user, None, RevokeReason::Reset, now_ms).await? };
+        delete_join_codes(&mut w.tx, user).await?;
+        record_in(&mut w.tx, now_ms, NewEvent::new(AuditAction::CliPasswordReset).on_user(user).with(AuditDetails::revoked(revoked.len()))).await?;
+        self.commit_audited(w, now_ms).await?;
+        Ok(revoked)
+    }
+}
+
+/// Takes the row lock of `user` (a no-op update, so nothing changes), and says whether the user exists. Every
+/// transaction that revokes devices or changes a password takes it first, then the rows of the devices, then those of
+/// the pairings: one order for all of them, so two of them at once (a password change from one device, a sign-out of
+/// the others from another, an admin reset) wait for each other on Postgres and never deadlock. SQLite writers are
+/// serialised already.
+pub(crate) async fn lock_user(tx: &mut sqlx::Transaction<'static, sqlx::Any>, user: UserId) -> Result<bool, MetaError> {
+    let done = sqlx::query("UPDATE users SET username = username WHERE id = $1").bind(uuid_bytes(&user.0)).execute(&mut **tx).await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// Whether `user` is disabled or marked for removal, read in `tx` after the user's row was locked.
+pub(crate) async fn account_blocked(tx: &mut sqlx::Transaction<'static, sqlx::Any>, user: UserId) -> Result<bool, MetaError> {
+    let row = sqlx::query("SELECT disabled_ms, removed_ms FROM users WHERE id = $1").bind(uuid_bytes(&user.0)).fetch_optional(&mut **tx).await?;
+    let Some(row) = row else { return Ok(false) };
+    Ok(row.try_get::<Option<i64>, _>("disabled_ms")?.is_some() || row.try_get::<Option<i64>, _>("removed_ms")?.is_some())
+}
+
+fn device_record(row: &sqlx::any::AnyRow) -> Result<DeviceRecord, MetaError> {
+    Ok(DeviceRecord {
+        id: DeviceId::from_uuid(uuid_from(&row.try_get::<Vec<u8>, _>("id")?)?),
+        name: row.try_get("name")?,
+        created_ms: row.try_get("created_ms")?,
+        last_used_ms: row.try_get("last_used_ms")?,
+        revoked: flag(row, "revoked")?,
+        client: DeviceClient { kind: row.try_get("client_kind")?, platform: row.try_get("platform")?, app_version: row.try_get("app_version")? },
+        revoked_ms: row.try_get("revoked_ms")?,
+        revoke_reason: row.try_get::<Option<String>, _>("revoke_reason")?.as_deref().map(RevokeReason::parse).transpose()?,
+    })
+}
+
+/// Revokes `user`'s devices that aren't revoked yet, except `keep`, and deletes the pairings of every revoked device
+/// of theirs, in `tx`. Time and reason are set with the flag, and only here, so a device revoked before keeps its own.
+pub(crate) async fn revoke_devices(
+    tx: &mut sqlx::Transaction<'static, sqlx::Any>,
+    user: UserId,
+    keep: Option<DeviceId>,
+    reason: RevokeReason,
+    now_ms: i64,
+) -> Result<Vec<DeviceId>, MetaError> {
+    let rows =
+        match keep {
+            Some(keep) => sqlx::query(
+                "UPDATE devices SET revoked = 1, revoked_ms = $1, revoke_reason = $2 WHERE user_id = $3 AND revoked = 0 AND id <> $4 RETURNING id",
+            )
+            .bind(now_ms)
+            .bind(reason.as_str())
+            .bind(uuid_bytes(&user.0))
+            .bind(uuid_bytes(keep.as_uuid()))
+            .fetch_all(&mut **tx)
+            .await?,
+            None => {
+                sqlx::query("UPDATE devices SET revoked = 1, revoked_ms = $1, revoke_reason = $2 WHERE user_id = $3 AND revoked = 0 RETURNING id")
+                    .bind(now_ms)
+                    .bind(reason.as_str())
+                    .bind(uuid_bytes(&user.0))
+                    .fetch_all(&mut **tx)
+                    .await?
+            }
+        };
+    sqlx::query("DELETE FROM pairings WHERE device_id IN (SELECT id FROM devices WHERE user_id = $1 AND revoked = 1)")
+        .bind(uuid_bytes(&user.0))
+        .execute(&mut **tx)
+        .await?;
+    rows.iter().map(|row| Ok(DeviceId::from_uuid(uuid_from(&row.try_get::<Vec<u8>, _>("id")?)?))).collect()
+}
+
+/// Deletes `user`'s open invite, every pairing of theirs and every open sign-in challenge, in `tx`: a code or challenge
+/// made before a password change, a reset or a disable must not work after it.
+pub(crate) async fn delete_join_codes(tx: &mut sqlx::Transaction<'static, sqlx::Any>, user: UserId) -> Result<(), MetaError> {
+    sqlx::query("DELETE FROM invites WHERE user_id = $1").bind(uuid_bytes(&user.0)).execute(&mut **tx).await?;
+    sqlx::query("DELETE FROM pairings WHERE user_id = $1").bind(uuid_bytes(&user.0)).execute(&mut **tx).await?;
+    sqlx::query("DELETE FROM login_challenges WHERE user_id = $1").bind(uuid_bytes(&user.0)).execute(&mut **tx).await?;
+    Ok(())
+}
+
+/// The system clock, for the call that takes no time of its own.
+pub(crate) fn wall_clock_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX)).unwrap_or(0)
 }
 
 /// The device name rule: 1–128 bytes without control characters.
@@ -269,11 +702,12 @@ pub(crate) async fn insert_user(
             sqlx::Error::Database(ref db) if db.is_unique_violation() => MetaError::UsernameTaken,
             other => MetaError::Db(other),
         })?;
-    sqlx::query("INSERT INTO spaces (id, owner, epoch, seq, oldest_seq, root) VALUES ($1, $2, $3, 0, 0, $4)")
+    sqlx::query("INSERT INTO spaces (id, owner, epoch, seq, oldest_seq, root, created_ms) VALUES ($1, $2, $3, 0, 0, $4, $5)")
         .bind(uuid_bytes(space.as_uuid()))
         .bind(uuid_bytes(&user.0))
         .bind(uuid_bytes(Epoch::generate().as_uuid()))
         .bind(uuid_bytes(root.as_uuid()))
+        .bind(now_ms)
         .execute(&mut **tx)
         .await?;
     sqlx::query(
@@ -284,7 +718,7 @@ pub(crate) async fn insert_user(
     .bind(uuid_bytes(root.as_uuid()))
     .execute(&mut **tx)
     .await?;
-    Ok(UserRecord { id: user, username: username.to_owned(), password_hash: password_hash.to_owned(), role, space })
+    Ok(UserRecord { id: user, username: username.to_owned(), password_hash: password_hash.to_owned(), role, space, auth_gen: 0 })
 }
 
 /// Inserts a device (its name already checked) in `tx`.
@@ -293,16 +727,23 @@ pub(crate) async fn insert_device(
     device: DeviceId,
     user: UserId,
     name: &str,
+    client: &DeviceClient,
     token_hash: &[u8; 32],
     now_ms: i64,
 ) -> Result<(), MetaError> {
-    sqlx::query("INSERT INTO devices (id, user_id, name, token_hash, created_ms, last_used_ms, revoked) VALUES ($1, $2, $3, $4, $5, $5, 0)")
-        .bind(uuid_bytes(device.as_uuid()))
-        .bind(uuid_bytes(&user.0))
-        .bind(name)
-        .bind(token_hash.to_vec())
-        .bind(now_ms)
-        .execute(&mut **tx)
-        .await?;
+    sqlx::query(
+        "INSERT INTO devices (id, user_id, name, token_hash, created_ms, last_used_ms, revoked, client_kind, platform, app_version) \
+         VALUES ($1, $2, $3, $4, $5, $5, 0, $6, $7, $8)",
+    )
+    .bind(uuid_bytes(device.as_uuid()))
+    .bind(uuid_bytes(&user.0))
+    .bind(name)
+    .bind(token_hash.to_vec())
+    .bind(now_ms)
+    .bind(client.kind.as_str())
+    .bind(client.platform.as_str())
+    .bind(client.app_version.as_str())
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }

@@ -1,0 +1,33 @@
+# Template of the server's config.toml in the Docker deployment. render-config.sh fills the placeholders (a name
+# between two at signs) and keeps the lines whose marker prefix is active: the database kind, the storage kind, and
+# for S3 the optional endpoint and plain-HTTP lines. Every other marker line is dropped. The values are checked
+# before they are written.
+# The rendered file is written by the secrets-init service into the secrets volume (mode 0400, owner 65532); it can
+# hold the database password and S3 keys, so nobody but the server can read it.
+
+# The server speaks plain HTTP inside the stack. Caddy terminates TLS and has the fixed address in trusted_proxies,
+# whose X-Forwarded-For the server believes (it takes single addresses, no networks).
+listen = "0.0.0.0:8080"
+behind_proxy = true
+trusted_proxies = ["@TRUSTED_PROXY@"]
+public_url = "@PUBLIC_URL@"
+
+# Optional limits, in bytes. See docs/server.md.
+# stored_bytes_per_user = 2_000_000_000_000
+# live_bytes_per_user = 1_073_741_824
+
+[database]
+#sqlite#url = "sqlite:/var/lib/craft-cloud/meta.db"
+#postgres#url = "postgres://craft_cloud:@DB_PASSWORD@@db:5432/craft_cloud"
+
+[storage]
+#disk#kind = "disk"
+#disk#path = "/var/lib/craft-cloud/blobs"
+#s3#kind = "s3"
+#s3#bucket = "@S3_BUCKET@"
+#s3#prefix = "@S3_PREFIX@"
+#s3#region = "@S3_REGION@"
+#s3#access_key_id = "@S3_ACCESS_KEY_ID@"
+#s3#secret_access_key = "@S3_SECRET_ACCESS_KEY@"
+#s3endpoint#endpoint = "@S3_ENDPOINT@"
+#s3http#allow_http = true
