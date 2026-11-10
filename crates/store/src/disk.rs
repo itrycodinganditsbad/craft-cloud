@@ -88,6 +88,16 @@ impl Backend for DiskBackend {
         .await
     }
 
+    async fn len_raw(&self, path: &str) -> Result<Option<u64>, StoreError> {
+        let target = self.full_path(path);
+        blocking(move || match std::fs::metadata(&target) {
+            Ok(meta) => Ok(Some(meta.len())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        })
+        .await
+    }
+
     async fn delete_raw(&self, path: &str) -> Result<(), StoreError> {
         let target = self.full_path(path);
         blocking(move || match std::fs::remove_file(&target) {

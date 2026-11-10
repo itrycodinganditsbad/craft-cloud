@@ -16,6 +16,7 @@ use craft_cloud_store::s3::S3Backend;
 use crate::auth::{check_password_rules, hash_password};
 use crate::config::{Config, StorageConfig};
 use crate::state::now_ms;
+use crate::storage_tools;
 
 #[derive(Debug, Parser)]
 #[command(name = "craft-cloud-server", version, about = "Self-hosted sync and storage for the Craft App Suite")]
@@ -85,6 +86,44 @@ pub enum Command {
         #[command(subcommand)]
         action: LiveAction,
     },
+    /// Look at and tune how blobs are stored: recompress them at a higher level, estimate what that would save.
+    Store {
+        /// Path to config.toml. May come before or after the action.
+        #[arg(long, global = true)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        action: StoreAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum StoreAction {
+    /// Rewrite stored blobs at a higher zstd level where that saves more. Safe while the server runs: each blob is
+    /// checked against its ID, compressed, decompressed and checked again before the object is replaced atomically,
+    /// and nothing is ever deleted. Stopping it (Ctrl-C) or `--limit-bytes` leaves a state the next run continues from.
+    Recompress {
+        /// The zstd level, 1 to 19. Higher is smaller and slower to write; reading is as fast at any level.
+        #[arg(long)]
+        level: u8,
+        /// Only say what would change.
+        #[arg(long)]
+        dry_run: bool,
+        /// Stop after reading this many bytes of stored objects; run again to continue.
+        #[arg(long)]
+        limit_bytes: Option<u64>,
+    },
+    /// Sample stored chunks (read only) and report what each level would save and how fast it compresses. The result
+    /// is kept for the admin overview.
+    Estimate {
+        /// How many chunks to sample.
+        #[arg(long, default_value_t = 100)]
+        sample: usize,
+        /// The levels to try, like 1,3,9,19.
+        #[arg(long, default_value = "1,3,9,19")]
+        levels: String,
+    },
+    /// Fill in the stored size of blobs written before sizes were tracked. Reads no object content on disk or S3.
+    Measure,
 }
 
 #[derive(Debug, Subcommand)]
@@ -142,9 +181,13 @@ pub async fn open(config: &Config) -> Result<(Meta, Store), CliError> {
         Meta::open(&config.database.url).await?.with_stored_bytes_cap(config.stored_bytes_per_user).with_live_bytes_cap(config.live_bytes_per_user);
     let store = match (&config.storage, config.storage.s3()?) {
         (_, Some(s3)) => Store::new(S3Backend::new(&s3)?),
-        (StorageConfig::Disk { path }, None) => Store::new(DiskBackend::new(path)?),
+        (StorageConfig::Disk { path, .. }, None) => Store::new(DiskBackend::new(path)?),
         (StorageConfig::S3 { .. }, None) => return Err(CliError::Usage("S3 storage without settings".into())),
     };
+    let store = store
+        .with_compression(config.storage.compression().into())
+        .with_level(config.storage.compression_level())
+        .with_min_saving(config.storage.compression_min_saving());
     Ok((meta, store))
 }
 
@@ -238,6 +281,43 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
                 let user = user_id(&meta, &username).await?;
                 let epoch = meta.reset_epoch(user.space).await?;
                 writeln!(out, "new epoch {epoch} for {}", user.username)?;
+            }
+            Ok(())
+        }
+        Command::Store { config, action } => {
+            let config = Config::load(&config_path(config)?)?;
+            let (meta, store) = open(&config).await?;
+            match action {
+                StoreAction::Recompress { level, dry_run, limit_bytes } => {
+                    if config.storage.compression() == crate::config::Compression::None {
+                        return Err(CliError::Usage(
+                            "compression = \"none\" is set in the config, which keeps blobs plain: recompressing would write compressed ones.                              Set it to \"zstd\" first"
+                                .into(),
+                        ));
+                    }
+                    let report = storage_tools::recompress(&meta, &store, level, dry_run, limit_bytes, out).await?;
+                    storage_tools::print_recompress(&report, level, dry_run, out)?;
+                    if report.failed > 0 {
+                        return Err(CliError::Usage(format!("{} blob(s) could not be read or rewritten and were left as they are", report.failed)));
+                    }
+                }
+                StoreAction::Estimate { sample, levels } => {
+                    let levels = storage_tools::parse_levels(&levels)?;
+                    match storage_tools::estimate(&meta, &store, sample, &levels).await? {
+                        Some(estimate) => {
+                            storage_tools::print_estimate(&estimate, out)?;
+                            storage_tools::save_estimate(&meta, &estimate, now_ms()).await?;
+                            writeln!(out, "kept for the admin overview")?;
+                        }
+                        None => writeln!(out, "nothing to sample: the server holds no readable chunks")?,
+                    }
+                }
+                StoreAction::Measure => {
+                    let report = storage_tools::measure(&meta, &store, out).await?;
+                    if report.failed > 0 {
+                        return Err(CliError::Usage(format!("{} blob(s) could not be measured and were left as they are", report.failed)));
+                    }
+                }
             }
             Ok(())
         }
