@@ -513,11 +513,21 @@ async fn clean_temp(config: &Config, older_than_hours: u64, out: &mut impl Write
         config.sftp_storage()?.ok_or_else(|| CliError::Usage("clean-temp is for storage.kind = \"sftp\"; a disk store removes its own".into()))?;
     let backend = SftpBackend::connect_existing(&settings).await?;
     let age = std::time::Duration::from_secs(older_than_hours.saturating_mul(3600));
-    let mut removed = 0u64;
+    let mut total = craft_cloud_store::sftp::SweepReport::default();
     for prefix in ["chunks", "manifests"] {
-        removed = removed.saturating_add(backend.remove_stale_temp(prefix, age).await?);
+        let part = backend.remove_stale_temp(prefix, age).await?;
+        total.removed = total.removed.saturating_add(part.removed);
+        total.younger = total.younger.saturating_add(part.younger);
+        total.foreign = total.foreign.saturating_add(part.foreign);
     }
-    writeln!(out, "removed {removed} temporary file(s) older than {older_than_hours} hour(s)")?;
+    writeln!(out, "removed {} temporary file(s) older than {older_than_hours} hour(s)", total.removed)?;
+    // What it saw and left, so that a file that is still there can be told from one the command did not look at.
+    if total.younger > 0 {
+        writeln!(out, "left {} younger temporary file(s): an upload may still be running", total.younger)?;
+    }
+    if total.foreign > 0 {
+        writeln!(out, "left {} other file(s) named .tmp-…: not exactly the server's temporary names, so not its to remove", total.foreign)?;
+    }
     Ok(())
 }
 

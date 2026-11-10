@@ -1,7 +1,7 @@
 //! SFTP backend: one file per object under a root directory on a file server the operator rents or owns.
 //!
-//! The layout is the disk backend's (`chunks/ab/cd/<hex>` below the root). A write goes to `<name>.tmp-<UUIDv7>` in
-//! the target's directory and is published with the `posix-rename@openssh.com` extension, which replaces an existing
+//! The layout is the disk backend's (`chunks/ab/cd/<hex>` below the root). A write goes to a file named `.tmp-<UUIDv7>` (as the
+//! disk backend names its temporary files) in the target's directory and is published with the `posix-rename@openssh.com` extension, which replaces an existing
 //! target in one step. A server that does not offer the extension is refused when the backend connects: replacing
 //! by deleting and then renaming could lose the old object, and the plain SFTP rename does not promise to replace.
 //!
@@ -19,7 +19,6 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -411,8 +410,9 @@ impl SftpBackend {
     /// Removes the temporary files of uploads that were cut off (a killed process, a connection lost for good) below
     /// `prefix` (empty: the whole root, for a backup root; the blob store takes `chunks` or `manifests`) that are older
     /// than `older_than`. Only the backend's own exact `.tmp-<UUIDv7>` names count, and age is read from the name. Walks
-    /// every directory below `prefix`, so on a big store it takes a while. Returns how many it removed.
-    pub async fn remove_stale_temp(&self, prefix: &str, older_than: Duration) -> Result<u64, StoreError> {
+    /// every directory below `prefix`, so on a big store it takes a while. The report says how many it removed, and how
+    /// many it saw and left: younger ones, and names that start with `.tmp-` but are not exactly the backend's.
+    pub async fn remove_stale_temp(&self, prefix: &str, older_than: Duration) -> Result<SweepReport, StoreError> {
         if prefix.is_empty() {
             if self.layout == Layout::Blobs {
                 return Err(StoreError::Backend("the prefix must be chunks or manifests".into()));
@@ -423,14 +423,22 @@ impl SftpBackend {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let cutoff = now.saturating_sub(older_than.as_secs());
         let dir = if prefix.is_empty() { self.inner.root_dir() } else { self.inner.join(prefix) };
-        let removed = AtomicU64::new(0);
+        let report = Mutex::new(SweepReport::default());
         self.inner
             .run(|conn| {
-                let (dir, removed) = (dir.clone(), &removed);
-                async move { sweep(&conn, dir, cutoff, removed).await.map(|_| ()) }
+                let (dir, report) = (dir.clone(), &report);
+                async move {
+                    // A retry walks everything again: what the failed walk removed stays counted, what it only saw does not.
+                    {
+                        let mut tally = report.lock().unwrap_or_else(PoisonError::into_inner);
+                        *tally = SweepReport { removed: tally.removed, ..SweepReport::default() };
+                    }
+                    sweep(&conn, dir, cutoff, report).await.map(|_| ())
+                }
             })
             .await?;
-        Ok(removed.load(Ordering::Relaxed))
+        let tally = *report.lock().unwrap_or_else(PoisonError::into_inner);
+        Ok(tally)
     }
 
     /// Removes an empty directory; a directory that is not there or not empty is left alone. For the backup's old generations.
@@ -869,27 +877,47 @@ async fn put_object(conn: &Conn, full: &str, source: &Source, leftovers: &Mutex<
     outcome
 }
 
+/// What [`SftpBackend::remove_stale_temp`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SweepReport {
+    /// Temporary files removed.
+    pub removed: u64,
+    /// The backend's own temporary names that are not old enough yet (an upload may be running), left alone.
+    pub younger: u64,
+    /// Other names that start with `.tmp-` but are not exactly what the backend writes, left alone: they are somebody
+    /// else's files (or a damaged name).
+    pub foreign: u64,
+}
+
 /// Removes the backend's own temporary files below `dir` that are older than `cutoff` (seconds since the epoch, by the
-/// time in their UUIDv7 names). Counts them in `removed`.
-fn sweep<'a>(conn: &'a Conn, dir: String, cutoff: u64, removed: &'a AtomicU64) -> WalkFuture<'a> {
+/// time in their UUIDv7 names), and tallies what it saw. A leftover of ours that is not a plain file (a link, say, by the
+/// operator's hand or a server that describes it oddly) is removed too when its name is exactly ours and old: removing a
+/// link removes the link; a directory is only ever walked.
+fn sweep<'a>(conn: &'a Conn, dir: String, cutoff: u64, report: &'a Mutex<SweepReport>) -> WalkFuture<'a> {
     Box::pin(async move {
         let Some(entries) = read_dir(conn, &dir).await? else { return Ok(false) };
         for (name, kind) in entries {
             let child = if dir.ends_with('/') { format!("{dir}{name}") } else { format!("{dir}/{name}") };
-            match kind {
-                Kind::Dir => {
-                    sweep(conn, child, cutoff, removed).await?;
+            if kind == Kind::Dir {
+                sweep(conn, child, cutoff, report).await?;
+                continue;
+            }
+            let Some(created) = crate::disk::temp_created_secs(&name) else {
+                if name.starts_with(".tmp-") {
+                    report.lock().unwrap_or_else(PoisonError::into_inner).foreign += 1;
                 }
-                Kind::File if crate::disk::temp_created_secs(&name).is_some_and(|created| created < cutoff) => match conn.sftp.remove(child).await {
-                    Ok(_) => {
-                        removed.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(error) => match Fail::from(error) {
-                        Fail::NoSuchFile => {}
-                        other => return Err(other),
-                    },
+                continue;
+            };
+            if created >= cutoff {
+                report.lock().unwrap_or_else(PoisonError::into_inner).younger += 1;
+                continue;
+            }
+            match conn.sftp.remove(child).await {
+                Ok(_) => report.lock().unwrap_or_else(PoisonError::into_inner).removed += 1,
+                Err(error) => match Fail::from(error) {
+                    Fail::NoSuchFile => {}
+                    other => return Err(other),
                 },
-                Kind::File | Kind::Other => {}
             }
         }
         Ok(false)
