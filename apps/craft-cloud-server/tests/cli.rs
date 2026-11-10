@@ -2231,11 +2231,17 @@ mod backup {
         root: PathBuf,
         /// Reading a chunk fails, as when the connection dies in the middle of a restore.
         fail_chunk_reads: bool,
+        /// Every object is said to be empty, as a server that lies about sizes would.
+        zero_sizes: bool,
     }
 
     impl DirRemote {
         fn new(root: &Path) -> Self {
-            Self { backend: Arc::new(DiskBackend::new(root).unwrap()), root: root.to_owned(), fail_chunk_reads: false }
+            Self { backend: Arc::new(DiskBackend::new(root).unwrap()), root: root.to_owned(), fail_chunk_reads: false, zero_sizes: false }
+        }
+
+        fn lying_about_sizes(&self) -> Self {
+            Self { zero_sizes: true, ..self.clone() }
         }
 
         fn failing_on_chunks(&self) -> Self {
@@ -2261,7 +2267,8 @@ mod backup {
             self.backend.get_raw_limited(path, max_bytes).await
         }
         async fn size_raw(&self, path: &str) -> Result<Option<u64>, StoreError> {
-            self.backend.size_raw(path).await
+            let size = self.backend.size_raw(path).await?;
+            Ok(if self.zero_sizes { size.map(|_| 0) } else { size })
         }
         async fn delete_raw(&self, path: &str) -> Result<(), StoreError> {
             self.backend.delete_raw(path).await
@@ -2606,9 +2613,13 @@ mod backup {
 
     /// A restore that is refused leaves nothing: no target, no staging directory.
     async fn refused(m: &Made, options: &RestoreOptions) -> CliError {
+        refused_with(&m.remote, m, options, None).await
+    }
+
+    async fn refused_with(remote: &DirRemote, m: &Made, options: &RestoreOptions, generation: Option<&str>) -> CliError {
         let before = names(m.parent.path());
         let target = m.parent.path().join("restored");
-        let error = restore_from(m.remote.clone(), &target, None, options, &mut Vec::new()).await.unwrap_err();
+        let error = restore_from(remote.clone(), &target, generation, options, &mut Vec::new()).await.unwrap_err();
         assert!(!target.exists(), "{error}");
         assert_eq!(names(m.parent.path()), before, "{error}");
         error
@@ -2624,7 +2635,7 @@ mod backup {
         let key_path = backup_key_path(&m.config);
         assert_eq!(key_path, m.s.dir.join("backup.key"));
         let key = std::fs::read(&key_path).unwrap();
-        assert_eq!(key.len(), 32);
+        assert_eq!(key.len(), 65, "64 hexadecimal digits and a line break");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2659,7 +2670,15 @@ mod backup {
 
         // Another key, even a well-formed one: the MAC does not match, whatever else is right.
         let other = m.parent.path().join("other.key");
-        std::fs::write(&other, [7u8; 32]).unwrap();
+        std::fs::write(
+            &other,
+            format!(
+                "{}
+",
+                "07".repeat(32)
+            ),
+        )
+        .unwrap();
         let wrong = RestoreOptions { key_file: Some(other.clone()), ..RestoreOptions::default() };
         let error = refused(&m, &wrong).await;
         assert!(matches!(&error, CliError::Inconsistent(_)) && says(&error, "does not match the backup key"), "{error}");
@@ -2672,7 +2691,7 @@ mod backup {
         assert!(says(&error, "does not exist"), "{error}");
         std::fs::write(&other, b"short").unwrap();
         let error = refused(&m, &wrong).await;
-        assert!(says(&error, "exactly 32 bytes"), "{error}");
+        assert!(says(&error, "64 hexadecimal digits"), "{error}");
     }
 
     #[tokio::test]
@@ -2837,28 +2856,68 @@ mod backup {
     }
 
     #[tokio::test]
-    async fn a_generation_from_before_authentication_needs_the_flag_and_says_so() {
+    async fn a_generation_from_before_authentication_needs_its_name_and_the_flag() {
         let m = made().await;
-        // Only an old generation is there.
-        std::fs::remove_dir_all(&m.generation).unwrap();
-        plant_v1_generation(&m.config, &m.root, "20231114T221000Z").await;
         let opts = keyed(&m.config);
-        let error = refused(&m, &opts).await;
-        assert!(matches!(&error, CliError::Usage(_)) && says(&error, "--allow-unauthenticated") && says(&error, "did not authenticate"), "{error}");
-        // The key does not matter for it, and the flag restores it, with a warning.
-        let allowed = RestoreOptions { allow_unauthenticated: true, ..RestoreOptions::default() };
+        let allowed = RestoreOptions { allow_unauthenticated: true, ..opts.clone() };
+        // The backup server plants a plain dump that looks newer than everything: with the flag but no name it is passed
+        // over, and the real backup is restored.
+        plant_v1_generation(&m.config, &m.root, "29991231T235959Z").await;
         let mut out = Vec::new();
-        restore_from(m.remote.clone(), &m.parent.path().join("old"), None, &allowed, &mut out).await.unwrap();
+        restore_from(m.remote.clone(), &m.parent.path().join("real"), None, &allowed, &mut out).await.unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("passed over 1 newer generation(s) that are not authenticated: 29991231T235959Z"), "{text}");
+        assert!(text.contains("restored generation 20231114T221320Z-"), "{text}");
+        // Without the flag it is passed over as well, and named without the flag it is refused with the reason.
+        restore_from(m.remote.clone(), &m.parent.path().join("real2"), None, &opts, &mut Vec::new()).await.unwrap();
+        let error = refused_with(&m.remote, &m, &opts, Some("29991231T235959Z")).await;
+        assert!(matches!(&error, CliError::Usage(_)) && says(&error, "--allow-unauthenticated") && says(&error, "did not authenticate"), "{error}");
+        // Named, with the flag: restored, with a warning.
+        let mut out = Vec::new();
+        restore_from(m.remote.clone(), &m.parent.path().join("old"), Some("29991231T235959Z"), &allowed, &mut out).await.unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("WARNING: this generation is not authenticated"), "{text}");
         assert!(m.parent.path().join("old/meta.db").is_file());
         // The limits apply to it as well.
         let small = RestoreOptions { limits: RestoreLimits { max_db_bytes: 1000, ..RestoreLimits::default() }, ..allowed.clone() };
-        let error = refused(&m, &small).await;
+        let error = refused_with(&m.remote, &m, &small, Some("29991231T235959Z")).await;
         assert!(says(&error, "--max-db-bytes"), "{error}");
-        let few = RestoreOptions { limits: RestoreLimits { max_objects: 1, ..RestoreLimits::default() }, ..allowed };
-        let error = refused(&m, &few).await;
+        let few = RestoreOptions { limits: RestoreLimits { max_objects: 1, ..RestoreLimits::default() }, ..allowed.clone() };
+        let error = refused_with(&m.remote, &m, &few, Some("29991231T235959Z")).await;
         assert!(says(&error, "--max-objects"), "{error}");
+
+        // Only unauthenticated generations are there: nothing is picked, and the message says what to do.
+        std::fs::remove_dir_all(&m.generation).unwrap();
+        let error = refused_with(&m.remote, &m, &allowed, None).await;
+        assert!(matches!(&error, CliError::Usage(_)) && says(&error, "no authenticated backup") && says(&error, "29991231T235959Z"), "{error}");
+        // A newest generation that is authenticated but wrong is an error, never a reason to fall back to an older one.
+        let m2 = made().await;
+        backup_to(&m2.config, m2.remote.clone(), 7, None, T0 + 60_000, &mut Vec::new()).await.unwrap();
+        let newest = generation_dir(&m2.root, "20231114T221420Z");
+        let mut manifest = read_manifest(&newest);
+        manifest["database"]["bytes"] = 1.into();
+        write_manifest(&newest, &manifest);
+        let error = refused(&m2, &keyed(&m2.config)).await;
+        assert!(says(&error, "does not match the backup key"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_total_limit_counts_what_is_written_not_what_the_server_says() {
+        let m = made().await;
+        std::fs::remove_dir_all(&m.generation).unwrap();
+        plant_v1_generation(&m.config, &m.root, "20231114T221000Z").await;
+        let dump = std::fs::metadata(m.root.join("generations/20231114T221000Z/meta.sqlite")).unwrap().len();
+        let lying = m.remote.lying_about_sizes();
+        let options = RestoreOptions {
+            allow_unauthenticated: true,
+            limits: RestoreLimits { max_total_bytes: dump + 10, min_free_bytes: 0, ..RestoreLimits::default() },
+            ..RestoreOptions::default()
+        };
+        let error = refused_with(&lying, &m, &options, Some("20231114T221000Z")).await;
+        assert!(says(&error, "--max-total-bytes"), "{error}");
+        // Without the lie, and with room, it restores.
+        let roomy = RestoreOptions { limits: RestoreLimits { max_total_bytes: dump + 100_000, min_free_bytes: 0, ..options.limits }, ..options };
+        restore_from(lying, &m.parent.path().join("ok"), Some("20231114T221000Z"), &roomy, &mut Vec::new()).await.unwrap();
     }
 
     #[tokio::test]

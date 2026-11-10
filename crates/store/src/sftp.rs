@@ -51,13 +51,19 @@ const MAX_PATH_BYTES: usize = 512;
 const MAX_CURSOR_BYTES: usize = 4096;
 /// An object is read into memory up to the caller's limit, but not preallocated beyond this.
 const MAX_PREALLOCATE: usize = 8 * 1024 * 1024;
-/// The most entries one directory of the file server may list. The layout puts a few thousand into the fullest one; a
-/// server that lists more is broken or hostile, and the listing stops with an error instead of filling memory.
-const MAX_DIR_ENTRIES: usize = 1_000_000;
+/// The most entries one directory of the file server may list. The fullest directory of the layout is a leaf
+/// (`chunks/ab/cd/`, with the blobs divided by 65,536 in it): 100,000 of them is some six billion blobs. A server that
+/// lists more is broken or hostile, and the listing stops with an error instead of filling memory.
+const MAX_DIR_ENTRIES: usize = 100_000;
 /// The most bytes of names one directory listing may add up to.
-const MAX_DIR_NAME_BYTES: usize = 64 * 1024 * 1024;
-/// How deep a walk goes below its start. The layout needs about four levels (`chunks/ab/cd/<id>`).
-const MAX_WALK_DEPTH: usize = 16;
+const MAX_DIR_NAME_BYTES: usize = 8 * 1024 * 1024;
+/// How deep a walk goes below its start. The layout is three levels below the root (`chunks/ab/cd/<id>`, and
+/// `generations/<stamp>/<file>`), so a start one level down needs three more; six leaves room for what is added later.
+const MAX_WALK_DEPTH: usize = 6;
+/// What the levels of one walk (or sweep) may hold in memory at once, counted as the walk holds them: each entry costs
+/// its name twice and a fixed 64 bytes. A path of nested directories adds up, which the per-directory caps alone would
+/// not stop.
+const MAX_HELD_COST: usize = 48 * 1024 * 1024;
 
 /// Connections the pool opens at most, unless the config says another number.
 pub const DEFAULT_CONNECTIONS: usize = 4;
@@ -440,7 +446,7 @@ impl SftpBackend {
                         let mut tally = report.lock().unwrap_or_else(PoisonError::into_inner);
                         *tally = SweepReport { removed: tally.removed, ..SweepReport::default() };
                     }
-                    sweep(&conn, dir, cutoff, report, 0).await.map(|_| ())
+                    sweep(&conn, dir, cutoff, report, 0, 0).await.map(|_| ())
                 }
             })
             .await?;
@@ -900,14 +906,15 @@ pub struct SweepReport {
 /// time in their UUIDv7 names), and tallies what it saw. A leftover of ours that is not a plain file (a link, say, by the
 /// operator's hand or a server that describes it oddly) is removed too when its name is exactly ours and old: removing a
 /// link removes the link; a directory is only ever walked.
-fn sweep<'a>(conn: &'a Conn, dir: String, cutoff: u64, report: &'a Mutex<SweepReport>, depth: usize) -> WalkFuture<'a> {
+fn sweep<'a>(conn: &'a Conn, dir: String, cutoff: u64, report: &'a Mutex<SweepReport>, depth: usize, held: usize) -> WalkFuture<'a> {
     Box::pin(async move {
         check_depth(depth)?;
-        let Some(entries) = read_dir(conn, &dir).await? else { return Ok(false) };
+        let Some((entries, cost)) = read_dir(conn, &dir, held).await? else { return Ok(false) };
+        let held = held.saturating_add(cost);
         for (name, kind) in entries {
             let child = if dir.ends_with('/') { format!("{dir}{name}") } else { format!("{dir}/{name}") };
             if kind == Kind::Dir {
-                sweep(conn, child, cutoff, report, depth + 1).await?;
+                sweep(conn, child, cutoff, report, depth + 1, held).await?;
                 continue;
             }
             let Some(created) = crate::disk::temp_created_secs(&name) else {
@@ -1038,7 +1045,8 @@ fn plain_name(name: &str) -> Result<(), Fail> {
 }
 
 /// The entries of a directory: (name, kind). `None` when the directory does not exist.
-async fn read_dir(conn: &Conn, dir: &str) -> Result<Option<Vec<(String, Kind)>>, Fail> {
+/// `held` is what the levels above hold already; the second part of the answer is what this listing holds.
+async fn read_dir(conn: &Conn, dir: &str, held: usize) -> Result<Option<(Vec<(String, Kind)>, usize)>, Fail> {
     let handle = match conn.sftp.opendir(dir).await {
         Ok(handle) => handle.handle,
         Err(error) => {
@@ -1048,21 +1056,39 @@ async fn read_dir(conn: &Conn, dir: &str) -> Result<Option<Vec<(String, Kind)>>,
             };
         }
     };
-    let result = read_dir_open(conn, dir, &handle).await;
+    let result = read_dir_open(conn, dir, &handle, held).await;
     let _ = conn.sftp.close(handle).await;
     result.map(Some)
 }
 
 /// What one directory listing may grow to, and the check that every batch of names moves it on. A server that repeats a
 /// name (or sends `.` again and again) is not making progress, and one that lists more than the caps is not listed further.
-#[derive(Default)]
 struct ListingBound {
     names: std::collections::HashSet<String>,
     name_bytes: usize,
+    /// What the levels above this one hold already.
+    held: usize,
 }
 
+/// The memory a walk holds for one listed entry, besides its name (twice).
+const ENTRY_OVERHEAD: usize = 64;
+
 impl ListingBound {
+    fn new(held: usize) -> Self {
+        Self { names: std::collections::HashSet::new(), name_bytes: 0, held }
+    }
+
+    /// What this listing holds so far.
+    fn cost(&self) -> usize {
+        self.name_bytes.saturating_mul(2).saturating_add(self.names.len().saturating_mul(ENTRY_OVERHEAD))
+    }
+
     fn admit(&mut self, name: &str) -> Result<(), Fail> {
+        if self.held.saturating_add(self.cost()) > MAX_HELD_COST {
+            return Err(Fail::Permanent(
+                "the directories of one walk hold more than the listing may keep in memory in all; the listing is stopped".into(),
+            ));
+        }
         if self.names.len() >= MAX_DIR_ENTRIES {
             return Err(Fail::Permanent(format!("the server lists more than {MAX_DIR_ENTRIES} entries in one directory; the listing is stopped")));
         }
@@ -1079,9 +1105,9 @@ impl ListingBound {
     }
 }
 
-async fn read_dir_open(conn: &Conn, dir: &str, handle: &str) -> Result<Vec<(String, Kind)>, Fail> {
+async fn read_dir_open(conn: &Conn, dir: &str, handle: &str, held: usize) -> Result<(Vec<(String, Kind)>, usize), Fail> {
     let mut entries = Vec::new();
-    let mut bound = ListingBound::default();
+    let mut bound = ListingBound::new(held);
     loop {
         let names = match conn.sftp.readdir(handle).await {
             Ok(names) => names,
@@ -1115,7 +1141,8 @@ async fn read_dir_open(conn: &Conn, dir: &str, handle: &str) -> Result<Vec<(Stri
             entries.push((file.filename, kind));
         }
     }
-    Ok(entries)
+    let cost = bound.cost();
+    Ok((entries, cost))
 }
 
 /// A server whose directories nest deeper than the layout ever does is broken or hostile.
@@ -1124,6 +1151,13 @@ fn check_depth(depth: usize) -> Result<(), Fail> {
         return Err(Fail::Permanent(format!("the server's directories nest deeper than {MAX_WALK_DEPTH} levels; the walk is stopped")));
     }
     Ok(())
+}
+
+/// Where a walk is: how deep, and how much the levels above hold.
+#[derive(Clone, Copy)]
+struct Level {
+    depth: usize,
+    held: usize,
 }
 
 type WalkFuture<'a> = Pin<Box<dyn Future<Output = Result<bool, Fail>> + Send + 'a>>;
@@ -1138,14 +1172,17 @@ fn walk<'a>(
     after: Option<&'a str>,
     limit: usize,
     out: &'a mut Vec<String>,
-    depth: usize,
+    level: Level,
 ) -> WalkFuture<'a> {
     Box::pin(async move {
+        let Level { depth, held } = level;
         check_depth(depth)?;
         if out.len() >= limit {
             return Ok(true);
         }
-        let Some(listed) = read_dir(conn, &dir).await? else { return Ok(false) };
+        let Some((listed, cost)) = read_dir(conn, &dir, held).await? else { return Ok(false) };
+        // This level holds its listing, and then its sorted copy, until it is done.
+        let held = held.saturating_add(cost);
         // (sort key, name, kind): a directory sorts as `name/`.
         let mut entries: Vec<(String, String, Kind)> = Vec::new();
         for (name, kind) in listed {
@@ -1164,7 +1201,7 @@ fn walk<'a>(
                     continue;
                 }
                 let child = if dir.ends_with('/') { format!("{dir}{name}") } else { format!("{dir}/{name}") };
-                if walk(conn, child, path, after, limit, out, depth + 1).await? {
+                if walk(conn, child, path, after, limit, out, Level { depth: depth + 1, held }).await? {
                     return Ok(true);
                 }
             } else if after.is_none_or(|cursor| path.as_str() > cursor) {
@@ -1265,7 +1302,7 @@ impl Backend for SftpBackend {
                 let (dir, prefix) = (dir.clone(), prefix.to_owned());
                 async move {
                     let mut out = Vec::new();
-                    walk(&conn, dir, prefix, after, limit, &mut out, 0).await?;
+                    walk(&conn, dir, prefix, after, limit, &mut out, Level { depth: 0, held: 0 }).await?;
                     Ok(out)
                 }
             })
@@ -1302,19 +1339,19 @@ mod tests {
 
     #[test]
     fn a_listing_is_bounded_in_entries_bytes_and_repeats() {
-        let mut bound = ListingBound::default();
+        let mut bound = ListingBound::new(0);
         assert!(bound.admit(".").is_ok() && bound.admit("..").is_ok() && bound.admit("a").is_ok());
         // A server that keeps answering with the same names makes no progress.
         assert!(matches!(bound.admit("a"), Err(Fail::Permanent(_))));
         assert!(matches!(bound.admit("."), Err(Fail::Permanent(_))));
 
-        let mut bound = ListingBound::default();
+        let mut bound = ListingBound::new(0);
         for i in 0..MAX_DIR_ENTRIES {
             assert!(bound.admit(&i.to_string()).is_ok());
         }
         assert!(matches!(bound.admit("one-more"), Err(Fail::Permanent(message)) if message.contains("more than")));
 
-        let mut bound = ListingBound::default();
+        let mut bound = ListingBound::new(0);
         let long = "x".repeat(1024 * 1024);
         let mut taken = 0usize;
         let refused = loop {
@@ -1324,7 +1361,47 @@ mod tests {
                 Err(error) => break error,
             }
         };
-        assert!(taken < 100 && matches!(refused, Fail::Permanent(message) if message.contains("bytes")));
+        assert!(taken < 10 && matches!(refused, Fail::Permanent(message) if message.contains("bytes")));
+    }
+
+    #[test]
+    fn the_levels_of_one_walk_may_not_hold_more_than_the_budget_in_all() {
+        // One level that is within every per-directory cap, with names of 64 bytes: about 19 MB held as the walk holds it.
+        let name = |i: usize| format!("{i:0>64}");
+        let mut level = ListingBound::new(0);
+        for i in 0..MAX_DIR_ENTRIES {
+            level.admit(&name(i)).unwrap();
+        }
+        let one = level.cost();
+        assert!(one < MAX_HELD_COST && one > MAX_HELD_COST / 4, "{one}");
+        // A server that answers every directory of a path like that is stopped at the third level, not the sixth.
+        let mut held = 0usize;
+        let mut levels = 0;
+        loop {
+            let mut next = ListingBound::new(held);
+            let mut full = true;
+            for i in 0..MAX_DIR_ENTRIES {
+                if next.admit(&name(i)).is_err() {
+                    full = false;
+                    break;
+                }
+            }
+            if !full {
+                break;
+            }
+            held += next.cost();
+            levels += 1;
+        }
+        assert!((2..=3).contains(&levels), "{levels}");
+        // And the real layout fits: the root, `chunks`, `ab` with 256 entries each, and a full leaf.
+        let mut held = 0usize;
+        for count in [2usize, 256, 256, 100_000] {
+            let mut level = ListingBound::new(held);
+            for i in 0..count {
+                level.admit(&format!("{i:0>64}")).unwrap();
+            }
+            held += level.cost();
+        }
     }
 
     #[test]

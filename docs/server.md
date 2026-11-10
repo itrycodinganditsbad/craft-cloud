@@ -550,10 +550,11 @@ sftp_host_key = "SHA256:…"               # the server's host key; or sftp_know
   error to the one request. Some providers allow only a few connections: lower `sftp_connections`.
 - `store estimate` and `store recompress` read every blob they look at over the network, and `recompress` writes it back:
   expect time and traffic. `store measure` asks for each object's size with one request. `verify` reads every chunk.
-- **A file server that lists too much is stopped.** A listing is bounded while it is read: more than a million entries in
-  one directory, names that add up to more than 64 MiB, a batch that repeats a name, or directories nested deeper than 16
-  levels (the layout needs four) end the operation with an error, so a broken or hostile server cannot make the process
-  use all its memory by never ending a listing.
+- **A file server that lists too much is stopped.** A listing is bounded while it is read: more than 100,000 entries in
+  one directory (the fullest directory of the layout holds a small fraction of that), names that add up to more than 8 MiB,
+  a batch that repeats a name, directories nested deeper than 6 levels (the layout needs three), or the nested levels of
+  one walk together holding more than about 48 MiB end the operation with an error, so a broken or hostile server cannot
+  make the process use all its memory by never ending a listing or by nesting large ones.
 - The setting `min_free` is not offered for SFTP, and the server does not refuse uploads when the remote directory is
   full: the file server's own refusal comes back as an error.
 
@@ -602,17 +603,23 @@ craft-cloud-server backup --config /var/lib/craft-cloud/config.toml \
   names another place when that is small. It needs room for the database.
 - **The backup key.** A backup server is somewhere you do not control, and whoever controls it could otherwise change
   the database in a backup (an account, a device token) and recompute the hash beside it, and a restore would take
-  the forgery for the backup. So the first `backup` makes a key, 32 random bytes in `backup.key` beside `config.toml`
+  the forgery for the backup. So the first `backup` makes a key, 32 random bytes written as 64 hexadecimal digits in `backup.key` beside `config.toml`
   (or the file named by `[backup] backup_key_file` or `--backup-key-file`; mode 0600 on Unix, never overwritten once
   it exists), and every backup is bound to it: the manifest's MAC covers each of its fields, the hash and size of the
   dump and of the blob inventory, and `restore` checks it before it believes any of them. **The key must be backed up
-  separately, from the machine and from the backup server** (a password manager will do; the file is 32 bytes). **Without
+  separately, from the machine and from the backup server** (see below). **Without
   it a backup cannot be restored**, and nothing can be done about that. The backup server can neither read the database
   (the dump is sealed under a key derived from the backup key) nor change it unnoticed. It *can* read the blobs
   (file contents, in the store's own format), see their number and sizes, and delete or withhold things (a restore then
   fails; it never accepts something made up). It can also offer an older backup that was genuine: look at the
   generation's stamp that `restore` prints. Sealing the blobs is a follow-up and not done yet. The key does not protect
   the files on the machine itself.
+
+  *Keeping the key.* The file is one line of 64 hexadecimal digits: `cat backup.key` shows it, and the line can be pasted into a
+  password manager as a secret note. To get it back, write that line into a file with any editor (white space around it and
+  capital letters do not matter; a file with anything else in it is refused with a message), keep the file private (`chmod
+  600`), and give it to `restore` with `--backup-key-file`, or name it in `[backup] backup_key_file` of the new
+  `config.toml`. Check a saved copy before you need it: restore a backup into a scratch directory with it.
 - **Not copied, on purpose:** `config.toml` (it holds secrets), `two-factor.key` and `backup.key`. Keep copies of all
   three apart from the backup: a backup does not hold them, and without the first key the two-factor secrets in a
   database cannot be opened.
@@ -661,14 +668,17 @@ leaves a database with part of its blobs at the target and a re-run is not refus
 
 **Limits, so a hostile or broken backup server cannot fill your disk.** The sizes in an authenticated manifest are the
 backup's own, but `restore` keeps limits of yours anyway and enforces them while the data arrives, before each blob:
-`--max-db-bytes` (default 8 GiB, the opened database), `--max-total-bytes` (default 1 TiB, database and blobs together),
+`--max-db-bytes` (default 8 GiB, the opened database), `--max-total-bytes` (default 1 TiB, what the restore writes to your
+disk: the database and the blobs as they are stored there),
 `--max-objects` (default 50 million blobs) and `--min-free-bytes` (default 1 GiB: the disk of the target must have that
 much left, looked at before the download and again before every blob). Sizes take units (`20 GiB`). Raise a limit if you
 really have a bigger backup; a restore that crosses one stops, removes what it made and says which limit.
 
 **Old backups.** A generation made before backups were authenticated (a `meta.sqlite` and no MAC) is refused, because
-nothing proves the backup server did not change it. If it is test data of your own, `--allow-unauthenticated` restores it
-(the limits apply, and the output warns). Make a new backup with this version and do not rely on the old one.
+nothing proves the backup server did not change it. If it is test data of your own, `--generation <stamp>` together with
+`--allow-unauthenticated` restores that one (the limits apply, and the output warns). Without `--generation` such a
+generation is passed over, never taken as the newest, because the backup server decides what looks newest. Make a new
+backup with this version and do not rely on the old one.
 
 **What a restore produces, whatever the server stored its blobs in.** `restore` always writes `meta.db` and a local
 disk tree `blobs/` (`chunks/ab/cd/<id>`, `manifests/ab/cd/<id>`), even if the backed-up server kept its blobs in S3 or on
@@ -690,18 +700,23 @@ S3 or SFTP. So the store (`[storage]`) is `disk`, `s3` or `sftp` and nothing els
 `rclone serve s3` or `rclone serve sftp` in front of a drive: the latency and the consistency are wrong for it, and that
 setup is not supported.
 
-A **backup** to such a drive is fine, in one of three ways:
+A **backup** to such a drive is fine. The built-in `backup` writes only to an `sftp://` address, so there are three ways:
 
-- **A. restic with the rclone backend.** Run `craft-cloud-server backup` to a local directory first (or dump the database
-  yourself), then, for example,
-  `restic -r rclone:gdrive:craft-cloud-backup backup /var/backups/craft-cloud/dump /var/lib/craft-cloud/blobs`.
-  restic encrypts everything it uploads, blobs included.
-- **B. The built-in backup to a local directory or an SFTP server, then `rclone sync`** to a `crypt` remote that wraps
-  the drive (`rclone config` makes it). The built-in backup seals the database dump, but not the blob contents, so the
-  `crypt` remote is what keeps the drive provider from reading your files.
-- **C. A bridge.** Run `rclone serve sftp` on a trusted machine, over a `crypt` remote on the drive, and give
-  `backup --to sftp://user@bridge/dir` that machine as the target. Host-key pinning (`--host-key` or `--known-hosts`)
-  and the SSH key (`--key-file`) apply as for any SFTP target.
+- **A. restic with the rclone backend, for a dump you make yourself.** For Postgres, `pg_dump --format=custom` into a
+  directory and then, for example,
+  `restic -r rclone:gdrive:craft-cloud-backup backup /var/backups/craft-cloud/dump`. For a SQLite server this also works
+  (copy the database with `sqlite3 meta.db "VACUUM INTO '/var/backups/craft-cloud/dump/meta.db'"` and add the blob
+  directory of a `disk` store), but then you do not have the backup key's protection; restic's own encryption and password
+  take its place, and restic encrypts blobs too.
+- **B. The built-in backup to an SFTP target, then `rclone sync` from there** to a `crypt` remote that wraps the drive
+  (`rclone config` makes it). The SFTP target can be a storage box, or any machine of yours with an SFTP server. The built-in
+  backup seals the database dump but not the blob contents, so the `crypt` remote is what keeps the drive provider from
+  reading your files. `rclone sync` copies the whole backup directory, generations and blobs.
+- **C. A bridge.** Run `rclone serve sftp` on loopback (or a trusted machine) over a local directory, and give
+  `backup --to sftp://user@localhost:2022/dir` that address as the target; then `rclone sync` the directory to the `crypt`
+  remote as in B. Host-key pinning (`--host-key` or `--known-hosts`) and the SSH key (`--key-file`) apply as for any SFTP
+  target. Serving the drive itself with `rclone serve sftp` is the setup this section advises against for the store, and it
+  is no better as a backup target than B.
 
 In every case the backup key (see "The backup key") must be kept separately, apart from the machine and from the drive:
 without it a built-in backup cannot be restored. Unless you use restic or a `crypt` remote, the drive provider can read

@@ -334,8 +334,10 @@ impl Budget {
         Ok(())
     }
 
-    /// Counts one blob of `bytes` that is about to be fetched.
-    fn charge_object(&mut self, bytes: u64) -> Result<(), CliError> {
+    /// Counts one blob that is about to be fetched and looks at the disk for it. `expected` is the size the backup server
+    /// reports (or, for an authenticated backup, the manifest lists): a guide for the free-space check, not what is counted
+    /// against `--max-total-bytes` (that is what is written, see [`Budget::charge_bytes`]).
+    fn begin_object(&mut self, expected: u64) -> Result<(), CliError> {
         self.objects = self.objects.saturating_add(1);
         if self.objects > self.limits.max_objects {
             return Err(CliError::Usage(format!(
@@ -343,8 +345,7 @@ impl Budget {
                 self.limits.max_objects
             )));
         }
-        self.charge_bytes(bytes)?;
-        self.check_free(bytes)
+        self.check_free(expected)
     }
 
     fn charge_bytes(&mut self, bytes: u64) -> Result<(), CliError> {
@@ -487,11 +488,16 @@ async fn copy_one(from: &Store, to: &Store, key: BlobKey, budget: Option<&Mutex<
         return Ok((None, len));
     }
     if let Some(budget) = budget {
+        // The size the backup server reports is only a guide for the free-space check: it is not trusted for the total.
         let size = from.object_len(key).await?.unwrap_or(0);
-        lock(budget).charge_object(size).map_err(CopyError::Limit)?;
+        lock(budget).begin_object(size).map_err(CopyError::Limit)?;
     }
     let bytes = from.get(key).await?;
     let written = to.put(key, &bytes).await?;
+    if let Some(budget) = budget {
+        // What was written here is what counts.
+        lock(budget).charge_bytes(written.physical_len).map_err(CopyError::Limit)?;
+    }
     Ok((Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX)), written.physical_len))
 }
 
@@ -614,7 +620,9 @@ const NOT_AUTHENTIC: &str = "the backup's manifest does not match the backup key
                              Nothing was restored";
 
 /// Reads the manifest of generation `stamp` and decides what to trust. Nothing in it is used before the MAC is right.
-fn read_manifest(raw: &[u8], stamp: &str, options: &RestoreOptions, out: &mut impl Write) -> Result<Source, CliError> {
+/// `None`: a generation from before backups were authenticated, which is only restored when it is named (`explicit`) and
+/// the flag is given; the newest generation is never one of those, whatever the backup server calls newest.
+fn read_manifest(raw: &[u8], stamp: &str, options: &RestoreOptions, explicit: bool, out: &mut impl Write) -> Result<Option<Source>, CliError> {
     let record: Value = serde_json::from_slice(raw).map_err(|_| CliError::Inconsistent("the backup's manifest is not readable".into()))?;
     match record["schema_version"].as_u64() {
         Some(2) => {
@@ -641,9 +649,12 @@ fn read_manifest(raw: &[u8], stamp: &str, options: &RestoreOptions, out: &mut im
             {
                 return Err(CliError::Inconsistent("the manifest names another generation or other files than its own".into()));
             }
-            Ok(Source::Authenticated(key, Box::new(signed)))
+            Ok(Some(Source::Authenticated(key, Box::new(signed))))
         }
         Some(1) if record["database"]["kind"] == "sqlite" => {
+            if !explicit {
+                return Ok(None);
+            }
             if !options.allow_unauthenticated {
                 return Err(CliError::Usage(
                     "this generation was made by an older version that did not authenticate backups: nothing proves that the backup server did not \
@@ -664,7 +675,7 @@ fn read_manifest(raw: &[u8], stamp: &str, options: &RestoreOptions, out: &mut im
             if record["database"]["file"] != dump_path {
                 return Err(CliError::Inconsistent("the manifest names another database file than its own generation".into()));
             }
-            Ok(Source::Unauthenticated { dump_path, hash, bytes })
+            Ok(Some(Source::Unauthenticated { dump_path, hash, bytes }))
         }
         _ => Err(CliError::Inconsistent("the backup was made by a version this one does not understand".into())),
     }
@@ -681,27 +692,58 @@ pub async fn restore_from<R: Remote>(
     check_empty(dir)?;
     let generations = list_generations(&remote).await?;
     let complete: Vec<&String> = generations.iter().filter(|(_, files)| files.iter().any(|f| f == MANIFEST_NAME)).map(|(stamp, _)| stamp).collect();
-    let stamp = match generation {
+    // The generation asked for, or the complete ones from the newest down. An old unauthenticated one is taken only when it
+    // is asked for by name: when none is named, such a generation is passed over (the backup server decides what looks newest,
+    // so a plain dump it plants must not become the restore).
+    let candidates: Vec<String> = match generation {
         // The whole name, or just its stamp (the newest backup that began in that second).
-        Some(wanted) => complete
-            .iter()
-            .rev()
-            .find(|stamp| {
-                stamp.as_str() == wanted
-                    || (stamp.len() > wanted.len() && stamp.starts_with(wanted) && stamp.get(wanted.len()..=wanted.len()) == Some("-"))
-            })
-            .map(|stamp| (*stamp).clone())
-            .ok_or_else(|| CliError::Usage(format!("the backup server has no complete generation {wanted}")))?,
-        None => complete.last().map(|stamp| (*stamp).clone()).ok_or_else(|| CliError::Usage("the backup server holds no complete backup".into()))?,
+        Some(wanted) => vec![
+            complete
+                .iter()
+                .rev()
+                .find(|stamp| {
+                    stamp.as_str() == wanted
+                        || (stamp.len() > wanted.len() && stamp.starts_with(wanted) && stamp.get(wanted.len()..=wanted.len()) == Some("-"))
+                })
+                .map(|stamp| (*stamp).clone())
+                .ok_or_else(|| CliError::Usage(format!("the backup server has no complete generation {wanted}")))?,
+        ],
+        None => complete.iter().rev().map(|stamp| (*stamp).clone()).collect(),
     };
-    let manifest_path = format!("{GENERATIONS}/{stamp}/{MANIFEST_NAME}");
-    let raw =
-        remote.get_raw_limited(&manifest_path, MAX_MANIFEST_BYTES).await?.ok_or_else(|| CliError::Inconsistent("the manifest disappeared".into()))?;
-    if raw.len() > MAX_MANIFEST_BYTES {
-        return Err(CliError::Inconsistent("the backup's manifest is too large to be one of ours".into()));
+    if candidates.is_empty() {
+        return Err(CliError::Usage("the backup server holds no complete backup".into()));
     }
-    // Before anything is written, and before any field is believed.
-    let source = read_manifest(&raw, &stamp, options, out)?;
+    let mut passed_over = Vec::new();
+    let mut chosen = None;
+    for stamp in candidates {
+        let manifest_path = format!("{GENERATIONS}/{stamp}/{MANIFEST_NAME}");
+        let raw = remote
+            .get_raw_limited(&manifest_path, MAX_MANIFEST_BYTES)
+            .await?
+            .ok_or_else(|| CliError::Inconsistent("the manifest disappeared".into()))?;
+        if raw.len() > MAX_MANIFEST_BYTES {
+            return Err(CliError::Inconsistent("the backup's manifest is too large to be one of ours".into()));
+        }
+        // Before anything is written, and before any field is believed. A manifest that fails is an error, never a reason
+        // to fall back to an older generation.
+        match read_manifest(&raw, &stamp, options, generation.is_some(), out)? {
+            Some(source) => {
+                chosen = Some((stamp, source));
+                break;
+            }
+            None => passed_over.push(stamp),
+        }
+    }
+    let Some((stamp, source)) = chosen else {
+        return Err(CliError::Usage(format!(
+            "the backup server holds no authenticated backup; {} older generation(s) are from before backups were authenticated and are restored only              when named (--generation <stamp> --allow-unauthenticated): {}",
+            passed_over.len(),
+            passed_over.join(", ")
+        )));
+    };
+    if !passed_over.is_empty() {
+        writeln!(out, "passed over {} newer generation(s) that are not authenticated: {}", passed_over.len(), passed_over.join(", "))?;
+    }
 
     // Everything is made in a directory beside the target and moved into place at the end, so a restore that is killed
     // leaves the target as it was (missing or empty, and a re-run is not refused) and a leftover `….restore-<id>` directory
@@ -912,7 +954,7 @@ async fn restore_listed_blobs(
 }
 
 async fn fetch_listed(source: &Store, local: &Store, key: BlobKey, size: u64, budget: &Mutex<Budget>) -> Result<u64, CliError> {
-    lock(budget).charge_object(size)?;
+    lock(budget).begin_object(size)?;
     let on_server = source
         .object_len(key)
         .await?
@@ -921,7 +963,10 @@ async fn fetch_listed(source: &Store, local: &Store, key: BlobKey, size: u64, bu
         return Err(CliError::Inconsistent(format!("{key} is {on_server} bytes on the backup server, the manifest lists {size}")));
     }
     let bytes = source.get(key).await.map_err(|e| CliError::Inconsistent(format!("{key}: {e}")))?;
-    local.put(key, &bytes).await?;
+    let written = local.put(key, &bytes).await?;
+    // What is written here counts against --max-total-bytes, whatever the manifest lists: the local copy is not stored the
+    // way the backup server stores it.
+    lock(budget).charge_bytes(written.physical_len)?;
     Ok(size)
 }
 

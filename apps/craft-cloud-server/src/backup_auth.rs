@@ -5,9 +5,11 @@
 //! server that rewrites a file rewrites the hash beside it. So the parts that decide what a restore trusts are bound to a
 //! secret the backup server never sees:
 //!
-//! - **The backup key** is 32 random bytes in a file of its own (`[backup] backup_key_file`, by default `backup.key`
-//!   beside `config.toml`), made on the first `backup` and never overwritten. It is not in the backup. Without it a backup
-//!   cannot be restored, so it must be kept apart from the machine (a password manager is fine: it is 64 hex digits).
+//! - **The backup key** is 32 random bytes, written as 64 hexadecimal digits and a line break in a file of its own
+//!   (`[backup] backup_key_file`, by default `backup.key` beside `config.toml`), made on the first `backup` and never
+//!   overwritten. It is not in the backup. Without it a backup cannot be restored, so it must be kept apart from the machine:
+//!   the text can be copied into a password manager and written back to a file with any editor (white space around it is
+//!   ignored; upper case digits are read too).
 //! - **The manifest** carries a MAC: keyed BLAKE3 under a key derived from the backup key with a context of its own. It
 //!   covers every field, the dump's hash and sizes, and the hash, count and total of the blob inventory, so a restore
 //!   trusts none of them before the MAC has been checked.
@@ -29,8 +31,10 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-/// The bytes a backup key file holds.
+/// The bytes of a backup key (its file holds them as hexadecimal digits).
 pub const KEY_BYTES: usize = 32;
+/// The hexadecimal digits of a key.
+const KEY_HEX_BYTES: usize = KEY_BYTES * 2;
 /// The default name of the key file, beside `config.toml`.
 pub const DEFAULT_KEY_FILE: &str = "backup.key";
 const SEGMENT: usize = 1024 * 1024;
@@ -56,20 +60,31 @@ impl std::fmt::Debug for BackupKey {
 }
 
 impl BackupKey {
-    /// Reads a key file: exactly 32 bytes.
+    /// Reads a key file: 64 hexadecimal digits, with white space around them ignored.
     pub fn load(path: &Path) -> Result<Self, String> {
         let mut file = std::fs::File::open(path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => format!("the backup key file {} does not exist", path.display()),
             _ => format!("can't read the backup key file {}: {e}", path.display()),
         })?;
-        let mut bytes = Zeroizing::new(Vec::with_capacity(KEY_BYTES + 1));
+        // A key file is 65 bytes; read a little more than that to tell a file that is too long.
+        let mut text = Zeroizing::new(Vec::with_capacity(KEY_HEX_BYTES * 2));
         (&mut file)
-            .take(KEY_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
+            .take(KEY_HEX_BYTES as u64 * 2)
+            .read_to_end(&mut text)
             .map_err(|e| format!("can't read the backup key file {}: {e}", path.display()))?;
-        let bytes: [u8; KEY_BYTES] =
-            bytes.as_slice().try_into().map_err(|_| format!("the backup key file {} must hold exactly 32 bytes", path.display()))?;
-        Ok(Self(Zeroizing::new(bytes)))
+        let bad =
+            || format!("the backup key file {} must hold the 64 hexadecimal digits of the key (and nothing else but white space)", path.display());
+        let digits = text.trim_ascii();
+        if digits.len() != KEY_HEX_BYTES {
+            return Err(bad());
+        }
+        let mut bytes = Zeroizing::new([0u8; KEY_BYTES]);
+        for (byte, pair) in bytes.iter_mut().zip(digits.chunks(2)) {
+            let value = |digit: &u8| char::from(*digit).to_digit(16);
+            let (Some(high), Some(low)) = (pair.first().and_then(value), pair.get(1).and_then(value)) else { return Err(bad()) };
+            *byte = u8::try_from(high * 16 + low).map_err(|_| bad())?;
+        }
+        Ok(Self(bytes))
     }
 
     /// Reads the key file, or makes it when there is none: 32 random bytes, owner-only on Unix, never over a file that is
@@ -93,7 +108,12 @@ impl BackupKey {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let written = options.open(&temp).and_then(|mut file| file.write_all(bytes.as_slice()).and_then(|()| file.sync_all()));
+        let mut text = Zeroizing::new(String::with_capacity(KEY_HEX_BYTES + 1));
+        for byte in bytes.iter() {
+            text.push_str(&format!("{byte:02x}"));
+        }
+        text.push('\n');
+        let written = options.open(&temp).and_then(|mut file| file.write_all(text.as_bytes()).and_then(|()| file.sync_all()));
         let published = written.and_then(|()| std::fs::hard_link(&temp, path));
         let _ = std::fs::remove_file(&temp);
         match published {
@@ -508,7 +528,10 @@ mod tests {
         let (first, made) = BackupKey::load_or_create(&path).unwrap();
         assert!(made);
         let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(bytes.len(), KEY_BYTES);
+        // 64 hexadecimal digits and a line break: text that can be copied.
+        assert_eq!(bytes.len(), KEY_HEX_BYTES + 1);
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(text.ends_with('\n') && text.trim_end().bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)), "{text:?}");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -521,8 +544,30 @@ mod tests {
         // No temporary file is left, and a key file of the wrong size is an error, not a new key.
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         std::fs::write(&path, b"short").unwrap();
-        assert!(BackupKey::load_or_create(&path).unwrap_err().contains("exactly 32 bytes"));
+        assert!(BackupKey::load_or_create(&path).unwrap_err().contains("64 hexadecimal digits"));
         assert_eq!(std::fs::read(&path).unwrap(), b"short");
+        // The text can be kept anywhere and written back with any editor: white space and capitals do not matter.
+        let same = format!("  {}\r\n\r\n", text.trim_end().to_uppercase());
+        std::fs::write(&path, same).unwrap();
+        assert_eq!(BackupKey::load(&path).unwrap().mac_key().as_slice(), first.mac_key().as_slice());
+        // Anything else is refused: the raw bytes, a digit too few or many, a letter that is no digit, text around.
+        let digits = text.trim_end().to_owned();
+        for bad in [
+            String::from_utf8_lossy(&[7u8; 32]).into_owned(),
+            digits[..63].to_owned(),
+            format!("{digits}0"),
+            format!("g{}", &digits[1..]),
+            format!("{digits} {digits}"),
+            format!("key: {digits}"),
+            String::new(),
+        ] {
+            std::fs::write(&path, &bad).unwrap();
+            let refused = BackupKey::load(&path).unwrap_err();
+            assert!(refused.contains("64 hexadecimal digits"), "{bad:?}: {refused}");
+        }
+        std::fs::write(&path, vec![b'a'; 100_000]).unwrap();
+        assert!(BackupKey::load(&path).is_err());
+        std::fs::write(&path, &text).unwrap();
         assert!(BackupKey::load(&dir.path().join("none.key")).unwrap_err().contains("does not exist"));
         assert_eq!(format!("{first:?}"), "BackupKey(<redacted>)");
     }
