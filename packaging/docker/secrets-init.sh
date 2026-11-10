@@ -68,26 +68,8 @@ prune server config.toml
 DATA=/var/lib/craft-cloud
 KEY="$DATA/two-factor.key"
 install -d -m 0700 -o 65532 -g 65532 "$DATA"
-if [ ! -e "$KEY" ] && [ ! -L "$KEY" ]; then
-    tmp="$DATA/.new.two-factor.key"
-    rm -f -- "$tmp"
-    head -c 32 /dev/urandom >"$tmp"
-    [ "$(wc -c <"$tmp")" -eq 32 ] || {
-        rm -f -- "$tmp"
-        echo "secrets-init: can't read 32 random bytes from /dev/urandom" >&2
-        exit 1
-    }
-    chown 65532:65532 "$tmp"
-    chmod 0600 "$tmp"
-    # A hard link fails when a key appeared in the meantime; it never replaces one.
-    ln "$tmp" "$KEY" 2>/dev/null || [ -e "$KEY" ] || {
-        rm -f -- "$tmp"
-        echo "secrets-init: can't create the two-factor key" >&2
-        exit 1
-    }
-    rm -f -- "$tmp"
-    echo "secrets-init: made the two-factor key"
-fi
+. /make-key.sh
+make_key "$KEY" 65532:65532 || exit 1
 
 case $DB_KIND in
     postgres)
