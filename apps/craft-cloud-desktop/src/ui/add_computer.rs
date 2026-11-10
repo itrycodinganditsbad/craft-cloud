@@ -24,7 +24,7 @@ pub(super) fn show(ui: &mut egui::Ui, adding: &Adding, now_ms: i64, events: &mut
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.add(egui::Label::new(RichText::new(&info.join).monospace().size(18.0).strong()).selectable(true));
-                if ui.small_button("Copy").clicked() {
+                if ui.add(super::kit::Button::new("Copy")).clicked() {
                     ui.ctx().copy_text(info.join.clone());
                 }
             });
@@ -56,7 +56,7 @@ pub(super) fn show(ui: &mut egui::Ui, adding: &Adding, now_ms: i64, events: &mut
     }
     if matches!(adding.state, AddState::Expired | AddState::Failed(_)) {
         ui.add_space(4.0);
-        if ui.button("Make a new code").clicked() {
+        if ui.add(super::kit::Button::new("Make a new code")).clicked() {
             events.push(Event::CloseAdding);
             events.push(Event::AddComputer);
         }
@@ -65,7 +65,7 @@ pub(super) fn show(ui: &mut egui::Ui, adding: &Adding, now_ms: i64, events: &mut
 
 /// `text` as a QR code `side` points wide: dark modules on white with the standard quiet zone, whatever the theme
 /// (cameras read it that way round).
-fn qr(ui: &mut egui::Ui, text: &str, side: f32) {
+pub(super) fn qr(ui: &mut egui::Ui, text: &str, side: f32) {
     let Ok(code) = QrCode::encode_text(text, QrCodeEcc::Medium) else {
         return;
     };

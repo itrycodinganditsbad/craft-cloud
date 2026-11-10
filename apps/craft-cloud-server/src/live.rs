@@ -768,13 +768,19 @@ pub async fn connect(
         return Err(ApiError::rate_limited(format!("a device may hold at most {MAX_CONNECTIONS_PER_DEVICE} live connections"), Some(5)));
     }
     let slot = ConnectionSlot { hub: state.clone(), device: auth.device };
+    // Listening for revocations before the device is looked up once more, and before the upgrade: a revoke between
+    // the sign-in check and here is seen by the lookup, one after it by the receiver, so none is missed.
+    let revocations = state.live.revocations();
+    if !state.meta.device_active(auth.device).await? {
+        return Err(ApiError::unauthorized());
+    }
     // No frame is over an update and its envelope (snapshots travel through the chunk API).
     Ok(upgrade.max_message_size(MAX_FRAME_BYTES).max_frame_size(MAX_FRAME_BYTES).on_upgrade(move |socket| async move {
         let _slot = slot;
         // Listening before the session reads anything, so no update falls between a read and the notification.
         let notes = state.live.listen(auth.space);
         let presence = state.live.listen_presence(auth.space);
-        serve(socket, Session::new(state, &auth), notes, presence).await;
+        serve(socket, Session::new(state, &auth), notes, presence, revocations).await;
     }))
 }
 
@@ -801,9 +807,14 @@ async fn send_all(socket: &mut WebSocket, frames: &[ServerFrame]) -> bool {
 
 /// The connection loop: frames in, frames out, the log pumped while a document has news, pings, and an end on
 /// shutdown, silence or a broken connection.
-async fn serve(mut socket: WebSocket, mut session: Session, mut notes: broadcast::Receiver<DocId>, mut presence: broadcast::Receiver<PresenceNote>) {
+async fn serve(
+    mut socket: WebSocket,
+    mut session: Session,
+    mut notes: broadcast::Receiver<DocId>,
+    mut presence: broadcast::Receiver<PresenceNote>,
+    mut revocations: broadcast::Receiver<DeviceId>,
+) {
     let mut stopping = session.state.notifier.shutdown_signal();
-    let mut revocations = session.state.live.revocations();
     let mut last_heard = Instant::now();
     let mut ping = tokio::time::interval_at(Instant::now() + PING_EVERY, PING_EVERY);
     let hello_by = Instant::now() + HELLO_TIMEOUT;

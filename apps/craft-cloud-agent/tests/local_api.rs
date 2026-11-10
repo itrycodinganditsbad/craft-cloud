@@ -10,7 +10,7 @@ use craft_cloud_agent::cli::{self, AgentError, Exit};
 use craft_cloud_agent::daemon::{RunOptions, run_loop};
 use craft_cloud_agent::schedule::Timing;
 use craft_cloud_meta::{Meta, Role};
-use craft_cloud_proto::api::{DeviceInfo, ErrorBody, PairingState, PairingStatus};
+use craft_cloud_proto::api::{DeviceInfo, ErrorBody, HistoryResponse, PairingState, PairingStatus};
 use craft_cloud_proto::local::{JoinRequest, LOCAL_API_FILE, LocalApiFile, LoginRequest, PairingInfo, RunState, Status, codes};
 use craft_cloud_server::AppState;
 use craft_cloud_server::auth::hash_password;
@@ -24,6 +24,7 @@ const PATIENCE: Duration = Duration::from_secs(30);
 struct Server {
     url: String,
     meta: Meta,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
     _dirs: (tempfile::TempDir, tempfile::TempDir),
 }
 
@@ -34,8 +35,8 @@ async fn server() -> Server {
     let state = AppState::new(meta.clone(), Store::new(DiskBackend::new(blobs.path()).unwrap()), vec![]).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(craft_cloud_server::serve(state, listener, std::future::pending()));
-    Server { url, meta, _dirs: (db, blobs) }
+    let task = tokio::spawn(craft_cloud_server::serve(state, listener, std::future::pending()));
+    Server { url, meta, task, _dirs: (db, blobs) }
 }
 
 fn quick() -> RunOptions {
@@ -172,8 +173,42 @@ const ROUTES: &[(&str, &str)] = &[
     ("GET", "/v1/pairings/0192f0c4-0000-7000-8000-000000000000"),
     ("DELETE", "/v1/pairings/0192f0c4-0000-7000-8000-000000000000"),
     ("GET", "/v1/devices"),
+    ("GET", "/v1/usage"),
     ("DELETE", "/v1/devices/0192f0c4-0000-7000-8000-000000000000"),
+    ("GET", "/v1/files/history?path=Notes%2Ftodo.txt"),
+    ("POST", "/v1/files/restore"),
+    ("GET", "/v1/trash?limit=1"),
+    ("POST", "/v1/trash/restore"),
+    ("POST", "/v1/trash/remove"),
     ("POST", "/v1/autostart"),
+    ("POST", "/v1/login/second-factor"),
+    ("GET", "/v1/account/two-factor"),
+    ("POST", "/v1/account/two-factor/setup"),
+    ("POST", "/v1/account/two-factor/confirm"),
+    ("POST", "/v1/account/two-factor/disable"),
+    ("POST", "/v1/account/two-factor/recovery-codes"),
+    ("POST", "/v1/account/password"),
+    ("POST", "/v1/devices/revoke-others"),
+    ("PATCH", "/v1/devices/0192f0c4-0000-7000-8000-000000000000"),
+    ("GET", "/v1/admin/server"),
+    ("GET", "/v1/admin/storage"),
+    ("GET", "/v1/admin/users"),
+    ("POST", "/v1/admin/users"),
+    ("PATCH", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000"),
+    ("GET", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/usage"),
+    ("DELETE", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000"),
+    ("POST", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/disable"),
+    ("POST", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/enable"),
+    ("POST", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/invite"),
+    ("DELETE", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/invite"),
+    ("POST", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/password-reset"),
+    ("POST", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/reset-two-factor"),
+    ("GET", "/v1/account"),
+    ("GET", "/v1/account/activity"),
+    ("GET", "/v1/admin/audit"),
+    ("GET", "/v1/admin/audit/export"),
+    ("GET", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/devices"),
+    ("DELETE", "/v1/admin/users/0192f0c4-0000-7000-8000-000000000000/devices/0192f0c4-0000-7000-8000-000000000001"),
 ];
 
 /// A user session without systemd: Linux's entry is the XDG autostart file.
@@ -522,12 +557,243 @@ async fn signed_in(server: &Server, data: &DataDir, folder: &Path) -> (Running, 
     (running, api)
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn usage_reads_through_to_the_server_without_caching() {
+    let server = server().await;
+    let data = DataDir::new(tempfile::tempdir().unwrap().keep());
+    let folder = tempfile::tempdir().unwrap();
+    let (_running, api) = signed_in(&server, &data, folder.path()).await;
+    let account = data.load_account().unwrap().unwrap();
+    let transport = craft_cloud_agent::http::HttpTransport::new(account.server.clone(), &account.token).unwrap();
+    std::fs::write(folder.path().join("usage-first.bin"), b"first payload").unwrap();
+    reaches_the_server(&server, "usage-first.bin").await;
+    let server_first = transport.usage().await.unwrap();
+    let (code, body) = call(&api, "GET", "/v1/usage", "");
+    assert_eq!(code, 200, "{body}");
+    let local_first: craft_cloud_proto::api::AccountUsage = serde_json::from_str(&body).unwrap();
+    assert_eq!(local_first, server_first, "the local API passes nonzero numbers through unchanged");
+    assert!(local_first.stored_bytes > 0);
+
+    std::fs::write(folder.path().join("usage-second.bin"), b"a different payload for fresh usage").unwrap();
+    reaches_the_server(&server, "usage-second.bin").await;
+    let server_second = transport.usage().await.unwrap();
+    let (code, body) = call(&api, "GET", "/v1/usage", "");
+    assert_eq!(code, 200, "{body}");
+    let local_second: craft_cloud_proto::api::AccountUsage = serde_json::from_str(&body).unwrap();
+    assert_eq!(local_second, server_second, "a second request sees server changes; no cache");
+    assert!(local_second.stored_bytes > local_first.stored_bytes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn usage_refuses_signed_out_and_reports_server_unreachable() {
+    let server = server().await;
+    let data = DataDir::new(tempfile::tempdir().unwrap().keep());
+    let running = Running::start(&data);
+    let api = api_file(data.path()).await;
+    let (code, body) = call(&api, "GET", "/v1/usage", "");
+    assert_eq!(code, 409, "{body}");
+    assert_eq!(error_code(&body), codes::NOT_SIGNED_IN);
+    let _ = running.stop().await;
+
+    let folder = tempfile::tempdir().unwrap();
+    let (running, api) = signed_in(&server, &data, folder.path()).await;
+    server.task.abort();
+    let (code, body) = call(&api, "GET", "/v1/usage", "");
+    assert_eq!(code, 503, "{body}");
+    assert_eq!(error_code(&body), codes::OFFLINE);
+    drop(running);
+}
+
 async fn reaches_the_server(server: &Server, name: &str) {
     let deadline = Instant::now() + PATIENCE;
     while !server_has(server, name).await {
         assert!(Instant::now() < deadline, "{name} reaches the server");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+async fn history_page(api: &LocalApiFile, path: &str, cursor: Option<&str>, limit: u32) -> HistoryResponse {
+    let mut query = format!("path={path}&limit={limit}");
+    if let Some(cursor) = cursor {
+        query.push_str("&cursor=");
+        query.push_str(cursor);
+    }
+    let (code, body) = call(api, "GET", &format!("/v1/files/history?{query}"), "");
+    assert_eq!(code, 200, "{body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_file_history_pages_restores_and_syncs_to_disk() {
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let folder = dir.path().join("Craft Cloud");
+    let (running, api) = signed_in(&server, &data, &folder).await;
+    let subdir = folder.join("Notes");
+    std::fs::create_dir(&subdir).unwrap();
+    let file = subdir.join("story.txt");
+
+    let mut previous = None;
+    for content in [b"first version".as_slice(), b"second version".as_slice(), b"third version".as_slice()] {
+        std::fs::write(&file, content).unwrap();
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let (code, body) = call(&api, "GET", "/v1/files/history?path=Notes%2Fstory.txt&limit=1", "");
+            if code == 200 {
+                let page: HistoryResponse = serde_json::from_str(&body).unwrap();
+                if page.versions.first().is_some_and(|version| Some(version.id) != previous) {
+                    previous = page.versions.first().map(|version| version.id);
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "version reaches server history");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    let newest = history_page(&api, "Notes%2Fstory.txt", None, 1).await;
+    let cursor = newest.next.clone().expect("more than one history page");
+    let older = history_page(&api, "Notes%2Fstory.txt", Some(&cursor), 1).await;
+    let current = newest.versions.first().expect("current version").id;
+    let restore = older.versions.first().expect("older version").id;
+    let body = serde_json::json!({ "path": "Notes/story.txt", "version": restore, "expected_version": current }).to_string();
+    let (code, answer) = call(&api, "POST", "/v1/files/restore", &body);
+    assert_eq!(code, 200, "{answer}");
+    let restored: craft_cloud_proto::api::RestoreResponse = serde_json::from_str(&answer).unwrap();
+    assert_eq!(restored.parent_version, current);
+
+    let stale = serde_json::json!({ "path": "Notes/story.txt", "version": current, "expected_version": current }).to_string();
+    let (code, answer) = call(&api, "POST", "/v1/files/restore", &stale);
+    assert_eq!((code, error_code(&answer).as_str()), (409, "conflict"), "{answer}");
+
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        if std::fs::read(&file).is_ok_and(|bytes| bytes.as_slice() == b"second version") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the change feed syncs restored bytes to disk");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (exit, output) = running.stop().await;
+    assert_eq!(exit.unwrap(), Exit::Done, "{output}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_file_history_rejects_unknown_outside_and_directory_paths() {
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let folder = dir.path().join("Craft Cloud");
+    let (running, api) = signed_in(&server, &data, &folder).await;
+    std::fs::create_dir(folder.join("Folder")).unwrap();
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let (code, body) = call(&api, "GET", "/v1/files/history?path=Folder", "");
+        if code == 400 {
+            assert_eq!(error_code(&body), "invalid");
+            break;
+        }
+        assert!(Instant::now() < deadline, "directory enters sync state");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (code, body) = call(&api, "GET", "/v1/files/history?path=missing.txt", "");
+    assert_eq!((code, error_code(&body).as_str()), (404, "not_found"), "{body}");
+    let (code, body) = call(&api, "GET", "/v1/files/history?path=..%2Foutside.txt", "");
+    assert_eq!((code, error_code(&body).as_str()), (400, "invalid"), "{body}");
+    let _ = running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_trash_pages_restores_renames_and_removes_nodes() {
+    use craft_cloud_proto::local::TrashResponse;
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let folder = dir.path().join("Craft Cloud");
+    let (running, api) = signed_in(&server, &data, &folder).await;
+
+    std::fs::write(folder.join("first.txt"), b"first bytes").unwrap();
+    std::fs::write(folder.join("second.txt"), b"second bytes").unwrap();
+    reaches_the_server(&server, "first.txt").await;
+    reaches_the_server(&server, "second.txt").await;
+    std::fs::remove_file(folder.join("first.txt")).unwrap();
+    std::fs::remove_file(folder.join("second.txt")).unwrap();
+    let deadline = Instant::now() + PATIENCE;
+    let page = loop {
+        let (code, body) = call(&api, "GET", "/v1/trash?limit=1", "");
+        if code == 200 {
+            let page: TrashResponse = serde_json::from_str(&body).unwrap();
+            if page.items.len() == 1 && page.next.is_some() {
+                break page;
+            }
+        }
+        assert!(Instant::now() < deadline, "both deleted files enter the trash");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let first = page.items.first().unwrap();
+    assert_eq!(first.path.as_deref(), Some(first.name.as_str()), "live root parent yields a path hint");
+    let cursor = page.next.as_deref().unwrap();
+    let (code, body) = call(&api, "GET", &format!("/v1/trash?limit=1&cursor={cursor}"), "");
+    assert_eq!(code, 200, "{body}");
+    let second_page: TrashResponse = serde_json::from_str(&body).unwrap();
+    let second = second_page.items.first().unwrap();
+    assert_ne!(first.id, second.id);
+
+    let restore_body = serde_json::json!({ "id": first.id }).to_string();
+    let (code, body) = call(&api, "POST", "/v1/trash/restore", &restore_body);
+    assert_eq!(code, 200, "{body}");
+    let restored: craft_cloud_proto::api::TrashRestoreResponse = serde_json::from_str(&body).unwrap();
+    assert!(!restored.renamed);
+    let restored_path = folder.join(&restored.name);
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        if std::fs::read(&restored_path)
+            .is_ok_and(|bytes| bytes.as_slice() == if first.name == "first.txt" { &b"first bytes"[..] } else { &b"second bytes"[..] })
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the agent syncs restored bytes to disk");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Re-delete the restored ID, create a live node with its old name, then verify conflict rename on restore.
+    std::fs::remove_file(&restored_path).unwrap();
+    let deadline = Instant::now() + PATIENCE;
+    let mut trashed_again = false;
+    while !trashed_again {
+        let (code, body) = call(&api, "GET", "/v1/trash?limit=50", "");
+        if code == 200 {
+            let page: TrashResponse = serde_json::from_str(&body).unwrap();
+            trashed_again = page.items.iter().any(|item| item.id == restored.node);
+        }
+        assert!(Instant::now() < deadline, "restored node is deleted again");
+        if !trashed_again {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    std::fs::write(&restored_path, b"replacement bytes").unwrap();
+    reaches_the_server(&server, &restored.name).await;
+    let (code, body) = call(&api, "POST", "/v1/trash/restore", &serde_json::json!({ "id": restored.node }).to_string());
+    assert_eq!(code, 200, "{body}");
+    let renamed: craft_cloud_proto::api::TrashRestoreResponse = serde_json::from_str(&body).unwrap();
+    assert!(renamed.renamed, "{renamed:?}");
+    assert_ne!(renamed.name, restored.name);
+
+    let (code, body) = call(&api, "POST", "/v1/trash/remove", &serde_json::json!({ "id": second.id }).to_string());
+    assert_eq!(code, 204, "{body}");
+    let (code, body) = call(&api, "GET", "/v1/trash?limit=50", "");
+    assert_eq!(code, 200, "{body}");
+    let remaining: TrashResponse = serde_json::from_str(&body).unwrap();
+    assert!(remaining.items.iter().all(|item| item.id != second.id));
+    let (code, body) = call(&api, "POST", "/v1/trash/restore", &serde_json::json!({ "id": second.id }).to_string());
+    assert_eq!((code, error_code(&body).as_str()), (404, "not_found"), "{body}");
+    let (code, body) = call(&api, "POST", "/v1/trash/restore", &serde_json::json!({ "id": "invalid" }).to_string());
+    assert_eq!((code, error_code(&body).as_str()), (400, "invalid"), "{body}");
+    let unknown = craft_cloud_proto::NodeId::generate();
+    let (code, body) = call(&api, "POST", "/v1/trash/restore", &serde_json::json!({ "id": unknown }).to_string());
+    assert_eq!((code, error_code(&body).as_str()), (404, "not_found"), "{body}");
+    let _ = running.stop().await;
 }
 
 /// Paused, nothing syncs and the status says so (not as a pause that needs someone); it stays paused after `run`
@@ -694,6 +960,8 @@ impl Machine {
             device_name: Some("lptp1".into()),
             adopt,
             password: password.map(str::to_owned),
+            totp_code: None,
+            recovery_code: None,
         })
         .unwrap()
     }
@@ -783,6 +1051,45 @@ async fn a_second_computer_joins_with_a_code_from_the_first() {
     let _ = running.stop().await;
 }
 
+/// Renaming this computer is kept here too (the status, the saved account), so the app's title agrees with the computers
+/// list; renaming another computer changes nothing here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn renaming_this_computer_updates_its_own_status_but_another_one_does_not() {
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let folder: PathBuf = dir.path().join("Craft Cloud");
+    let (running, a) = signed_in(&server, &data, &folder).await;
+    let before = status(&a).machine.unwrap();
+
+    let pairing = new_pairing(&a);
+    let b = Machine::signed_out().await;
+    let (code, body) = b.join(&pairing.join, false, None);
+    assert_eq!(code, 200, "{body}");
+    let both = devices(&a);
+    let me = both.iter().find(|d| d.current).unwrap();
+    let other = both.iter().find(|d| !d.current).unwrap();
+
+    // Another computer: the server has the name, this agent's status and account keep theirs.
+    let (code, body) = call(&a, "PATCH", &format!("/v1/devices/{}", other.id), r#"{"name":"the other one"}"#);
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(status(&a).machine.as_deref(), Some(before.as_str()));
+    assert_eq!(data.load_account().unwrap().unwrap().device_name, before);
+
+    // This computer: the status and the saved account say the new name at once.
+    let (code, body) = call(&a, "PATCH", &format!("/v1/devices/{}", me.id), r#"{"name":"my new name"}"#);
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(status(&a).machine.as_deref(), Some("my new name"));
+    assert_eq!(data.load_account().unwrap().unwrap().device_name, "my new name");
+    assert!(devices(&a).iter().any(|d| d.current && d.name == "my new name"));
+    // A refused rename (an empty name) leaves the name as it is.
+    let (code, _) = call(&a, "PATCH", &format!("/v1/devices/{}", me.id), r#"{"name":""}"#);
+    assert_ne!(code, 200);
+    assert_eq!(status(&a).machine.as_deref(), Some("my new name"));
+    b.stop().await;
+    let _ = running.stop().await;
+}
+
 /// What can be checked before the code is spent is checked first: a folder with files and no `adopt` leaves the code
 /// usable. What can only fail after it (a marker for another space in the folder) removes the new device again and
 /// says to make a new code.
@@ -850,4 +1157,452 @@ async fn an_invite_to_a_new_account_asks_for_a_password_through_the_agent() {
     let joined: Status = serde_json::from_str(&body).unwrap();
     assert_eq!(joined.account.as_deref(), Some("cleo"));
     b.stop().await;
+}
+
+// ---- the admin calls (`/v1/admin/…`) ----
+
+use craft_cloud_proto::api::{
+    AccountUsage, AdminCode, AdminCreatedUser, AdminDevices, AdminServerInfo, AdminStorageOverview, AdminUserInfo, AdminUserList,
+};
+
+/// The server with `root`, an administrator, beside `ana`, a member.
+async fn admin_server() -> Server {
+    let server = server().await;
+    server.meta.create_user("root", &hash_password(PASSWORD).unwrap(), Role::Admin, 0).await.unwrap();
+    server
+}
+
+/// Signs `run` in as `user` through its local API and waits until it is idle.
+async fn signed_in_as(server: &Server, user: &str, data: &DataDir, folder: &Path) -> (Running, LocalApiFile) {
+    let running = Running::start(data);
+    let api = api_file(data.path()).await;
+    let body = serde_json::to_string(&LoginRequest {
+        server: server.url.clone(),
+        user: user.into(),
+        password: PASSWORD.into(),
+        folder: Some(folder.display().to_string()),
+        device_name: Some(format!("{user}-pc")),
+        adopt: false,
+    })
+    .unwrap();
+    let (code, answer) = call(&api, "POST", "/v1/login", &body);
+    assert_eq!(code, 200, "{answer}");
+    eventually("signed in and idle", || status(&api).run_state == RunState::Idle).await;
+    (running, api)
+}
+
+/// A call with the confirmation `password` and the rest of the body in `fields`.
+fn confirmed(api: &LocalApiFile, method: &str, path: &str, password: &str, fields: serde_json::Value) -> (u16, String) {
+    let mut body = fields;
+    body["password"] = password.into();
+    call(api, method, path, &body.to_string())
+}
+
+/// Whether an admin disabled the account.
+async fn is_disabled(server: &Server, name: &str) -> bool {
+    let user = server.meta.user_by_name(name).await.unwrap().unwrap();
+    server.meta.admin_user(user.id, 0).await.unwrap().unwrap().disabled_ms.is_some()
+}
+
+fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            files_under(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
+}
+
+/// Every route passes the server's answer on with its status and code: reads, the changes of an account, the codes,
+/// the devices; the confirmation is the admin's password in the body; a missing or wrong one is the server's `400
+/// invalid` and `403 wrong_password` (never 401), and too many wrong ones its `429`. Nothing of the password or of a
+/// code is kept by the agent or printed by it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_calls_reach_the_servers_admin_api_and_pass_its_answers_through() {
+    let server = admin_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let folder = dir.path().join("Craft Cloud");
+    let (running, api) = signed_in_as(&server, "root", &data, &folder).await;
+    let ana = server.meta.user_by_name("ana").await.unwrap().unwrap();
+    let ana_path = format!("/v1/admin/users/{}", ana.id.0);
+
+    // Reads.
+    let (code, body) = call(&api, "GET", "/v1/admin/server", "");
+    assert_eq!(code, 200, "{body}");
+    let info: AdminServerInfo = serde_json::from_str(&body).unwrap();
+    assert_eq!((info.users, info.devices_active, info.storage_kind.as_str()), (2, 1, "disk"));
+    let (code, body) = call(&api, "GET", "/v1/admin/storage", "");
+    assert_eq!(code, 200, "{body}");
+    let overview: AdminStorageOverview = serde_json::from_str(&body).unwrap();
+    assert_eq!(overview.accounts, 2);
+    assert_eq!(overview.stored_bytes, 0);
+    let (code, body) = call(&api, "GET", &format!("{ana_path}/usage"), "");
+    assert_eq!(code, 200, "{body}");
+    let usage: AccountUsage = serde_json::from_str(&body).unwrap();
+    assert_eq!((usage.stored_bytes, usage.quota_bytes, usage.trash_bytes, usage.history_bytes), (0, None, Some(0), Some(0)));
+    let (code, body) = call(&api, "GET", "/v1/admin/users?limit=1", "");
+    assert_eq!(code, 200, "{body}");
+    let page: AdminUserList = serde_json::from_str(&body).unwrap();
+    assert_eq!(page.users.iter().map(|u| u.username.as_str()).collect::<Vec<_>>(), ["ana"]);
+    let next = page.next.expect("a second page");
+    let (code, body) = call(&api, "GET", &format!("/v1/admin/users?limit=1&cursor={next}"), "");
+    assert_eq!(code, 200, "{body}");
+    let second: AdminUserList = serde_json::from_str(&body).unwrap();
+    assert_eq!((second.users.first().map(|u| u.username.as_str()), second.next), (Some("root"), None));
+    let (code, body) = call(&api, "GET", "/v1/admin/users?query=AN", "");
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(serde_json::from_str::<AdminUserList>(&body).unwrap().users.len(), 1);
+    let (code, body) = call(&api, "GET", "/v1/admin/users?limit=0", "");
+    assert_eq!((code, error_code(&body).as_str()), (400, "invalid"), "the server's own refusal: {body}");
+    let (code, body) = call(&api, "GET", "/v1/admin/users?limit=x", "");
+    assert_eq!((code, error_code(&body).as_str()), (400, "invalid"), "{body}");
+    let (code, body) = call(&api, "GET", &format!("{ana_path}/devices"), "");
+    assert_eq!(code, 200, "{body}");
+    assert!(serde_json::from_str::<AdminDevices>(&body).unwrap().devices.is_empty());
+
+    // A missing confirmation is the server's `invalid`; a wrong one its `wrong_password`, a 403: never a 401.
+    let (code, body) = call(&api, "POST", &format!("{ana_path}/disable"), "{}");
+    assert_eq!((code, error_code(&body).as_str()), (400, "invalid"), "{body}");
+    let (code, body) = confirmed(&api, "POST", &format!("{ana_path}/disable"), "not the password", serde_json::json!({}));
+    assert_eq!((code, error_code(&body).as_str()), (403, "wrong_password"), "{body}");
+    let (code, body) = call(&api, "POST", &format!("{ana_path}/disable"), "not json");
+    assert_eq!(code, 400, "{body}");
+    assert!(!is_disabled(&server, "ana").await, "nothing changed without a right confirmation");
+    assert!(status(&api).signed_in && !status(&api).removed, "a 403 doesn't sign the agent out");
+
+    // The changes: with the confirmation, each is the server's answer.
+    let (code, body) = confirmed(&api, "POST", "/v1/admin/users", PASSWORD, serde_json::json!({ "username": "bo", "role": "member" }));
+    assert_eq!(code, 200, "{body}");
+    let created: AdminCreatedUser = serde_json::from_str(&body).unwrap();
+    assert_eq!((created.user.username.as_str(), created.user.role.as_str(), created.user.invite_pending), ("bo", "member", true));
+    let invite_code = created.invite.code.clone();
+    assert!(!invite_code.is_empty());
+    let bo_path = format!("/v1/admin/users/{}", created.user.id);
+    let (code, body) = confirmed(&api, "POST", "/v1/admin/users", PASSWORD, serde_json::json!({ "username": "bo", "role": "member" }));
+    assert_eq!((code, error_code(&body).as_str()), (409, "username_taken"), "{body}");
+    let (code, body) = confirmed(&api, "PATCH", &ana_path, PASSWORD, serde_json::json!({ "quota_bytes": 50_000_000 }));
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(serde_json::from_str::<AdminUserInfo>(&body).unwrap().quota_bytes, Some(50_000_000));
+    let (code, body) = confirmed(&api, "PATCH", &ana_path, PASSWORD, serde_json::json!({ "quota_bytes": null, "role": "admin" }));
+    assert_eq!(code, 200, "{body}");
+    let changed: AdminUserInfo = serde_json::from_str(&body).unwrap();
+    assert_eq!((changed.quota_bytes, changed.role.as_str()), (None, "admin"));
+    let (code, body) = confirmed(&api, "PATCH", &ana_path, PASSWORD, serde_json::json!({}));
+    assert_eq!((code, error_code(&body).as_str()), (400, "invalid"), "{body}");
+    let (code, body) = confirmed(&api, "PATCH", &ana_path, PASSWORD, serde_json::json!({ "role": "member" }));
+    assert_eq!(code, 200, "{body}");
+    // The last administrator can't be demoted: the server's 409.
+    let root = server.meta.user_by_name("root").await.unwrap().unwrap();
+    let (code, body) = confirmed(&api, "PATCH", &format!("/v1/admin/users/{}", root.id.0), PASSWORD, serde_json::json!({ "role": "member" }));
+    assert_eq!((code, error_code(&body).as_str()), (409, "last_admin"), "{body}");
+    let (code, body) = confirmed(&api, "POST", &format!("{ana_path}/disable"), PASSWORD, serde_json::json!({}));
+    assert_eq!((code, body.as_str()), (204, ""), "{body}");
+    assert!(is_disabled(&server, "ana").await);
+    let (code, body) = confirmed(&api, "POST", &format!("{ana_path}/enable"), PASSWORD, serde_json::json!({}));
+    assert_eq!((code, body.as_str()), (204, ""), "{body}");
+    let (code, body) = confirmed(&api, "POST", &format!("{ana_path}/password-reset"), PASSWORD, serde_json::json!({}));
+    assert_eq!(code, 200, "{body}");
+    let reset: AdminCode = serde_json::from_str(&body).unwrap();
+    assert!(!reset.code.is_empty());
+    let (code, body) = confirmed(&api, "POST", &format!("{ana_path}/invite"), PASSWORD, serde_json::json!({}));
+    assert_eq!((code, error_code(&body).as_str()), (409, "conflict"), "ana has a password: the server says so: {body}");
+    let (code, body) = confirmed(&api, "POST", &format!("{bo_path}/invite"), PASSWORD, serde_json::json!({}));
+    assert_eq!(code, 200, "{body}");
+    let second_invite: AdminCode = serde_json::from_str(&body).unwrap();
+    let (code, body) = confirmed(&api, "DELETE", &format!("{bo_path}/invite"), PASSWORD, serde_json::json!({}));
+    assert_eq!((code, body.as_str()), (204, ""), "{body}");
+    let (code, body) = confirmed(&api, "DELETE", &format!("{bo_path}/invite"), PASSWORD, serde_json::json!({}));
+    assert_eq!((code, error_code(&body).as_str()), (404, "not_found"), "nothing left to revoke: {body}");
+    let unknown_device = craft_cloud_proto::DeviceId::generate();
+    let (code, body) = confirmed(&api, "DELETE", &format!("{ana_path}/devices/{unknown_device}"), PASSWORD, serde_json::json!({}));
+    assert_eq!((code, error_code(&body).as_str()), (404, "not_found"), "{body}");
+    let (code, body) = confirmed(&api, "DELETE", &bo_path, PASSWORD, serde_json::json!({}));
+    assert_eq!((code, body.as_str()), (202, ""), "the server's own status: {body}");
+    let (code, body) = call(&api, "GET", "/v1/admin/users", "");
+    assert_eq!(code, 200, "{body}");
+    assert!(serde_json::from_str::<AdminUserList>(&body).unwrap().users.iter().all(|u| u.username != "bo"), "removed accounts are out of the list");
+    let (code, body) = call(&api, "GET", "/v1/admin/users/not-an-id/devices", "");
+    assert_eq!((code, error_code(&body).as_str()), (400, "invalid"), "{body}");
+
+    // Wrong passwords are counted by the server: it says when it has had enough, and that stays a 429.
+    let mut limited = None;
+    for _ in 0..8 {
+        let (code, body) = confirmed(&api, "POST", &format!("{ana_path}/disable"), "still wrong", serde_json::json!({}));
+        if code == 429 {
+            limited = Some(error_code(&body));
+            break;
+        }
+        assert_eq!((code, error_code(&body).as_str()), (403, "wrong_password"), "{body}");
+    }
+    assert_eq!(limited.as_deref(), Some("rate_limited"));
+    assert!(status(&api).signed_in && !status(&api).removed);
+
+    let (exit, out) = running.stop().await;
+    assert_eq!(exit.unwrap(), Exit::Done, "{out}");
+    // Nothing of the confirmation or the codes was kept or printed (the files are read once the agent has stopped: it
+    // holds the data folder's lock while it runs).
+    let mut written = Vec::new();
+    files_under(data.path(), &mut written);
+    for file in written.iter().filter(|f| f.file_name().is_some_and(|n| n != LOCAL_API_FILE)) {
+        let text = String::from_utf8_lossy(&std::fs::read(file).unwrap()).into_owned();
+        for secret in [PASSWORD, "still wrong", invite_code.as_str(), reset.code.as_str(), second_invite.code.as_str()] {
+            assert!(!text.contains(secret), "{} holds a secret", file.display());
+        }
+    }
+    for secret in [PASSWORD, "still wrong", invite_code.as_str(), reset.code.as_str(), second_invite.code.as_str()] {
+        assert!(!out.contains(secret), "the agent printed a secret: {out}");
+    }
+}
+
+/// A member's calls are refused by the server as `403 forbidden`, and that is what the app is told; the agent is
+/// not signed out by it (a 401 would mean "this device was revoked").
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_is_told_forbidden_and_stays_signed_in() {
+    let server = admin_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let (running, api) = signed_in_as(&server, "ana", &data, &dir.path().join("Craft Cloud")).await;
+    let some_id = "0192f0c4-0000-7000-8000-000000000000";
+    for (method, path) in
+        [("GET", "/v1/admin/server".to_owned()), ("GET", "/v1/admin/users".to_owned()), ("GET", format!("/v1/admin/users/{some_id}/devices"))]
+    {
+        let (code, body) = call(&api, method, &path, "");
+        assert_eq!((code, error_code(&body).as_str()), (403, "forbidden"), "{method} {path}: {body}");
+    }
+    for (method, path) in [
+        ("POST", "/v1/admin/users".to_owned()),
+        ("PATCH", format!("/v1/admin/users/{some_id}")),
+        ("POST", format!("/v1/admin/users/{some_id}/disable")),
+        ("DELETE", format!("/v1/admin/users/{some_id}")),
+    ] {
+        let fields = serde_json::json!({ "username": "x", "role": "admin", "quota_bytes": 5_000_000 });
+        let (code, body) = confirmed(&api, method, &path, PASSWORD, fields);
+        assert_eq!((code, error_code(&body).as_str()), (403, "forbidden"), "{method} {path}: {body}");
+    }
+    let now = status(&api);
+    assert!(now.signed_in && !now.removed, "{now:?}");
+    let ana = server.meta.user_by_name("ana").await.unwrap().unwrap();
+    assert_eq!(ana.role, Role::Member);
+    let (exit, out) = running.stop().await;
+    assert_eq!(exit.unwrap(), Exit::Done, "{out}");
+}
+
+/// The server's `401` for a revoked admin device is not a local `401` (which says the token is wrong): it is told as
+/// every signed-in call tells it, as something that needs the person.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revoked_admin_device_is_told_as_needs_you() {
+    let server = admin_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let (running, api) = signed_in_as(&server, "root", &data, &dir.path().join("Craft Cloud")).await;
+    let root = server.meta.user_by_name("root").await.unwrap().unwrap();
+    for device in server.meta.list_devices(root.id).await.unwrap() {
+        server.meta.revoke_device(root.id, device.id).await.unwrap();
+    }
+    let (code, body) = call(&api, "GET", "/v1/admin/server", "");
+    assert_eq!((code, error_code(&body).as_str()), (409, codes::NEEDS_YOU), "{body}");
+    let (code, body) = confirmed(&api, "POST", "/v1/admin/users", PASSWORD, serde_json::json!({ "username": "x", "role": "member" }));
+    assert_eq!((code, error_code(&body).as_str()), (409, codes::NEEDS_YOU), "{body}");
+    running.stop().await.0.unwrap();
+}
+
+/// Signed out there is no server to ask; the bodies are small; the checks on every call are the other routes'.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_calls_need_a_sign_in_and_small_bodies() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("data"));
+    let running = Running::start(&data);
+    let api = api_file(data.path()).await;
+    let id = "0192f0c4-0000-7000-8000-000000000000";
+    let (code, body) = call(&api, "GET", "/v1/admin/server", "");
+    assert_eq!((code, error_code(&body).as_str()), (409, codes::NOT_SIGNED_IN), "{body}");
+    let (code, body) = confirmed(&api, "POST", &format!("/v1/admin/users/{id}/disable"), PASSWORD, serde_json::json!({}));
+    assert_eq!((code, error_code(&body).as_str()), (409, codes::NOT_SIGNED_IN), "{body}");
+    let (code, body) = call(&api, "GET", "/v1/admin/users?limit=9999999999", "");
+    assert_eq!(code, 400, "a limit that is no number: {body}");
+    let long = serde_json::json!({ "username": "a".repeat(9 * 1024), "role": "member", "password": PASSWORD }).to_string();
+    let (code, body) = call(&api, "POST", "/v1/admin/users", &long);
+    assert_eq!((code, error_code(&body).as_str()), (413, "too_large"), "{body}");
+    let (code, _) = call(&api, "POST", "/v1/admin/users", "{\"username\": 5}");
+    assert_eq!(code, 422, "the shape of the body is checked here too");
+    running.stop().await.0.unwrap();
+}
+
+// ---- the account, its activity and the audit log ----
+
+use craft_cloud_proto::api::{AccountInfo, AuditEvent, AuditPage};
+use craft_cloud_server::audit::AuditExportLimits;
+
+/// [`admin_server`] with the export cut as `limits` say.
+async fn admin_server_limited(limits: AuditExportLimits) -> Server {
+    let (db, blobs) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let meta = Meta::open(&format!("sqlite:{}", db.path().join("meta.db").display())).await.unwrap();
+    meta.create_user("ana", &hash_password(PASSWORD).unwrap(), Role::Member, 0).await.unwrap();
+    meta.create_user("root", &hash_password(PASSWORD).unwrap(), Role::Admin, 0).await.unwrap();
+    let state = AppState::new(meta.clone(), Store::new(DiskBackend::new(blobs.path()).unwrap()), vec![]).unwrap().with_audit_export(limits);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(craft_cloud_server::serve(state, listener, std::future::pending()));
+    Server { url, meta, task, _dirs: (db, blobs) }
+}
+
+fn page_of(body: &str) -> AuditPage {
+    serde_json::from_str(body).unwrap_or_else(|e| panic!("not an audit page ({e}): {body}"))
+}
+
+/// The account, its activity, the audit list and its export pass through the agent with the server's statuses and codes: a
+/// member's `403 forbidden` is never a signed-out agent; filters are checked before they are sent; the export is the server's
+/// stream, whole, and `truncated` when the server cuts it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_account_its_activity_and_the_audit_log_pass_through() {
+    let server = admin_server_limited(AuditExportLimits::default()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let root_data = DataDir::new(dir.path().join("root"));
+    let ana_data = DataDir::new(dir.path().join("ana"));
+    let (root_run, root) = signed_in_as(&server, "root", &root_data, &dir.path().join("Root Cloud")).await;
+    let (ana_run, ana) = signed_in_as(&server, "ana", &ana_data, &dir.path().join("Ana Cloud")).await;
+    let ana_user = server.meta.user_by_name("ana").await.unwrap().unwrap();
+
+    // Some more events: the admin creates an account, disables it and enables it again (not ana: that would sign her out).
+    let (code, body) = confirmed(&root, "POST", "/v1/admin/users", PASSWORD, serde_json::json!({ "username": "bo", "role": "member" }));
+    assert_eq!(code, 200, "{body}");
+    let bo = serde_json::from_str::<craft_cloud_proto::api::AdminCreatedUser>(&body).unwrap().user.id;
+    for what in ["disable", "enable"] {
+        let (code, body) = confirmed(&root, "POST", &format!("/v1/admin/users/{bo}/{what}"), PASSWORD, serde_json::json!({}));
+        assert_eq!(code, 204, "{body}");
+    }
+
+    // The signed-in account, as the server says it.
+    let (code, body) = call(&root, "GET", "/v1/account", "");
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(serde_json::from_str::<AccountInfo>(&body).unwrap().role, "admin");
+    let (code, body) = call(&ana, "GET", "/v1/account", "");
+    assert_eq!((code, serde_json::from_str::<AccountInfo>(&body).unwrap().role.as_str()), (200, "member"));
+
+    // The admin's list: pages with a cursor given back as it came, filters, the server's own refusals.
+    let (code, body) = call(&root, "GET", "/v1/admin/audit?limit=2", "");
+    assert_eq!(code, 200, "{body}");
+    let first = page_of(&body);
+    assert_eq!(first.events.len(), 2);
+    assert!(first.events[0].at_ms >= first.events[1].at_ms, "newest first");
+    let next = first.next.clone().expect("more events than a page");
+    let (code, body) = call(&root, "GET", &format!("/v1/admin/audit?limit=2&cursor={next}"), "");
+    assert_eq!(code, 200, "{body}");
+    let second = page_of(&body);
+    assert!(second.events.iter().all(|e| first.events.iter().all(|f| f.id != e.id)), "no event twice");
+    let (code, body) = call(&root, "GET", "/v1/admin/audit?action=admin.", "");
+    assert_eq!(code, 200, "{body}");
+    let admin_events = page_of(&body).events;
+    assert!(admin_events.len() >= 3 && admin_events.iter().all(|e| e.action.starts_with("admin.")), "{admin_events:?}");
+    let (code, body) = call(&root, "GET", "/v1/admin/audit?action=auth.login", "");
+    let logins = page_of(&body).events;
+    assert!(code == 200 && logins.len() == 2 && logins.iter().all(|e| e.action == "auth.login"), "{body}");
+    let (code, body) = call(&root, "GET", &format!("/v1/admin/audit?user={}", ana_user.id.0), "");
+    assert_eq!(code, 200, "{body}");
+    let about_ana = page_of(&body).events;
+    assert!(!about_ana.is_empty() && about_ana.iter().all(|e| e.actor_user == Some(ana_user.id.0) || e.target_id == Some(ana_user.id.0)));
+    let (code, body) = call(&root, "GET", "/v1/admin/audit?before_ms=1", "");
+    assert!(code == 200 && page_of(&body).events.is_empty(), "{body}");
+    // What is wrong is said before anything is sent, or by the server (a cursor it didn't make).
+    for query in [
+        "action=nope.",
+        "action=auth.log",
+        "action=x%27%20OR%201=1",
+        "user=not-an-id",
+        "limit=0",
+        "limit=201",
+        "limit=x",
+        "before_ms=-1",
+        "cursor=a%20b",
+        "cursor=AAAA",
+    ] {
+        let (code, body) = call(&root, "GET", &format!("/v1/admin/audit?{query}"), "");
+        assert_eq!((code, error_code(&body).as_str()), (400, "invalid"), "{query}: {body}");
+    }
+
+    // A member's own activity: the events about her, whatever the admin's filters say; a member can't read the log.
+    let (code, body) = call(&ana, "GET", "/v1/account/activity", "");
+    assert_eq!(code, 200, "{body}");
+    let own = page_of(&body).events;
+    assert!(!own.is_empty(), "{own:?}");
+    assert!(own.iter().all(|e| e.actor_user == Some(ana_user.id.0) || e.target_id == Some(ana_user.id.0)), "{own:?}");
+    let (code, body) =
+        call(&ana, "GET", &format!("/v1/account/activity?user={}&action=admin.", server.meta.user_by_name("root").await.unwrap().unwrap().id.0), "");
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(page_of(&body).events.len(), own.len(), "an account's activity has no admin filters");
+    let (code, body) = call(&ana, "GET", "/v1/account/activity?limit=101", "");
+    assert_eq!((code, error_code(&body).as_str()), (400, "invalid"), "{body}");
+    for path in ["/v1/admin/audit", "/v1/admin/audit/export"] {
+        let (code, body) = call(&ana, "GET", path, "");
+        assert_eq!((code, error_code(&body).as_str()), (403, "forbidden"), "{path}: {body}");
+    }
+    let now = status(&ana);
+    assert!(now.signed_in && !now.removed, "a 403 doesn't sign the agent out: {now:?}");
+
+    // The export: the server's lines, then its last line; whole through the typed client, which writes as it reads.
+    let client = craft_cloud_app::Client::connect_in(root_data.path()).unwrap();
+    let all = tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        let outcome = client.admin_audit_export(&craft_cloud_app::AuditQuery::default(), &mut out);
+        (outcome, out)
+    })
+    .await
+    .unwrap();
+    let (outcome, out) = all;
+    let outcome = outcome.unwrap();
+    assert!(!outcome.truncated);
+    let lines: Vec<AuditEvent> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(lines.len() as u64, outcome.events);
+    let (code, body) = call(&root, "GET", "/v1/admin/audit?limit=200", "");
+    assert_eq!(code, 200, "{body}");
+    assert!(page_of(&body).events.iter().all(|e| lines.iter().any(|l| l.id == e.id)), "the export holds every event of the list");
+    // A filtered export; a refusal before the stream; a filter that is wrong.
+    let client = craft_cloud_app::Client::connect_in(root_data.path()).unwrap();
+    let filtered = tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        let query = craft_cloud_app::AuditQuery { action: Some("auth.".into()), ..Default::default() };
+        let outcome = client.admin_audit_export(&query, &mut out).unwrap();
+        (outcome, out)
+    })
+    .await
+    .unwrap();
+    assert_eq!(filtered.0.events, 2, "the two sign-ins");
+    let ana_client = craft_cloud_app::Client::connect_in(ana_data.path()).unwrap();
+    let refused = tokio::task::spawn_blocking(move || ana_client.admin_audit_export(&Default::default(), &mut Vec::new())).await.unwrap();
+    assert_eq!(refused.unwrap_err().code(), Some("forbidden"));
+    let (code, body) = call(&root, "GET", "/v1/admin/audit/export?action=nope.", "");
+    assert_eq!((code, error_code(&body).as_str()), (400, "invalid"), "{body}");
+
+    // Nothing of any of it was printed.
+    let (exit, out) = root_run.stop().await;
+    assert_eq!(exit.unwrap(), Exit::Done, "{out}");
+    assert!(!out.contains(PASSWORD), "{out}");
+    ana_run.stop().await.0.unwrap();
+}
+
+/// A server that holds more events than an export may: the last line is `truncated`, and the client says so (not whole).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_truncated_export_is_said_to_be() {
+    let server = admin_server_limited(AuditExportLimits { page: 1, channel: 1, max_rows: 2 }).await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path().join("root"));
+    let (running, api) = signed_in_as(&server, "root", &data, &dir.path().join("Root Cloud")).await;
+    for name in ["bo", "cy", "di"] {
+        let (code, body) = confirmed(&api, "POST", "/v1/admin/users", PASSWORD, serde_json::json!({ "username": name, "role": "member" }));
+        assert_eq!(code, 200, "{body}");
+    }
+    let client = craft_cloud_app::Client::connect_in(data.path()).unwrap();
+    let (outcome, out) = tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        (client.admin_audit_export(&Default::default(), &mut out), out)
+    })
+    .await
+    .unwrap();
+    let outcome = outcome.unwrap();
+    assert_eq!((outcome.events, outcome.truncated), (2, true));
+    assert_eq!(String::from_utf8(out).unwrap().lines().count(), 2, "the newest two, and no last line in what is written");
+    running.stop().await.0.unwrap();
 }
