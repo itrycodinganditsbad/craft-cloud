@@ -609,6 +609,11 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                     if node.deleted {
                         self.state.remote.remove(&node.id);
                     } else {
+                        // A folder this machine asked to delete (the answer never recorded) that the server reports
+                        // changed and live: noted here, judged in `apply_remote` once the files it held are settled.
+                        if self.state.sent_dir_deletes.contains(&node.id) {
+                            self.state.live_dirs.insert(node.id);
+                        }
                         self.state.remote.insert(node.id, RemoteNode::from_state(&node));
                     }
                 }
@@ -672,6 +677,10 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             }
         }
         let (epoch, seq) = first.ok_or_else(|| SyncError::Corrupt("empty listing".into()))?;
+        // A folder this machine asked to delete (the answer never recorded) that the listing has live is never pushed as
+        // deleted from that stale request: a listing can't tell a delete that never arrived from one followed by a
+        // restore, so the folder is let go and arrives as the server has it (the conservative side of a doubt).
+        self.state.live_dirs.extend(self.state.sent_dir_deletes.iter().filter(|id| remote.contains_key(*id)).copied());
         self.state.remote = remote;
         self.state.epoch = Some(epoch);
         self.state.seq = seq;

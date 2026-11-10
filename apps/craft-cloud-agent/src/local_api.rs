@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use axum::extract::rejection::{JsonRejection, PathRejection};
-use axum::extract::{DefaultBodyLimit, Path, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::http::header::{AUTHORIZATION, HOST, ORIGIN};
 use axum::middleware::{self, Next};
@@ -25,11 +25,15 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use craft_cloud_proto::DeviceId;
-use craft_cloud_proto::api::{DeviceInfo, ErrorBody, PairingStatus, codes as api_codes};
+use craft_cloud_proto::api::{
+    AccountUsage, DeviceInfo, HistoryResponse, PairingStatus, RecoveryCodes, RestoreResponse, RevokedOthers, TwoFactorChallenge,
+    TwoFactorSetupResponse, TwoFactorStatus, codes as api_codes,
+};
 use craft_cloud_proto::join::{Code, JoinString, MAX_JOIN_BYTES, PAIRING_CHARS};
 use craft_cloud_proto::local::{
-    AutostartRequest, JoinRequest, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_SCHEMA, LocalApiFile, LoginRequest, LogoutRequest, MAX_LOCAL_JSON_BYTES,
-    PairingInfo, RunState, Status, codes, paths,
+    AutostartRequest, ChangePasswordRequest, JoinRequest, LOCAL_API_FILE, LOCAL_API_MAX, LOCAL_API_SCHEMA, LocalApiFile, LoginRequest, LogoutRequest,
+    MAX_LOCAL_JSON_BYTES, PairingInfo, PasswordRequest, RenameDeviceRequest, RunState, SecondFactorLoginRequest, Status, TotpRequest,
+    TwoFactorProofRequest, codes, paths,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -46,6 +50,8 @@ use crate::live::app_blobs::{self, BlobError};
 pub enum Command {
     Login(LoginRequest, oneshot::Sender<Result<(), AgentError>>),
     Join(JoinRequest, oneshot::Sender<Result<(), AgentError>>),
+    /// The second step of a sign-in that answered `two_factor_required`.
+    LoginSecondFactor(SecondFactorLoginRequest, oneshot::Sender<Result<(), AgentError>>),
     Logout(LogoutRequest, oneshot::Sender<Result<(), AgentError>>),
     /// Hold syncing and the live connection until [`Command::Resume`], also after a restart.
     Pause(oneshot::Sender<Result<(), AgentError>>),
@@ -191,23 +197,45 @@ impl Control {
     }
 }
 
-/// An error answer: the HTTP status and the [`ErrorBody`].
+/// An error answer: the HTTP status, the typed local API code and message, and optional details such as a two-factor
+/// challenge, a lock wait, or a trash-restore name conflict.
 #[derive(Debug)]
 pub struct LocalError {
     pub status: StatusCode,
-    pub code: &'static str,
+    pub code: String,
     pub message: String,
+    pub two_factor: Option<TwoFactorChallenge>,
+    pub retry_after_secs: Option<u64>,
+    pub name_taken: Option<bool>,
 }
 
 impl LocalError {
-    pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        Self { status, code, message: message.into() }
+    pub fn new(status: StatusCode, code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self { status, code: code.into(), message: message.into(), two_factor: None, retry_after_secs: None, name_taken: None }
+    }
+
+    fn with_code(status: StatusCode, code: String, message: impl Into<String>) -> Self {
+        Self { status, code, message: message.into(), two_factor: None, retry_after_secs: None, name_taken: None }
     }
 }
 
 impl IntoResponse for LocalError {
     fn into_response(self) -> Response {
-        (self.status, Json(ErrorBody { error: self.code.to_owned(), message: self.message, ..ErrorBody::default() })).into_response()
+        let extras = craft_cloud_proto::local::ErrorExtras { two_factor: self.two_factor, retry_after_secs: self.retry_after_secs };
+        let mut body = serde_json::json!({ "error": self.code, "message": self.message });
+        if let (Some(object), Ok(serde_json::Value::Object(more))) = (body.as_object_mut(), serde_json::to_value(&extras)) {
+            object.extend(more);
+        }
+        if let Some(name_taken) = self.name_taken
+            && let Some(object) = body.as_object_mut()
+        {
+            object.insert("name_taken".to_owned(), serde_json::Value::Bool(name_taken));
+        }
+        let mut response = (self.status, Json(body)).into_response();
+        if let Some(secs) = self.retry_after_secs {
+            response.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from(secs));
+        }
+        response
     }
 }
 
@@ -217,7 +245,33 @@ impl From<AgentError> for LocalError {
         // A setup that failed after the code was spent answers as what failed, with the whole message.
         if let AgentError::JoinSetup(inner) = e {
             let inner = LocalError::from(*inner);
-            return Self::new(inner.status, inner.code, message);
+            return Self::with_code(inner.status, inner.code, message);
+        }
+        // The second factor: a challenge, a wrong code, a lock and a server's refusal keep what they carry. None of them is a
+        // revoked device (that is `Revoked`, from a 401 on a signed-in call).
+        match &e {
+            AgentError::TwoFactorRequired(challenge) => {
+                let mut error = Self::new(StatusCode::UNAUTHORIZED, codes::TWO_FACTOR_REQUIRED, message);
+                // `join` has no challenge to hand on: the same join goes again with the code.
+                error.two_factor = Some(challenge.clone());
+                return error;
+            }
+            AgentError::TwoFactorInvalid(_) => return Self::new(StatusCode::UNAUTHORIZED, codes::TWO_FACTOR_INVALID, message),
+            AgentError::ChallengeGone => return Self::new(StatusCode::CONFLICT, codes::TWO_FACTOR_EXPIRED, message),
+            AgentError::TwoFactorLocked { retry_after_secs, .. } => {
+                let mut error = Self::new(StatusCode::TOO_MANY_REQUESTS, codes::TWO_FACTOR_LOCKED, message);
+                error.retry_after_secs = *retry_after_secs;
+                return error;
+            }
+            AgentError::Refused { status, code, retry_after_secs, .. } => {
+                // The server's own status and code (never a 401: that is `Revoked`).
+                let status =
+                    StatusCode::from_u16(*status).ok().filter(|s| (s.is_client_error() || s.is_server_error()) && *s != StatusCode::UNAUTHORIZED);
+                let mut error = Self::new(status.unwrap_or(StatusCode::BAD_REQUEST), code.clone(), message);
+                error.retry_after_secs = *retry_after_secs;
+                return error;
+            }
+            _ => {}
         }
         let (status, code) = match &e {
             AgentError::WrongPassword => (StatusCode::UNAUTHORIZED, codes::WRONG_PASSWORD),
@@ -337,30 +391,178 @@ impl Drop for LocalApi {
     }
 }
 
-type Api = Arc<ApiState>;
+pub(crate) type Api = Arc<ApiState>;
 
 fn router(state: Api) -> Router {
     Router::new()
         .route(paths::STATUS, get(status))
         .route(paths::LOGIN, post(login))
+        .route(paths::LOGIN_SECOND_FACTOR, post(login_second_factor).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route(paths::LOGOUT, post(logout))
+        .route(paths::TWO_FACTOR, get(two_factor_status))
+        .route(paths::TWO_FACTOR_SETUP, post(two_factor_setup).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route(paths::TWO_FACTOR_CONFIRM, post(two_factor_confirm).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route(paths::TWO_FACTOR_DISABLE, post(two_factor_disable).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route(paths::TWO_FACTOR_RECOVERY_CODES, post(two_factor_recovery_codes).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route(paths::ACCOUNT_PASSWORD, post(change_password).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route(paths::DEVICES_REVOKE_OTHERS, post(revoke_other_devices))
         .route(paths::RECENTS, get(crate::live::recents_socket))
         .route(paths::DOCS, get(crate::live::docs::docs_socket))
         .route(paths::JOIN, post(join))
         .route(paths::PAIRINGS, post(create_pairing))
         .route(&format!("{}/{{id}}", paths::PAIRINGS), get(pairing_status).delete(delete_pairing))
         .route(paths::DEVICES, get(devices))
-        .route(&format!("{}/{{id}}", paths::DEVICES), delete(remove_device))
+        .route(paths::USAGE, get(usage))
+        .route(&format!("{}/{{id}}", paths::DEVICES), delete(remove_device).patch(rename_device).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route(paths::AUTOSTART, post(set_autostart))
         .route(paths::PAUSE, post(pause))
         .route(paths::RESUME, post(resume))
         .route(paths::QUIT, post(quit))
+        .merge(crate::admin::routes())
+        .route(paths::FILE_HISTORY, get(file_history))
+        .route(paths::FILE_RESTORE, post(file_restore))
+        .route(paths::TRASH, get(trash))
+        .route(paths::TRASH_RESTORE, post(trash_restore))
+        .route(paths::TRASH_REMOVE, post(trash_remove))
         .route(paths::BLOBS, axum::routing::put(put_blob).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
         .route(&format!("{}/{{hash}}", paths::BLOBS), get(get_blob))
         .fallback(|| async { LocalError::new(StatusCode::NOT_FOUND, api_codes::NOT_FOUND, "no such call") })
         .layer(DefaultBodyLimit::max(MAX_LOCAL_JSON_BYTES))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
+}
+
+#[derive(serde::Deserialize)]
+struct HistoryQuery {
+    path: String,
+    cursor: Option<String>,
+    limit: Option<u32>,
+}
+
+fn file_node(state: &ApiState, path: &str) -> Result<craft_cloud_proto::NodeId, LocalError> {
+    if path.is_empty() || path.starts_with('/') || path.contains('\\') || path.contains(':') || path.as_bytes().contains(&0) {
+        return Err(LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, "path must be relative to the sync root"));
+    }
+    let names = path
+        .split('/')
+        .map(craft_cloud_proto::Name::new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, "path contains an invalid name"))?;
+    let saved =
+        DataDir::new(&state.data).load_state().map_err(|e| LocalError::new(StatusCode::INTERNAL_SERVER_ERROR, api_codes::INTERNAL, e.to_string()))?;
+    let rel = craft_cloud_sync::RelPath::from_names(names);
+    let node =
+        saved.state.base_at(&rel).ok_or_else(|| LocalError::new(StatusCode::NOT_FOUND, api_codes::NOT_FOUND, "no synced file at that path"))?;
+    if !matches!(saved.state.base.get(&node).map(|entry| &entry.kind), Some(craft_cloud_sync::BaseKind::File { .. })) {
+        return Err(LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, "history is only available for files"));
+    }
+    Ok(node)
+}
+
+fn history_error(error: crate::http::HistoryCallError) -> LocalError {
+    match error {
+        crate::http::HistoryCallError::Refused { status: StatusCode::UNAUTHORIZED, body } => {
+            LocalError::new(StatusCode::CONFLICT, codes::NEEDS_YOU, body.message)
+        }
+        crate::http::HistoryCallError::Refused { status, body } => {
+            let name_taken = body
+                .conflicts
+                .as_ref()
+                .map(|conflicts| conflicts.iter().any(|conflict| matches!(conflict.kind, craft_cloud_proto::ConflictKind::NameTaken { .. })));
+            LocalError { status, code: body.error, message: body.message, name_taken, two_factor: None, retry_after_secs: None }
+        }
+        crate::http::HistoryCallError::Transport(craft_cloud_sync::TransportError::NotFound) => {
+            LocalError::new(StatusCode::NOT_FOUND, api_codes::NOT_FOUND, "no such file or version")
+        }
+        crate::http::HistoryCallError::Transport(craft_cloud_sync::TransportError::Unauthorized) => {
+            LocalError::new(StatusCode::CONFLICT, codes::NEEDS_YOU, "sign in again to continue")
+        }
+        crate::http::HistoryCallError::Transport(error) => AgentError::from(error).into(),
+    }
+}
+
+async fn file_history(
+    State(state): State<Api>,
+    query: Result<Query<HistoryQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<HistoryResponse>, LocalError> {
+    let Query(query) = query.map_err(|e| LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, e.body_text()))?;
+    let node = file_node(&state, &query.path)?;
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.file_history(node, query.cursor.as_deref(), query.limit).await.map_err(history_error)?))
+}
+
+async fn file_restore(
+    State(state): State<Api>,
+    body: Result<Json<craft_cloud_proto::local::RestoreRequest>, JsonRejection>,
+) -> Result<Json<RestoreResponse>, LocalError> {
+    let Json(request) = body?;
+    let node = file_node(&state, &request.path)?;
+    let (_, transport) = server_api(&state)?;
+    let answer = transport.restore_file(node, request.version, request.expected_version).await.map_err(history_error)?;
+    state.control.request_pass();
+    Ok(Json(answer))
+}
+
+#[derive(serde::Deserialize)]
+struct TrashQuery {
+    cursor: Option<String>,
+    limit: Option<u32>,
+}
+
+fn trash_path_hint(saved: Option<&crate::account::SavedState>, parent: craft_cloud_proto::NodeId, name: &str) -> Option<String> {
+    let saved = saved?;
+    let parent_path = saved.state.base_path(parent)?;
+    if parent_path.is_root() { Some(name.to_owned()) } else { Some(format!("{parent_path}/{name}")) }
+}
+
+async fn trash(
+    State(state): State<Api>,
+    query: Result<Query<TrashQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<craft_cloud_proto::local::TrashResponse>, LocalError> {
+    let Query(query) = query.map_err(|e| LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, e.body_text()))?;
+    let (_, transport) = server_api(&state)?;
+    let response = transport.trash(query.cursor.as_deref(), query.limit).await.map_err(history_error)?;
+    let saved = DataDir::new(&state.data).load_state().ok();
+    Ok(Json(craft_cloud_proto::local::TrashResponse {
+        items: response
+            .items
+            .into_iter()
+            .map(|item| craft_cloud_proto::local::TrashItem {
+                path: trash_path_hint(saved.as_ref(), item.parent, &item.name),
+                id: item.id,
+                parent: item.parent,
+                name: item.name,
+                is_dir: item.is_dir,
+                size: item.size,
+                deleted_ms: item.deleted_ms,
+                purge_after_ms: item.purge_after_ms,
+            })
+            .collect(),
+        next: response.next,
+    }))
+}
+
+async fn trash_restore(
+    State(state): State<Api>,
+    body: Result<Json<craft_cloud_proto::local::TrashNodeRequest>, JsonRejection>,
+) -> Result<Json<craft_cloud_proto::api::TrashRestoreResponse>, LocalError> {
+    let Json(request) = body?;
+    let id = request.id.parse().map_err(|_| LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, "id must be a node ID"))?;
+    let (_, transport) = server_api(&state)?;
+    let answer = transport.restore_from_trash(id).await.map_err(history_error)?;
+    state.control.request_pass();
+    Ok(Json(answer))
+}
+
+async fn trash_remove(
+    State(state): State<Api>,
+    body: Result<Json<craft_cloud_proto::local::TrashNodeRequest>, JsonRejection>,
+) -> Result<StatusCode, LocalError> {
+    let Json(request) = body?;
+    let id = request.id.parse().map_err(|_| LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, "id must be a node ID"))?;
+    let (_, transport) = server_api(&state)?;
+    transport.remove_from_trash(id).await.map_err(history_error)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Equal strings, compared in time that doesn't depend on where they differ.
@@ -406,6 +608,101 @@ async fn ask(state: &ApiState, make: impl FnOnce(oneshot::Sender<Result<(), Agen
 async fn login(State(state): State<Api>, body: Result<Json<LoginRequest>, JsonRejection>) -> Result<Json<Status>, LocalError> {
     let Json(request) = body?;
     ask(&state, |reply| Command::Login(request, reply)).await
+}
+
+/// Most bytes of the small bodies (a password, a code, a name): far less than a join string's megabyte.
+const TINY_JSON_BYTES: usize = 4 * 1024;
+
+async fn login_second_factor(
+    State(state): State<Api>,
+    body: Result<Json<SecondFactorLoginRequest>, JsonRejection>,
+) -> Result<Json<Status>, LocalError> {
+    let Json(request) = body?;
+    ask(&state, |reply| Command::LoginSecondFactor(request, reply)).await
+}
+
+/// A call of the signed-in account to the server, its refusals kept whole: never mistaken for a revoked device.
+fn account_call_error(e: crate::http::CallError) -> LocalError {
+    AgentError::from(e).into()
+}
+
+async fn two_factor_status(State(state): State<Api>) -> Result<Json<TwoFactorStatus>, LocalError> {
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.two_factor_status().await.map_err(account_call_error)?))
+}
+
+async fn two_factor_setup(
+    State(state): State<Api>,
+    body: Result<Json<PasswordRequest>, JsonRejection>,
+) -> Result<Json<TwoFactorSetupResponse>, LocalError> {
+    let Json(request) = body?;
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.two_factor_setup(&request.password).await.map_err(account_call_error)?))
+}
+
+async fn two_factor_confirm(State(state): State<Api>, body: Result<Json<TotpRequest>, JsonRejection>) -> Result<Json<RecoveryCodes>, LocalError> {
+    let Json(request) = body?;
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.two_factor_confirm(&request.totp_code).await.map_err(account_call_error)?))
+}
+
+async fn two_factor_disable(State(state): State<Api>, body: Result<Json<TwoFactorProofRequest>, JsonRejection>) -> Result<StatusCode, LocalError> {
+    let Json(request) = body?;
+    let (_, transport) = server_api(&state)?;
+    transport
+        .two_factor_disable(&craft_cloud_proto::api::TwoFactorProofRequest {
+            password: request.password,
+            totp_code: request.totp_code,
+            recovery_code: request.recovery_code,
+        })
+        .await
+        .map_err(account_call_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn two_factor_recovery_codes(
+    State(state): State<Api>,
+    body: Result<Json<TwoFactorProofRequest>, JsonRejection>,
+) -> Result<Json<RecoveryCodes>, LocalError> {
+    let Json(request) = body?;
+    let (_, transport) = server_api(&state)?;
+    let sent = craft_cloud_proto::api::TwoFactorProofRequest {
+        password: request.password,
+        totp_code: request.totp_code,
+        recovery_code: request.recovery_code,
+    };
+    Ok(Json(transport.two_factor_recovery_codes(&sent).await.map_err(account_call_error)?))
+}
+
+async fn change_password(State(state): State<Api>, body: Result<Json<ChangePasswordRequest>, JsonRejection>) -> Result<StatusCode, LocalError> {
+    let Json(request) = body?;
+    let (_, transport) = server_api(&state)?;
+    let sent = craft_cloud_proto::api::ChangePasswordRequest { current_password: request.current_password, new_password: request.new_password };
+    transport.change_password(&sent).await.map_err(account_call_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn revoke_other_devices(State(state): State<Api>) -> Result<Json<RevokedOthers>, LocalError> {
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.revoke_other_devices().await.map_err(account_call_error)?))
+}
+
+async fn rename_device(
+    State(state): State<Api>,
+    id: Result<Path<DeviceId>, PathRejection>,
+    body: Result<Json<RenameDeviceRequest>, JsonRejection>,
+) -> Result<Json<DeviceInfo>, LocalError> {
+    let id = path_id(id)?;
+    let Json(request) = body?;
+    let (_, transport) = server_api(&state)?;
+    let renamed = transport.rename_device(id, &request.name).await.map_err(|e| match e {
+        // A device that isn't there (or isn't ours, or is signed out): the server's `not_found`.
+        crate::http::CallError::Transport(craft_cloud_sync::TransportError::NotFound) => {
+            LocalError::new(StatusCode::NOT_FOUND, api_codes::NOT_FOUND, "no such computer in this cloud")
+        }
+        other => account_call_error(other),
+    })?;
+    Ok(Json(renamed))
 }
 
 async fn logout(State(state): State<Api>, body: Result<Json<LogoutRequest>, JsonRejection>) -> Result<Json<Status>, LocalError> {
@@ -475,14 +772,14 @@ async fn join(State(state): State<Api>, body: Result<Json<JoinRequest>, JsonReje
 }
 
 /// The signed-in account's server API, for the calls the local API makes itself (they touch nothing here).
-fn server_api(state: &ApiState) -> Result<(Account, HttpTransport), LocalError> {
+pub(crate) fn server_api(state: &ApiState) -> Result<(Account, HttpTransport), LocalError> {
     let account = state.control.account().ok_or(AgentError::NotSignedIn)?;
     let transport = HttpTransport::new(account.server.clone(), &account.token).map_err(AgentError::from)?;
     Ok((account, transport))
 }
 
 /// A path's ID, or `400 invalid`.
-fn path_id<T>(id: Result<Path<T>, PathRejection>) -> Result<T, LocalError> {
+pub(crate) fn path_id<T>(id: Result<Path<T>, PathRejection>) -> Result<T, LocalError> {
     id.map(|Path(id)| id).map_err(|e| LocalError::new(StatusCode::BAD_REQUEST, api_codes::INVALID, e.body_text()))
 }
 
@@ -524,6 +821,12 @@ async fn delete_pairing(State(state): State<Api>, id: Result<Path<uuid::Uuid>, P
 async fn devices(State(state): State<Api>) -> Result<Json<Vec<DeviceInfo>>, LocalError> {
     let (_, transport) = server_api(&state)?;
     Ok(Json(transport.devices().await.map_err(AgentError::from)?))
+}
+
+/// `GET /v1/usage`: asks the signed-in account's server each time; nothing is cached.
+async fn usage(State(state): State<Api>) -> Result<Json<AccountUsage>, LocalError> {
+    let (_, transport) = server_api(&state)?;
+    Ok(Json(transport.usage().await.map_err(AgentError::from)?))
 }
 
 /// Removes (revokes) another computer of the account; answered with the list as it is then. This computer can't be

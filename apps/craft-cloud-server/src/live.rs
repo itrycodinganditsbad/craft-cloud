@@ -65,6 +65,7 @@ use tokio::sync::broadcast;
 use tokio::time::Instant;
 
 use crate::error::ApiError;
+use crate::space::SpaceAccess;
 use crate::state::{AppState, Limits};
 
 /// Live connections one device may hold at once (a reconnect may overlap the old connection for a moment).
@@ -369,11 +370,16 @@ impl Session {
     /// A session for the signed-in device `auth`. The caller listens to the space ([`LiveHub::listen`]) before the
     /// session reads anything, and hands it what it hears ([`Session::note`], [`Session::lagged`]).
     pub fn new(state: Arc<AppState>, auth: &DeviceAuth) -> Self {
+        Self::in_space(state, auth.device, auth.personal_space())
+    }
+
+    /// A session of `device` on `space`, which the caller has checked the device's account may use.
+    pub fn in_space(state: Arc<AppState>, device: DeviceId, space: SpaceId) -> Self {
         let budget = Budget::new(&state.limits);
         Self {
             state,
-            space: auth.space,
-            device: auth.device,
+            space,
+            device,
             welcomed: false,
             protocol: 0,
             id: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
@@ -761,20 +767,34 @@ impl Session {
 pub async fn connect(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<DeviceAuth>,
+    Extension(access): Extension<SpaceAccess>,
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Result<Response, ApiError> {
+    // Live documents of a team space need live protocol 3 (the role per frame, the space in the welcome), which a later
+    // change brings. Until then the upgrade answers a team space as it does a space the caller has no access to, so a viewer
+    // can never write through a protocol that has no role in it. An agent does not ask: it opens no live connection for a
+    // team space on live protocol 2.
+    if !access.personal {
+        return Err(ApiError::not_found("space"));
+    }
     let upgrade = upgrade.map_err(|e| ApiError::new(e.status(), codes::INVALID, e.body_text()))?;
     if !take(&state.live.connections, auth.device, MAX_CONNECTIONS_PER_DEVICE) {
         return Err(ApiError::rate_limited(format!("a device may hold at most {MAX_CONNECTIONS_PER_DEVICE} live connections"), Some(5)));
     }
     let slot = ConnectionSlot { hub: state.clone(), device: auth.device };
+    // Listening for revocations before the device is looked up once more, and before the upgrade: a revoke between
+    // the sign-in check and here is seen by the lookup, one after it by the receiver, so none is missed.
+    let revocations = state.live.revocations();
+    if !state.meta.device_active(auth.device).await? {
+        return Err(ApiError::unauthorized());
+    }
     // No frame is over an update and its envelope (snapshots travel through the chunk API).
     Ok(upgrade.max_message_size(MAX_FRAME_BYTES).max_frame_size(MAX_FRAME_BYTES).on_upgrade(move |socket| async move {
         let _slot = slot;
         // Listening before the session reads anything, so no update falls between a read and the notification.
-        let notes = state.live.listen(auth.space);
-        let presence = state.live.listen_presence(auth.space);
-        serve(socket, Session::new(state, &auth), notes, presence).await;
+        let notes = state.live.listen(access.space);
+        let presence = state.live.listen_presence(access.space);
+        serve(socket, Session::in_space(state, auth.device, access.space), notes, presence, revocations).await;
     }))
 }
 
@@ -801,9 +821,14 @@ async fn send_all(socket: &mut WebSocket, frames: &[ServerFrame]) -> bool {
 
 /// The connection loop: frames in, frames out, the log pumped while a document has news, pings, and an end on
 /// shutdown, silence or a broken connection.
-async fn serve(mut socket: WebSocket, mut session: Session, mut notes: broadcast::Receiver<DocId>, mut presence: broadcast::Receiver<PresenceNote>) {
+async fn serve(
+    mut socket: WebSocket,
+    mut session: Session,
+    mut notes: broadcast::Receiver<DocId>,
+    mut presence: broadcast::Receiver<PresenceNote>,
+    mut revocations: broadcast::Receiver<DeviceId>,
+) {
     let mut stopping = session.state.notifier.shutdown_signal();
-    let mut revocations = session.state.live.revocations();
     let mut last_heard = Instant::now();
     let mut ping = tokio::time::interval_at(Instant::now() + PING_EVERY, PING_EVERY);
     let hello_by = Instant::now() + HELLO_TIMEOUT;
