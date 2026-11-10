@@ -44,6 +44,35 @@ impl<F: Fs, T: Transport> Engine<F, T> {
             self.state.base.remove(&id);
         }
         self.state.sent_deletes.clear();
+        // The same for folders, whose deletes carry no version. A folder this machine asked to delete (the answer never
+        // recorded) that the server reports live is let go like a file whose delete went through (it was brought back
+        // after the delete, or changed by another machine first), and arrives as it is on the server, not deleted a
+        // second time. A folder the server no longer has went through, so it is let go too, once it is gone from here
+        // as well. This is settled deepest first, after the files above: a restored folder is only judged once the
+        // folders of this machine's own delete below it are settled, or a tombstoned subfolder still tracked in it
+        // would keep it and the next push would delete it again. A folder the feed did not mention was never touched:
+        // its delete is sent again. One that still has tracked nodes in it stays.
+        let live_dirs = std::mem::take(&mut self.state.live_dirs);
+        let mut asked: Vec<(usize, NodeId)> =
+            std::mem::take(&mut self.state.sent_dir_deletes).into_iter().map(|id| (self.state.base_path(id).map_or(0, |p| p.depth()), id)).collect();
+        asked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (_, id) in asked {
+            let is_dir = matches!(self.state.base.get(&id).map(|e| &e.kind), Some(BaseKind::Dir { .. }));
+            if !is_dir || self.state.base.values().any(|e| e.parent == Some(id)) {
+                continue;
+            }
+            let released = if live_dirs.contains(&id) {
+                true
+            } else if self.state.remote.contains_key(&id) {
+                false
+            } else {
+                // Deleted on the server; nothing of it is left here when its place is empty.
+                self.state.base_path(id).is_some_and(|path| matches!(self.stat(&path), Ok(None)))
+            };
+            if released {
+                self.state.base.remove(&id);
+            }
+        }
         // Changed or new remote nodes, parents first.
         let mut work: Vec<(usize, NodeId)> =
             self.state.remote.keys().filter(|id| **id != root).filter_map(|id| Some((self.state.remote_path(*id)?.depth(), *id))).collect();
@@ -237,7 +266,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     }
 
     /// Fails as a filesystem error on the node (it is skipped and waits) if taking `to` would act on a link.
-    fn refuse_link_toward(&self, to: &RelPath) -> Result<(), SyncError> {
+    pub(super) fn refuse_link_toward(&self, to: &RelPath) -> Result<(), SyncError> {
         match self.link_toward(to)? {
             Some(link) => Err(io_err(&link, std::io::Error::other(OTHER_REASON))),
             None => Ok(()),
@@ -862,7 +891,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     }
 
     /// Creates `dir` and any missing folders above it, moving aside anything in the way.
-    fn make_dirs(&mut self, dir: &RelPath, report: &mut Report) -> Result<(), SyncError> {
+    pub(super) fn make_dirs(&mut self, dir: &RelPath, report: &mut Report) -> Result<(), SyncError> {
         let mut current = RelPath::root();
         for name in dir.names() {
             current = current.join(name);
@@ -894,7 +923,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
 
     /// Makes sure nothing sits at `path`, not even a name that differs only by case: whatever is there is
     /// moved aside as a conflict copy.
-    fn ensure_free(&mut self, path: &RelPath, report: &mut Report) -> Result<(), SyncError> {
+    pub(super) fn ensure_free(&mut self, path: &RelPath, report: &mut Report) -> Result<(), SyncError> {
         // Checked before anything is made or moved aside.
         self.refuse_link_toward(path)?;
         if let Some(parent) = path.parent() {
@@ -1050,6 +1079,10 @@ impl<F: Fs, T: Transport> Engine<F, T> {
     /// When the agent can't tell yet which save is newer, the file waits ([`LiveWinner::Wait`]); after
     /// `save_order_wait_ms` of that, `None` (a conflict copy). A winner is never guessed.
     fn live_winner(&mut self, id: NodeId, file: &FileState, at: &RelPath) -> Result<Option<(LiveWinner, Option<FsKind>)>, SyncError> {
+        // Where nothing can go up, "ours goes over theirs" is not on offer: both versions are kept as a conflict copy.
+        if self.read_only {
+            return Ok(None);
+        }
         let checked = self.stat(at)?;
         let hash = self.content_hash(at);
         // Our content is a Craft save whose record is on its way: never a conflict copy, it waits for the record.
@@ -1096,7 +1129,7 @@ impl<F: Fs, T: Transport> Engine<F, T> {
         Some(LiveWinner::Wait)
     }
 
-    fn holds_base_content(&self, entry: &BaseEntry, at: &RelPath) -> bool {
+    pub(super) fn holds_base_content(&self, entry: &BaseEntry, at: &RelPath) -> bool {
         match &entry.kind {
             BaseKind::File { hash, .. } => self.content_hash(at) == Some(*hash),
             BaseKind::Dir { .. } => false,

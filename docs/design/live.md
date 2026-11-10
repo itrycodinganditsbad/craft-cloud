@@ -24,6 +24,9 @@ per app connection for live sessions. `run` serves it while signed out too. Call
   one), `GET /v1/pairings/{id}` → `{state: waiting|used|expired, device_name?}`, `DELETE /v1/pairings/{id}` → 204;
 - `GET /v1/devices` → the account's devices (`current` marks this one); `DELETE /v1/devices/{id}` revokes another one
   and answers the list after (this one is refused with `cannot_remove_self`: that is `logout`);
+- `GET`, `POST`, `PATCH` and `DELETE` `/v1/admin/…`, and `GET /v1/account` and `/v1/account/activity`: the server's admin API
+  and the account's own audit events passed on for the Craft Cloud app's admin pages, with the server's status and error codes (listed in [`../agent.md`](../agent.md), "The local API's admin
+  calls");
 - `POST /v1/pause` / `POST /v1/resume` → status: while paused no sync pass starts (one under way finishes), and the
   long-poll, the folder watcher and the live connection hold; the local API and the apps' recents keep working (adds
   reach the server after resume). Kept in `state.json`, so a paused agent starts paused; `run_state` is
@@ -102,7 +105,11 @@ for opaque updates; variants are only ever appended, anything new is negotiated 
   documents of files, snapshots, compaction and presence; a connection on protocol 1 (an agent from before them, or
   a new agent and an older server) carries recents only, and is sent a compacted log whole. A new agent with an older
   server keeps recents and says live documents need a newer server; a document live on it already keeps its changes
-  on the machine until then.
+  on the machine until then. Protocol 3 adds team spaces (`docs/design/collaboration.md`): the connection's space is
+  named by the `craft-space` header of the upgrade, and the server answers `welcome_space {protocol, epoch, space,
+  role}` instead of `welcome` and relays presence as `presence_from {doc, bytes, user}` instead of `presence`, `user`
+  being the sending account, stamped by the server. Both are appended to the server's frames; every frame of
+  protocol 2 keeps its bytes (golden tests pin them), and a connection that negotiates 2 sees exactly the old frames.
 - `create {doc, kind}` → `created {doc}`; idempotent. Kinds: `recents:<app>`, whose ID is derived from the account and
   the app, so two machines that create it offline make the same one; and `document {node, app}`, a file of the synced
   folder, whose ID is `node_doc(space, node)` (BLAKE3 of both with a domain of its own, as a UUIDv8), so two machines

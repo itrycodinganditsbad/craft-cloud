@@ -7,14 +7,23 @@
 //! row, so commits to one space run one at a time and commits to different spaces run in parallel.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod admin;
+mod audit;
 mod blobs;
 mod codec;
 mod commit;
+mod history;
+mod index;
 mod join;
 mod live;
 mod schema;
+mod spaces;
+mod trash;
 mod tree;
+mod two_factor;
+mod usage;
 mod users;
+mod web;
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -24,15 +33,34 @@ use sqlx::any::{AnyConnectOptions, AnyPoolOptions};
 use sqlx::{AnyPool, ConnectOptions};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-pub use commit::CommitOutcome;
+pub use admin::{AdminActor, AdminUser, AdminVia, Issued, MAX_SEARCH_BYTES, MIN_QUOTA_BYTES, RESET_TTL_MS, ServerCounts, UserPage};
+pub use audit::{
+    ActionFilter, AuditAction, AuditCursor, AuditDetails, AuditEvent, AuditFailure, AuditOutcome, AuditQuery, ClientKind, Field, MAX_DETAILS_BYTES,
+    MAX_RETENTION_DAYS, MIN_RETENTION_DAYS, OPPORTUNISTIC_PRUNE_BATCHES, Origin, PRUNE_BATCH, PRUNE_EVERY_MS, Platform, Pruned, Step, TargetKind,
+};
+pub use commit::{CommitOutcome, RestoreOutcome, TrashRestoreOutcome};
 pub use craft_cloud_proto::BlobKind;
+pub use history::HistoryPage;
+pub use index::{BlobRecord, EdgeCheck, EdgeProblem, EdgeProblemKind, Finding, INDEX_BATCH_ROWS, IndexAudit, IndexState, Validation};
 pub use join::{InviteFor, Redeemed};
 pub use live::{
     Appended, DEFAULT_LIVE_BYTES_PER_SPACE, LiveDoc, LiveUpdate, MAX_LIVE_DOC_BYTES, MAX_LIVE_DOC_ROWS_PER_SPACE, MAX_LIVE_DOCS_PER_SPACE,
     MAX_LIVE_DOCUMENTS_HOLDING_UPDATES, MAX_LIVE_DOCUMENTS_PER_SPACE, MAX_LIVE_PAGE, SnapshotRef,
 };
+pub use spaces::{Member, SpaceActor, SpaceOwner, SpacePage, SpaceSummary, UserSpace, WriteGuard};
+pub use trash::{TrashEntry, TrashPage};
 pub use tree::{MAX_PAGE_SAVE_BYTES, SpaceInfo};
-pub use users::{DeviceAuth, DeviceRecord, Role, UserId, UserRecord, valid_username};
+pub use two_factor::{
+    CHALLENGE_TTL_MS, Completed, DeviceActor, LOCK_AFTER_FAILURES, LOCK_BASE_MS, LOCK_MAX_MS, MAX_CHALLENGE_ATTEMPTS, MAX_OPEN_CHALLENGES,
+    MAX_SETUP_ATTEMPTS, NewChallenge, Proof, RECOVERY_CODES, SETUP_TTL_MS, SignIn, StoredSecrets, TotpVerifier, TwoFactorInfo, UnreadableSecret,
+    retry_after_secs,
+};
+pub use usage::{StorageAccount, StorageEstimate, StorageEstimateReason, StorageIndexCounts, StorageOverview};
+pub use users::{
+    AccountRecord, CLIENT_KINDS, DeviceAuth, DeviceClient, DeviceRecord, MAX_CLIENT_FIELD_BYTES, RevokeReason, Role, UserId, UserRecord,
+    valid_username,
+};
+pub use web::{NewWebSession, WebSession, WebSignIn};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MetaError {
@@ -77,14 +105,66 @@ pub enum MetaError {
     /// An invite to an account without a password was redeemed without a new one; nothing was changed.
     #[error("this invite needs a new password for the account")]
     PasswordRequired,
+    /// The device that asked for a change was revoked while the request ran (it is no longer signed in); nothing was
+    /// changed.
+    #[error("this device is no longer signed in")]
+    DeviceRevoked,
+    /// What the request was based on changed while it ran (the password it checked is no longer the account's);
+    /// nothing was changed and the request may be made again.
+    #[error("{0}")]
+    Conflict(&'static str),
+    /// The admin who asked may not do this (their role changed while the request ran, or the rules about resetting
+    /// another admin); nothing was changed.
+    #[error("{0}")]
+    Forbidden(&'static str),
+    /// The change would leave the server without an administrator who can sign in; nothing was changed.
+    #[error("this would leave the server without an enabled administrator")]
+    LastAdmin,
+    /// The change would leave a team space without an accepted owner; nothing was changed.
+    #[error("this would leave the team space without an owner")]
+    LastOwner,
+    /// The account is a member of the team space but its role does not allow this write (it was lowered, or the space was
+    /// archived, after the request was let in); nothing was changed.
+    #[error("this space is read-only for your role")]
+    ReadOnly,
+    /// The account is disabled or marked for removal. Said only to someone who proved they hold its password or a
+    /// code of it, never to a guesser.
+    #[error("this account is disabled")]
+    AccountDisabled,
+    /// The account has two-factor sign-in and the request carried no second factor; nothing was changed (an invite or
+    /// reset code is not used up).
+    #[error("this account needs its second factor")]
+    TwoFactorRequired,
+    /// A code or recovery code was wrong, or a code that was used before; its counters were committed and nothing else
+    /// was changed.
+    #[error("the second factor is wrong")]
+    TwoFactorInvalid,
+    /// Too many wrong second factors: every check is refused until `retry_after_ms` have passed.
+    #[error("the second factor is locked after too many wrong codes")]
+    TwoFactorLocked { retry_after_ms: i64 },
+    /// A set-up of two-factor sign-in is open on another device.
+    #[error("two-factor set-up is open on another device")]
+    TwoFactorPending,
+    /// A sign-in challenge that is unknown, expired, used or no longer fit, never saying which.
+    #[error("this sign-in step doesn't work any more")]
+    ChallengeGone,
     #[error("invalid input: {0}")]
     Invalid(&'static str),
     #[error("stored data is damaged: {0}")]
     Corrupt(&'static str),
+    /// A database that was to exist already ([`Meta::open_existing`]) is not there or not ready; nothing was created.
+    #[error("{0}")]
+    Missing(&'static str),
 }
 
 /// How long a SQLite connection waits for a lock another connection or program holds before giving up.
 pub const SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The most deleted items below one folder that restoring or removing the folder from the trash takes with it in one
+/// call, shallowest first. What is beyond stays in the trash and, once its folder is live or removed from the trash,
+/// appears in the trash list on its own, to be restored or removed by a further call. The bound keeps the work done
+/// under the space's write lock by one call small.
+pub const MAX_TRASH_TREE_NODES: u64 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Dialect {
@@ -113,12 +193,48 @@ pub struct Meta {
     live_held_documents_cap: u64,
     /// The most bytes all of one space's live documents may hold ([`Meta::with_live_bytes_cap`]).
     live_bytes_cap: u64,
+    /// How long audit events are kept when a write prunes them ([`Meta::with_audit_retention_days`]); `None`: a write never prunes.
+    audit_retention_ms: Option<i64>,
+    /// When the last complete pruning ran, and whether one runs now; shared by the clones.
+    prune_state: Arc<audit::PruneState>,
+    /// Where the store reads the time of day for what it judges itself (a browser session's expiry inside an admin change);
+    /// `None`: the system clock ([`Meta::with_clock`]).
+    clock: Option<Arc<dyn Fn() -> i64 + Send + Sync>>,
+    /// Edges of the reference index one transaction writes ([`Meta::with_index_batch_rows`]).
+    index_rows: usize,
+    /// The most deleted items below one folder that restoring or removing the folder from the trash takes with it
+    /// ([`Meta::with_trash_tree_cap`]).
+    trash_tree_cap: u64,
+    /// Set on a handle made by [`Meta::guarded`]: the write transactions of the space's writes check the caller's role
+    /// again before they change anything.
+    guard: Option<WriteGuard>,
 }
 
 impl Meta {
+    /// The configured stored-bytes cap for one space, if any.
+    pub fn stored_bytes_cap(&self) -> Option<u64> {
+        self.stored_cap
+    }
     /// Connects and brings the schema up to date. `url` is `sqlite:path/to/meta.db` (created if missing),
     /// `sqlite::memory:`, or `postgres://user:pass@host/db`.
     pub async fn open(url: &str) -> Result<Self, MetaError> {
+        Self::start(url, false).await
+    }
+
+    /// Connects to a database that already exists and creates nothing: a SQLite file that is not there is an error
+    /// (`mode=ro`, whatever options the URL had), not a new empty database, and a database whose schema is not the
+    /// current one is refused, not upgraded. For a command that only reads, so that a wrong path is reported instead of
+    /// being taken for an empty database that has no problems. `sqlite::memory:` has nothing to exist.
+    ///
+    /// A read-only SQLite connection never writes the database file or the WAL, and cannot checkpoint: closing the last
+    /// connection of a read-write one checkpoints the WAL of a crashed process into the database file and removes it,
+    /// which is a write a read-only command must not make. It still reads the WAL's committed data. Opening may leave
+    /// an empty `-wal` and a `-shm` file (SQLite's rebuilt index of the WAL, no data) when there were none.
+    pub async fn open_existing(url: &str) -> Result<Self, MetaError> {
+        Self::start(url, true).await
+    }
+
+    async fn start(url: &str, existing: bool) -> Result<Self, MetaError> {
         sqlx::any::install_default_drivers();
         let dialect = if url.starts_with("sqlite:") {
             Dialect::Sqlite
@@ -128,6 +244,8 @@ impl Meta {
             return Err(MetaError::UnsupportedUrl);
         };
         let url = match dialect {
+            Dialect::Sqlite if existing && url.contains(":memory:") => return Err(MetaError::Missing("an in-memory database has no existing data")),
+            Dialect::Sqlite if existing => format!("{}?mode=ro", url.split_once('?').map_or(url, |(path, _)| path)),
             Dialect::Sqlite if !url.contains('?') && !url.contains(":memory:") => format!("{url}?mode=rwc"),
             _ => url.to_owned(),
         };
@@ -154,10 +272,14 @@ impl Meta {
             Dialect::Postgres => pool_options,
         };
         let pool = pool_options.connect_with(options).await?;
-        if dialect == Dialect::Sqlite && !url.contains(":memory:") {
-            sqlx::query("PRAGMA journal_mode = WAL").execute(&pool).await?;
+        if existing {
+            schema::check_current(&pool, dialect).await?;
+        } else {
+            if dialect == Dialect::Sqlite && !url.contains(":memory:") {
+                sqlx::query("PRAGMA journal_mode = WAL").execute(&pool).await?;
+            }
+            schema::migrate(&pool, dialect).await?;
         }
-        schema::migrate(&pool, dialect).await?;
         Ok(Self {
             pool,
             dialect,
@@ -169,7 +291,33 @@ impl Meta {
             live_documents_cap: MAX_LIVE_DOCUMENTS_PER_SPACE,
             live_held_documents_cap: MAX_LIVE_DOCUMENTS_HOLDING_UPDATES,
             live_bytes_cap: DEFAULT_LIVE_BYTES_PER_SPACE,
+            audit_retention_ms: None,
+            prune_state: Arc::new(audit::PruneState::new()),
+            clock: None,
+            index_rows: INDEX_BATCH_ROWS,
+            trash_tree_cap: MAX_TRASH_TREE_NODES,
+            guard: None,
         })
+    }
+
+    /// The store with another clock, for what it judges by the time of day itself: whether a browser session is still inside its
+    /// lifetimes when an admin change runs (read after the change's locks are taken). The server gives it the clock it injects
+    /// for tests; without one the system clock is read. The clock belongs to this handle and its clones.
+    pub fn with_clock(mut self, clock: Arc<dyn Fn() -> i64 + Send + Sync>) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    /// Milliseconds since the Unix epoch, by the store's clock.
+    pub(crate) fn clock_ms(&self) -> i64 {
+        self.clock.as_ref().map_or_else(users::wall_clock_ms, |clock| clock())
+    }
+
+    /// The store with another cap on the deleted items below one folder that restoring or removing the folder from the
+    /// trash takes with it in one call (the default is [`MAX_TRASH_TREE_NODES`]); the rest stays in the trash. For tests.
+    pub fn with_trash_tree_cap(mut self, cap: u64) -> Self {
+        self.trash_tree_cap = cap;
+        self
     }
 
     /// The store with another cap on the bytes of updates one live document's log may hold (the default is
@@ -224,6 +372,14 @@ impl Meta {
     pub fn with_stored_bytes_cap(mut self, cap: Option<u64>) -> Self {
         self.stored_cap = cap;
         self
+    }
+
+    /// `sqlite` or `postgres`, for the admin's server overview.
+    pub fn database_kind(&self) -> &'static str {
+        match self.dialect {
+            Dialect::Sqlite => "sqlite",
+            Dialect::Postgres => "postgres",
+        }
     }
 
     /// Whether a database connection is in use (a query under way, or a connection on its way back to the pool).

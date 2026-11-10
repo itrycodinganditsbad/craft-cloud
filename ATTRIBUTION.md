@@ -14,3 +14,4 @@ next to them.
 | `apps/craft-cloud-desktop/assets/tray-*.png` | Craft Cloud's tray icon in each state (synced, syncing, offline, needs attention, paused): a cloud with a badge | Craft Cloud contributors | Drawn by `cargo xtask icons` (`xtask/src/icons.rs`) for this repository | MIT OR Apache-2.0 |
 | `apps/craft-cloud-desktop/tests/autostart/*` | Expected start-at-login entries of the app per OS (golden files) | Craft Cloud contributors | Written for this repository | MIT OR Apache-2.0 |
 | `apps/craft-cloud-desktop/tests/snapshots/*.png` | The Craft Cloud app's screens as its snapshot tests expect them (the text in egui's default fonts, see `epaint_default_fonts`) | Craft Cloud contributors | Rendered by the tests (`UPDATE_SNAPSHOTS=1`) | MIT OR Apache-2.0 |
+| `apps/craft-cloud-server/src/web/style.css` | The admin pages' stylesheet: system fonts, no images, no external files | Craft Cloud contributors | Written for this repository | MIT OR Apache-2.0 |
