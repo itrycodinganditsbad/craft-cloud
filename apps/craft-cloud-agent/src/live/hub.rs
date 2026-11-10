@@ -1566,6 +1566,23 @@ impl State {
         }
     }
 
+    /// The hub is stopping: an open still waiting for its file's node or for its document's join gets its answer now (the file
+    /// opens as a plain file), instead of the app's own timeout, and the hub forgets it. The docs socket outlives a personal
+    /// hub, so nothing else would ever answer it.
+    fn refuse_pending_opens(&mut self) {
+        let mut pending: Vec<(ConnId, u64)> = std::mem::take(&mut self.docs.lookups).into_iter().map(|l| (l.conn, l.id)).collect();
+        for waiting in std::mem::take(&mut self.docs.waiting).into_values() {
+            pending.extend(waiting);
+        }
+        self.docs.importer.clear();
+        pending.sort_unstable();
+        pending.dedup();
+        for (conn, id) in pending {
+            self.docs.opens.remove(&(conn, id));
+            let _ = self.tell(conn, DocOut::NotLive { id, reason: NotLiveReason::Offline, message: "the space stopped syncing".into() });
+        }
+    }
+
     async fn handle(&mut self, request: Request) {
         match request {
             // The run loop's to handle (it owns the dialing).
@@ -1726,6 +1743,7 @@ async fn run(
                     }
                 }
                 // Only now, so a document is told after the answers to everything it had sent.
+                state.refuse_pending_opens();
                 if state.config.team {
                     state.tell_stopped();
                 }
@@ -2005,6 +2023,31 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), ended).await.expect("the hub ends").ok();
         let second = Hub::start(config(dir.path(), space), Control::new(tx), true).expect("the folder is free once the first hub ended");
         drop(second.stop());
+    }
+
+    /// An open that still waits for its file's node when the hub stops is answered at once (not left to the app's own timeout),
+    /// for a team hub and for a personal one, whose docs socket goes on.
+    #[tokio::test]
+    async fn a_stopping_hub_answers_the_opens_still_waiting() {
+        for team in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("folder")).unwrap();
+            std::fs::write(dir.path().join("folder").join("plan.txt"), b"plan").unwrap();
+            let (tx, _rx) = mpsc::channel(1);
+            let mut hub_config = config(dir.path(), SpaceId::generate());
+            hub_config.team = team;
+            let hub = Hub::start(hub_config, Control::new(tx), true).unwrap();
+            let handle = hub.handle();
+            let (out, mut answers) = mpsc::channel(8);
+            handle.docs(DocsCall::Connect { conn: 1, out }).await.unwrap();
+            // Nothing has been synced: the file has no node, so the open waits for one.
+            let open = DocsCall::Open { conn: 1, id: 7, path: "plan.txt".into(), app: "notes".into(), file_hash: None, identity: false };
+            handle.docs(open).await.unwrap();
+            let ended = hub.stop();
+            let answer = tokio::time::timeout(Duration::from_secs(4), answers.recv()).await.expect("the open is answered").expect("an answer");
+            assert!(matches!(answer, DocOut::NotLive { id: 7, reason: NotLiveReason::Offline, .. }), "team {team}: {answer:?}");
+            tokio::time::timeout(Duration::from_secs(10), ended).await.expect("the hub ends").ok();
+        }
     }
 
     /// A connection whose close never completes.
