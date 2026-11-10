@@ -879,12 +879,64 @@ iqNc2jOhYN+M91BKSLYoAAAAEGNyYWZ0LWNsb3VkLXRlc3QBAgMEBQ==
         // The listing hides the backend's own temporary names, so nothing else would ever find these.
         let listed = backend.list_raw("chunks", None, 100).await.unwrap();
         assert!(listed.contains(&foreign.to_owned()) && !listed.contains(&old) && !listed.contains(&fresh), "{listed:?}");
-        assert_eq!(backend.remove_stale_temp("chunks", Duration::from_secs(3600)).await.unwrap(), 1);
+        let report = backend.remove_stale_temp("chunks", Duration::from_secs(3600)).await.unwrap();
+        assert_eq!((report.removed, report.younger, report.foreign), (1, 1, 1), "{report:?}");
         assert_eq!(backend.size_raw(&old).await.unwrap(), None);
         assert_eq!(backend.size_raw(&fresh).await.unwrap(), Some(11));
         assert_eq!(backend.size_raw(foreign).await.unwrap(), Some(11), "a name that is not exactly ours is somebody else's file");
-        assert_eq!(backend.remove_stale_temp("chunks", Duration::from_secs(3600)).await.unwrap(), 0);
+        let again = backend.remove_stale_temp("chunks", Duration::from_secs(3600)).await.unwrap();
+        assert_eq!((again.removed, again.younger, again.foreign), (0, 1, 1), "{again:?}");
         assert!(backend.remove_stale_temp("", Duration::from_secs(3600)).await.is_err(), "the blob store names chunks or manifests");
+    }
+
+    /// The temporary files of a killed server are made by the server, but an operator's tools (or a test) may make them in any
+    /// directory and at any time: several in one directory, next to a real object, in a directory that is not a shard name.
+    #[tokio::test]
+    #[ignore = "plants files in the test container named by CRAFT_CLOUD_TEST_SFTP_CONTAINER"]
+    async fn sftp_sweeps_every_old_temporary_file_in_any_directory() {
+        use uuid::{ContextV7, Timestamp, Uuid};
+        let Some(config) = config() else { return };
+        let container = std::env::var("CRAFT_CLOUD_TEST_SFTP_CONTAINER").expect("CRAFT_CLOUD_TEST_SFTP_CONTAINER names the container");
+        let backend = SftpBackend::connect(&SftpConfig { retries: 0, ..config.clone() }).await.unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let at = |secs: u64| format!(".tmp-{}", Uuid::new_v7(Timestamp::from_unix(ContextV7::new(), secs, 0)).hyphenated());
+        let dirs = ["chunks/24/3f", "chunks/ab/g1", "chunks/ab/g2", "chunks/cd/ef", "manifests/00/01"];
+        let mut old = Vec::new();
+        for dir in dirs {
+            // The real object first, so that the directory has been listed with it, then three temporary files and a stranger.
+            backend
+                .put_raw(&format!("{dir}/243fa556f943c64a98c42711dea2cd8fbcbf0f9c5ea8c71dee4ff19dab5cf897"), Bytes::from_static(b"real"))
+                .await
+                .unwrap();
+            let (stale, half_an_hour, fresh) = (at(now - 2 * 86_400), at(now - 1800), at(now));
+            let path = format!("{}/{dir}", config.root);
+            let script =
+                format!("cd {path} && touch {stale} {half_an_hour} {fresh} .tmp-notauuid && chmod 644 {stale} {half_an_hour} {fresh} .tmp-notauuid");
+            let status = std::process::Command::new("docker").args(["exec", "-u", "craft", &container, "sh", "-c", &script]).status().unwrap();
+            assert!(status.success());
+            old.push(format!("{dir}/{stale}"));
+        }
+        // A leftover that is a link (by an operator's hand) has our exact name: it is removed as the link it is.
+        backend.put_raw("chunks/ab/g9/seed", Bytes::from_static(b"x")).await.unwrap();
+        let link = format!("{}/chunks/ab/g9/{}", config.root, at(now - 2 * 86_400 - 5));
+        let made =
+            std::process::Command::new("docker").args(["exec", "-u", "craft", &container, "ln", "-s", "/etc/hostname", &link]).status().unwrap();
+        assert!(made.success());
+        let removed = backend.remove_stale_temp("chunks", Duration::from_secs(3600)).await.unwrap().removed
+            + backend.remove_stale_temp("manifests", Duration::from_secs(3600)).await.unwrap().removed;
+        let left: Vec<_> = {
+            let mut left = Vec::new();
+            for path in &old {
+                if backend.size_raw(path).await.unwrap().is_some() {
+                    left.push(path.clone());
+                }
+            }
+            left
+        };
+        assert!(left.is_empty(), "removed {removed}, still there: {left:?}");
+        assert_eq!(removed, 6, "five old files and the link");
+        let still = std::process::Command::new("docker").args(["exec", "-u", "craft", &container, "test", "-L", &link]).status().unwrap();
+        assert!(!still.success(), "the link is gone");
     }
 
     #[tokio::test]
