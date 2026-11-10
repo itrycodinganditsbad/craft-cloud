@@ -258,6 +258,7 @@ impl Hub {
                     autostart: None,
                     last_sync_ms: None,
                     removed: false,
+                    spaces: Vec::new(),
                 };
                 respond_json(&mut stream, 200, &status);
             }
@@ -375,7 +376,7 @@ impl Hub {
     fn on_request(&self, machine: usize, conn: u64, request: DocsRequest) {
         let mut inner = lock(&self.inner);
         match request {
-            DocsRequest::Open { id, path, app: _, file_hash } => {
+            DocsRequest::Open { id, path, app: _, file_hash, identity: _ } => {
                 if let Some(c) = inner.machines.get_mut(&machine).and_then(|m| m.conns.get_mut(&conn)) {
                     c.apps.insert(id, file_hash);
                 }
@@ -502,7 +503,7 @@ fn open(inner: &mut Inner, machine: usize, conn: u64, id: u64, path: &str) {
     c.open.insert(id, Opened { doc, sent: log.len(), seq: 0 });
     c.told.insert(doc, (online, state.waiting));
     let mut w = lock(&c.writer);
-    let opened = DocsEvent::Opened { id, doc, state, changed_outside };
+    let opened = DocsEvent::Opened { id, doc, state, changed_outside, read_only: false, space: None };
     if let Ok(text) = serde_json::to_string(&opened) {
         let _ = w.send(Message::Text(text.into()));
     }
@@ -876,7 +877,7 @@ mod tests {
         let stored = a.client().blobs().put(b"blob bytes").unwrap();
         assert_eq!(
             b.client().blobs().get(&stored.hash, stored.len).unwrap_err(),
-            crate::Error::Refused { code: "offline".into(), message: "the server can't be reached to fetch the blob".into() }
+            crate::Error::Refused { code: "offline".into(), message: "the server can't be reached to fetch the blob".into(), name_taken: None }
         );
         b.set_online(true);
         assert_eq!(b.client().blobs().get(&stored.hash, stored.len).unwrap(), b"blob bytes");

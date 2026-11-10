@@ -95,6 +95,31 @@ pub fn write(folder: &Path, marker: &RootMarker) -> Result<(), RootError> {
     write_atomic(&path, &json, false).map_err(|source| RootError::Io { path, source })
 }
 
+pub const NONCE_FILE: &str = "nonce";
+/// A nonce is 32 hex digits; anything much bigger is not ours.
+const MAX_NONCE_BYTES: u64 = 128;
+
+/// The nonce `<folder>/.craft-cloud/nonce`, if the folder has one. The agent rewrites it with a new random value at every
+/// checkpoint and records the same value in the space's `state.json`, so a folder restored from an older copy (which holds an
+/// older nonce, or none) is not the folder the state was made for, even if its path and ID are the same.
+pub fn read_nonce(folder: &Path) -> Option<String> {
+    let path = folder.join(AGENT_DIR).join(NONCE_FILE);
+    let md = fs::symlink_metadata(&path).ok().filter(|md| md.file_type().is_file() && md.len() <= MAX_NONCE_BYTES)?;
+    let text = fs::read_to_string(&path).ok().filter(|_| md.len() > 0)?;
+    let text = text.trim();
+    (!text.is_empty() && text.bytes().all(|b| b.is_ascii_hexdigit())).then(|| text.to_owned())
+}
+
+/// Writes a new random nonce into `<folder>/.craft-cloud/nonce` and returns it.
+pub fn rotate_nonce(folder: &Path) -> io::Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|e| io::Error::other(e.to_string()))?;
+    let nonce: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let path = folder.join(AGENT_DIR).join(NONCE_FILE);
+    write_atomic(&path, nonce.as_bytes(), false)?;
+    Ok(nonce)
+}
+
 /// Checks that `folder` is there and its marker names `expected`.
 pub fn check(folder: &Path, expected: &RootMarker) -> Result<(), RootError> {
     if !folder.is_dir() {

@@ -79,8 +79,22 @@ pub fn watch(folder: &Path, events: UnboundedSender<WatchEvent>) -> Result<Folde
         },
         config,
     )?;
-    watcher.watch(folder, RecursiveMode::Recursive)?;
+    watcher.watch(&watched(folder), RecursiveMode::Recursive)?;
     Ok(FolderWatcher { _watcher: watcher })
+}
+
+/// What to watch for `folder`. Where the folder itself is a link, inotify (with links not followed) watches the link and
+/// not the folder behind it, so no change in it would ever be reported: the folder it leads to is watched instead
+/// ([`roots`] knows both spellings). On macOS FSEvents resolves the path anyway, so this changes nothing there; on Windows
+/// the folder is watched as given.
+fn watched(folder: &Path) -> PathBuf {
+    #[cfg(unix)]
+    if std::fs::symlink_metadata(folder).is_ok_and(|m| m.file_type().is_symlink())
+        && let Ok(real) = std::fs::canonicalize(folder)
+    {
+        return real;
+    }
+    folder.to_owned()
 }
 
 /// Whether an event is a change in the synced folder: not a read, and not only inside the agent's own folder.
@@ -119,6 +133,35 @@ mod tests {
         assert!(!counts(&event(EventKind::Access(AccessKind::Close(AccessMode::Read)), &["/f/a.txt"]), &own));
         assert!(counts(&event(EventKind::Access(AccessKind::Close(AccessMode::Write)), &["/f/a.txt"]), &own));
         assert!(counts(&event(EventKind::Any, &[]), &own), "an event without paths may be anything");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_folder_is_watched_where_it_leads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (real, link) = (dir.path().join("real"), dir.path().join("link"));
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(watched(&link), std::fs::canonicalize(&real).unwrap());
+        assert_eq!(watched(&real), real, "a folder that is not a link is watched as given");
+        let missing = dir.path().join("missing");
+        assert_eq!(watched(&missing), missing);
+
+        // A change in the folder behind the link is reported.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let _watcher = watch(&link, tx).unwrap();
+        std::fs::write(real.join("a.txt"), b"x").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match rx.try_recv() {
+                Ok(WatchEvent::Changed { paths, .. }) if paths.iter().any(|p| p.ends_with("a.txt")) => break,
+                Ok(_) => {}
+                Err(_) => {
+                    assert!(std::time::Instant::now() < deadline, "no event for a change behind the link");
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        }
     }
 
     #[test]
