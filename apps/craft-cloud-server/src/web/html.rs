@@ -116,6 +116,22 @@ pub fn heading(text: &str) -> String {
     format!("<h1>{}</h1>", esc(text))
 }
 
+/// A stat cell with a value and a label.
+pub fn stat(value: &str, label: &str) -> String {
+    format!("<div class=\"stat\"><span class=\"stat-value\">{}</span><span class=\"stat-label\">{}</span></div>", esc(value), esc(label))
+}
+
+/// A status badge with a fixed visual tone.
+pub fn badge(text: &str, tone: &str) -> String {
+    let class = match tone {
+        "active" | "two-factor" => "status-active",
+        "disabled" => "status-disabled",
+        "invited" => "status-invited",
+        _ => "status-neutral",
+    };
+    format!("<span class=\"status-badge {class}\">{}</span>", esc(text))
+}
+
 /// A notice that something worked (`role=status`) or failed (`role=alert`).
 pub fn notice(text: &str, error: bool) -> String {
     let (class, role) = if error { ("notice error", "alert") } else { ("notice", "status") };

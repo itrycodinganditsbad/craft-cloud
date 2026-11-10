@@ -178,9 +178,9 @@ fn server_health(info: &AdminServerInfo) -> String {
         rows.push("Refusing uploads");
     }
     if rows.is_empty() {
-        return format!("{}<p class=\"muted\">Healthy</p>", heading("Server health"));
+        return "<h2>Server health</h2><p class=\"muted\">Healthy</p>".to_owned();
     }
-    format!("{}{}", heading("Server health"), notice(&rows.join(" · "), true))
+    format!("<h2>Server health</h2>{}", notice(&rows.join(" · "), true))
 }
 
 fn compression_section(compression: &AdminCompression) -> String {
@@ -271,13 +271,16 @@ pub(super) async fn set_compression(State(state): State<Shared>, request: Reques
 }
 
 fn storage_details(storage: &AdminStorageOverview) -> String {
-    let mut body = String::from("<h2>Server storage</h2><dl>");
+    let capacity = storage.capacity_bytes.filter(|bytes| *bytes > 0);
+    let mut body = String::from("<h2>Server storage</h2><div class=\"stats\" aria-label=\"Storage totals\">");
+    body.push_str(&super::html::stat(&fmt_bytes(storage.stored_bytes), "Stored"));
+    body.push_str(&super::html::stat(&capacity.map_or_else(|| "—".to_owned(), fmt_bytes), "Capacity"));
+    body.push_str(&super::html::stat(&storage.database_bytes.map_or_else(|| "—".to_owned(), fmt_bytes), "Database size"));
+    body.push_str("</div><dl>");
     let mut row = |term: &str, value: String| {
         body.push_str(&format!("<dt>{}</dt><dd>{}</dd>", super::html::esc(term), super::html::esc(&value)));
     };
-    row("Stored", fmt_bytes(storage.stored_bytes));
     row("Store", storage.store_kind.clone().unwrap_or_else(|| "not reported".to_owned()));
-    let capacity = storage.capacity_bytes.filter(|bytes| *bytes > 0);
     row("Capacity", capacity.map_or_else(|| "not configured".to_owned(), fmt_bytes));
     row(
         "Capacity used",
@@ -305,7 +308,6 @@ fn storage_details(storage: &AdminStorageOverview) -> String {
             |(total, free)| format!("{} used of {}; {} available", fmt_bytes(total.saturating_sub(free)), fmt_bytes(total), fmt_bytes(free)),
         ),
     );
-    row("Database size", storage.database_bytes.map_or_else(|| "not measured".to_owned(), fmt_bytes));
     row(
         "Manifest index",
         format!(
@@ -343,15 +345,17 @@ pub(super) async fn overview(State(state): State<Shared>, request: Request) -> R
     let storage = state.meta.admin_storage_overview().await?;
     let mut body = heading("Overview");
     body.push_str(&server_health(&server));
+    body.push_str("<div class=\"stats\" aria-label=\"Server counts and storage\">");
+    body.push_str(&super::html::stat(&counts.users.to_string(), "Accounts"));
+    body.push_str(&super::html::stat(&counts.devices_active.to_string(), "Devices signed in"));
+    body.push_str(&super::html::stat(&fmt_bytes(counts.stored_bytes), "Stored"));
+    body.push_str(&super::html::stat(&fmt_bytes(counts.live_bytes), "Live documents"));
+    body.push_str("</div>");
     body.push_str("<dl>");
     let mut row = |term: &str, value: String| {
         body.push_str(&format!("<dt>{}</dt><dd>{}</dd>", super::html::esc(term), super::html::esc(&value)));
     };
     row("Version", env!("CARGO_PKG_VERSION").to_owned());
-    row("Accounts", counts.users.to_string());
-    row("Devices signed in", counts.devices_active.to_string());
-    row("Stored", fmt_bytes(counts.stored_bytes));
-    row("Live documents", fmt_bytes(counts.live_bytes));
     row("Storage", state.store.kind().to_owned());
     row("Database", state.meta.database_kind().to_owned());
     row("Your session ends", format!("{} at the latest", fmt_time(authed.session.absolute_expires_ms)));
@@ -379,17 +383,17 @@ pub(super) async fn overview(State(state): State<Shared>, request: Request) -> R
 fn status_cell(user: &AdminUser) -> String {
     let mut parts = Vec::new();
     match (user.removed_ms, user.disabled_ms) {
-        (Some(ms), _) => parts.push(format!("removed {}", fmt_time(ms))),
-        (None, Some(ms)) => parts.push(format!("disabled {}", fmt_time(ms))),
-        (None, None) => parts.push("active".to_owned()),
+        (Some(ms), _) => parts.push(super::html::badge(&format!("removed {}", fmt_time(ms)), "disabled")),
+        (None, Some(ms)) => parts.push(super::html::badge(&format!("disabled {}", fmt_time(ms)), "disabled")),
+        (None, None) => parts.push(super::html::badge("active", "active")),
     }
     if user.two_factor_enabled {
-        parts.push("two-factor".to_owned());
+        parts.push(super::html::badge("two-factor", "two-factor"));
     }
     if user.invite_pending {
-        parts.push("invite open".to_owned());
+        parts.push(super::html::badge("invite open", "invited"));
     }
-    super::html::esc(&parts.join(", "))
+    parts.join(" ")
 }
 
 /// `GET /web/users?query&cursor`.
@@ -510,32 +514,33 @@ pub(super) async fn user(State(state): State<Shared>, Path(id): Path<String>, re
     body.push_str("<p>");
     body.push_str(&link("/web/users", "All users"));
     body.push_str("</p><dl>");
-    let mut row = |term: &str, value: String| {
+    let row = |body: &mut String, term: &str, value: String| {
         body.push_str(&format!("<dt>{}</dt><dd>{}</dd>", super::html::esc(term), super::html::esc(&value)));
     };
-    row("Username", found.username.clone());
-    row("ID", found.id.0.to_string());
-    row("Role", found.role.as_str().to_owned());
-    row("Created", fmt_time(found.created_ms));
-    row(
-        "Status",
-        match (found.removed_ms, found.disabled_ms) {
-            (Some(ms), _) => format!("marked for removal {}", fmt_time(ms)),
-            (None, Some(ms)) => format!("disabled {}", fmt_time(ms)),
-            (None, None) => "active".to_owned(),
-        },
-    );
-    row("Two-factor sign-in", if found.two_factor_enabled { "on" } else { "off" }.to_owned());
-    row("Devices signed in", found.devices_active.to_string());
-    row("Stored", fmt_bytes(found.stored_bytes));
+    row(&mut body, "Username", found.username.clone());
+    row(&mut body, "ID", found.id.0.to_string());
+    row(&mut body, "Role", found.role.as_str().to_owned());
+    row(&mut body, "Created", fmt_time(found.created_ms));
+    let (status, tone) = match (found.removed_ms, found.disabled_ms) {
+        (Some(ms), _) => (format!("marked for removal {}", fmt_time(ms)), "disabled"),
+        (None, Some(ms)) => (format!("disabled {}", fmt_time(ms)), "disabled"),
+        (None, None) => ("active".to_owned(), "active"),
+    };
+    body.push_str(&format!("<dt>Status</dt><dd>{}</dd>", super::html::badge(&status, tone)));
+    body.push_str(&format!(
+        "<dt>Two-factor sign-in</dt><dd>{}</dd>",
+        super::html::badge(if found.two_factor_enabled { "on" } else { "off" }, if found.two_factor_enabled { "two-factor" } else { "neutral" })
+    ));
+    row(&mut body, "Devices signed in", found.devices_active.to_string());
+    row(&mut body, "Stored", fmt_bytes(found.stored_bytes));
     if let Some(usage) = usage {
         for (term, value) in usage_rows(&usage) {
-            row(term, value);
+            row(&mut body, term, value);
         }
     } else {
-        row("Quota", found.quota_bytes.map_or_else(|| "none (the server's cap applies, if any)".to_owned(), fmt_bytes));
+        row(&mut body, "Quota", found.quota_bytes.map_or_else(|| "none (the server's cap applies, if any)".to_owned(), fmt_bytes));
     }
-    row("Invite", if found.invite_pending { "open".to_owned() } else { "none".to_owned() });
+    row(&mut body, "Invite", if found.invite_pending { "open".to_owned() } else { "none".to_owned() });
     body.push_str("</dl>");
 
     if found.removed_ms.is_some() {

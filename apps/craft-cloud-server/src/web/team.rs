@@ -149,7 +149,7 @@ pub(super) async fn spaces(State(state): State<Shared>, request: Request) -> Res
             cell.join(", "),
             space.members.to_string(),
             super::html::esc(&format!("{} of {}", fmt_bytes(space.stored_bytes), quota_text(space.quota_bytes))),
-            super::html::esc(&state_text(space)),
+            super::html::badge(&state_text(space), if space.archived_ms.is_some() { "disabled" } else { "active" }),
         ]);
     }
     if rows.is_empty() {
@@ -233,17 +233,20 @@ pub(super) async fn space(State(state): State<Shared>, Path(id): Path<String>, r
     body.push_str("<p>");
     body.push_str(&link("/web/spaces", "All team spaces"));
     body.push_str("</p><dl>");
-    let mut row = |term: &str, value: String| {
+    let row = |body: &mut String, term: &str, value: String| {
         body.push_str(&format!("<dt>{}</dt><dd>{}</dd>", super::html::esc(term), super::html::esc(&value)));
     };
-    row("Name", found.name.clone());
-    row("ID", id.as_uuid().to_string());
-    row("Created", fmt_time(found.created_ms));
-    row("State", state_text(&found));
-    row("Members", found.members.to_string());
-    row("Owners who can sign in", found.owners.to_string());
-    row("Stored", fmt_bytes(found.stored_bytes));
-    row("Limit", quota_text(found.quota_bytes));
+    row(&mut body, "Name", found.name.clone());
+    row(&mut body, "ID", id.as_uuid().to_string());
+    row(&mut body, "Created", fmt_time(found.created_ms));
+    body.push_str(&format!(
+        "<dt>State</dt><dd>{}</dd>",
+        super::html::badge(&state_text(&found), if found.archived_ms.is_some() { "disabled" } else { "active" })
+    ));
+    row(&mut body, "Members", found.members.to_string());
+    row(&mut body, "Owners who can sign in", found.owners.to_string());
+    row(&mut body, "Stored", fmt_bytes(found.stored_bytes));
+    row(&mut body, "Limit", quota_text(found.quota_bytes));
     body.push_str("</dl>");
     if found.owners == 0 {
         body.push_str(&notice("This space has no owner who can sign in, so nobody can manage it. Name one below.", true));
@@ -264,7 +267,10 @@ pub(super) async fn space(State(state): State<Shared>, Path(id): Path<String>, r
                 vec![
                     link(&user_href(m.user), &m.username),
                     super::html::esc(m.role.as_str()),
-                    super::html::esc(&format!("{}{account}", if m.accepted() { "member" } else { "invited" })),
+                    super::html::badge(
+                        &format!("{}{account}", if m.accepted() { "member" } else { "invited" }),
+                        if m.accepted() { "active" } else { "invited" },
+                    ),
                 ]
             })
             .collect();

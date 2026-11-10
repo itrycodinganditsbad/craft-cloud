@@ -1282,7 +1282,12 @@ async fn the_user_list_pages_and_searches(s: &Web) {
     }
     // The overview counts.
     let overview = s.get("/web", Some(&sess.token)).await.text().await.unwrap();
-    assert!(overview.contains("<dt>Accounts</dt><dd>63</dd>") && overview.contains("<dt>Database</dt>"), "{overview}");
+    assert!(
+        overview.contains("class=\"stat-value\">63</span>")
+            && overview.contains("class=\"stat-label\">Accounts</span>")
+            && overview.contains("<dt>Database</dt>"),
+        "{overview}"
+    );
 }
 
 async fn the_audit_log_filters_pages_and_downloads(s: &Web) {
@@ -1847,7 +1852,7 @@ async fn team_spaces_are_made_listed_and_changed(s: &Web) {
     assert!(html.contains("The team space was created.") && html.contains("Team space Studio"), "{html}");
     assert!(html.contains("16.0 MiB") && html.contains(&format!("/web/users/{}", owner.id.0)) && html.contains("<td>owner</td>"), "{html}");
     let html = s.get("/web/spaces", Some(&boss.token)).await.text().await.unwrap();
-    assert!(html.contains("Studio") && html.contains("0 B of 16.0 MiB") && html.contains("<td>active</td>"), "{html}");
+    assert!(html.contains("Studio") && html.contains("0 B of 16.0 MiB") && html.contains("status-badge status-active\">active</span>"), "{html}");
     let base = format!("/web/spaces/{}", space.id.as_uuid());
 
     // The limit: set, refused, removed.
