@@ -12,3 +12,6 @@ target/
 *.sqlite-shm
 # a snapshot test's own render when it doesn't match
 *.new.png
+# the Docker deployment's settings and secrets (written by packaging/docker/install.sh), and a custom TLS certificate
+/packaging/docker/.env
+/packaging/docker/tls/

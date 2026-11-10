@@ -506,7 +506,7 @@ impl<D: LiveDocument> Session<D> {
         let file_hash = file_bytes.map(|b| *blake3::hash(b).as_bytes());
         let opened = match docs.open_with(path, D::APP, &OpenOptions { file_hash }) {
             Ok(o) => o,
-            Err(craft_cloud_app::Error::Refused { code, message }) => return Err(KitError::Agent(format!("{code}: {message}"))),
+            Err(craft_cloud_app::Error::Refused { code, message, .. }) => return Err(KitError::Agent(format!("{code}: {message}"))),
             Err(e) => return not_running(e),
         };
         let (document, snapshot) = match opened {
