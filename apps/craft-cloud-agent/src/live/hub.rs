@@ -174,6 +174,8 @@ enum Request {
     },
     /// Hold the live connection (closed, and not dialed) or let it run again; answered once done.
     Pause(bool, oneshot::Sender<()>),
+    /// This computer's name changed: the entries added from now on carry the new one.
+    Machine(String),
     /// A docs connection's request (answered on its own channel).
     Docs(DocsCall),
 }
@@ -205,6 +207,12 @@ impl HubHandle {
         let (reply, rx) = oneshot::channel();
         self.tx.send(Request::Pause(paused, reply)).await.map_err(|_| HubError::Gone)?;
         rx.await.map_err(|_| HubError::Gone)
+    }
+
+    /// Tells the hub this computer's new name (the device was renamed); the recents it adds from now on carry it.
+    pub async fn set_machine(&self, machine: String) {
+        // A hub that is gone has no entries left to name.
+        let _ = self.tx.send(Request::Machine(machine)).await;
     }
 
     /// Hands a docs connection's request to the hub (its answers come on the connection's channel).
@@ -1119,6 +1127,7 @@ impl State {
         match request {
             // The run loop's to handle (it owns the dialing).
             Request::Pause(..) => {}
+            Request::Machine(machine) => self.config.machine = machine,
             Request::Docs(call) => {
                 let frames = self.docs_call(call);
                 self.send(frames).await;

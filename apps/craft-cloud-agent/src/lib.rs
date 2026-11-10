@@ -11,6 +11,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod account;
+pub mod admin;
 pub mod autostart;
 pub mod cli;
 pub mod daemon;
@@ -19,6 +20,7 @@ pub mod doc;
 pub mod http;
 pub mod live;
 pub mod local_api;
+pub mod local_state;
 pub mod lock;
 pub mod root;
 pub mod runlog;

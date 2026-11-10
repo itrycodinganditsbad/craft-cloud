@@ -132,7 +132,7 @@ fn pass_end(result: &Result<PassSummary, AgentError>, recheck_in: Option<Duratio
         // Deletes held behind a link can be approved too, so the loop looks for an approval while any is held (more
         // slowly: nothing else waits for it).
         Ok(summary) => PassEnd::Done { recheck_in, needs_approval: summary.needs_approval(), held: summary.held_set().is_some() },
-        Err(e) if e.exit() == Exit::NeedsYou => PassEnd::NeedsYou { reason: e.to_string(), recheck: recheck_for(e) },
+        Err(e) if e.exit() == Exit::NeedsYou => PassEnd::NeedsYou { reason: e.to_string(), reason_code: reason_code_for(e), recheck: recheck_for(e) },
         Err(e) => PassEnd::Failed(e.to_string()),
     }
 }
@@ -140,14 +140,27 @@ fn pass_end(result: &Result<PassSummary, AgentError>, recheck_in: Option<Duratio
 /// Which pauses look again by themselves: a folder or marker that is missing (a drive not mounted yet), folders
 /// that lie inside one another, or another agent on the folder can be put right at any moment and checking is
 /// harmless, so every minute; a server that speaks another protocol or refuses requests is fixed by an update, and an
-/// account whose storage on the server is full by the admin allowing more, so every ten minutes; a revoked device,
+/// account whose storage on the server is full, or a server that is full itself, by the admin allowing more or freeing space, so every ten minutes; a revoked device,
 /// damaged or newer saved files, another account's state and damaged data from the server never fix themselves, so
 /// the loop waits until it is stopped.
 fn recheck_for(e: &AgentError) -> Recheck {
     match e {
         AgentError::Root(_) | AgentError::DataInFolder { .. } | AgentError::Lock(_) => Recheck::Soon,
-        AgentError::Server(craft_cloud_sync::TransportError::Protocol(_) | craft_cloud_sync::TransportError::QuotaExceeded { .. }) => Recheck::Slowly,
+        AgentError::Server(
+            craft_cloud_sync::TransportError::Protocol(_)
+            | craft_cloud_sync::TransportError::QuotaExceeded { .. }
+            | craft_cloud_sync::TransportError::ServerFull,
+        ) => Recheck::Slowly,
         _ => Recheck::Never,
+    }
+}
+
+/// The machine-readable cause of a pause, for the local API's `reason_code`: only the causes an app treats on its own.
+fn reason_code_for(e: &AgentError) -> Option<String> {
+    match e {
+        AgentError::Server(craft_cloud_sync::TransportError::ServerFull) => Some(craft_cloud_proto::api::codes::SERVER_FULL.to_owned()),
+        AgentError::Server(craft_cloud_sync::TransportError::QuotaExceeded { .. }) => Some(craft_cloud_proto::api::codes::QUOTA_EXCEEDED.to_owned()),
+        _ => None,
     }
 }
 
@@ -409,7 +422,9 @@ fn to_wall(at: Ms, mono_now: Ms, wall_now: i64) -> i64 {
 fn without_times(status: &LoopStatus) -> LoopStatus {
     let state = match &status.state {
         LoopState::Retrying { message, .. } => LoopState::Retrying { next_try_ms: 0, message: message.clone() },
-        LoopState::Paused { reason, next_check_ms } => LoopState::Paused { reason: reason.clone(), next_check_ms: next_check_ms.map(|_| 0) },
+        LoopState::Paused { reason, next_check_ms, reason_code } => {
+            LoopState::Paused { reason: reason.clone(), next_check_ms: next_check_ms.map(|_| 0), reason_code: reason_code.clone() }
+        }
         other => other.clone(),
     };
     LoopStatus { heartbeat_ms: 0, state, ..status.clone() }
@@ -421,7 +436,7 @@ fn run_state(state: &LoopState) -> RunState {
         LoopState::Idle => RunState::Idle,
         LoopState::Syncing => RunState::Syncing,
         LoopState::Retrying { message, .. } => RunState::Retrying { message: message.clone() },
-        LoopState::Paused { reason, .. } => RunState::Paused { reason: reason.clone() },
+        LoopState::Paused { reason, reason_code, .. } => RunState::Paused { reason: reason.clone(), reason_code: reason_code.clone() },
         LoopState::Stopping | LoopState::Stopped => RunState::Stopping,
         LoopState::SignedOut => RunState::SignedOut,
         LoopState::PausedByUser => RunState::PausedByUser,
@@ -565,7 +580,9 @@ impl Status {
             Phase::Idle => LoopState::Idle,
             Phase::Syncing => LoopState::Syncing,
             Phase::Retrying { next_try, message } => LoopState::Retrying { next_try_ms: self.wall(next_try), message },
-            Phase::Paused { reason, next_check } => LoopState::Paused { reason, next_check_ms: next_check.map(|at| self.wall(at)) },
+            Phase::Paused { reason, reason_code, next_check } => {
+                LoopState::Paused { reason, reason_code, next_check_ms: next_check.map(|at| self.wall(at)) }
+            }
             Phase::Stopping => LoopState::Stopping,
         }
     }
@@ -672,7 +689,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
     status.write_now(match data.load_account() {
         Ok(Some(_)) => LoopState::Idle,
         Ok(None) => LoopState::SignedOut,
-        Err(e) => LoopState::Paused { reason: e.to_string(), next_check_ms: None },
+        Err(e) => LoopState::Paused { reason: e.to_string(), next_check_ms: None, reason_code: None },
     });
     let api = match LocalApi::start(data, control.clone()).await {
         Ok(api) => api,
@@ -721,7 +738,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                 }
             }
         };
-        let (Some(account), Some(transport)) = (saved, transport) else {
+        let (Some(mut account), Some(transport)) = (saved, transport) else {
             control.set_account(None);
             status.forget_passes();
             say(out, &format!("not signed in: waiting for a sign-in ({})", crate::cli::SIGN_IN_HINT));
@@ -994,7 +1011,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                     None => stop_open = false,
                 },
                 command = commands.recv(), if commands_open => match command {
-                    Some(Command::Login(_, reply) | Command::Join(_, reply)) => {
+                    Some(Command::Login(_, reply) | Command::Join(_, reply) | Command::LoginSecondFactor(_, reply)) => {
                         let _ = reply.send(Err(crate::cli::already_signed_in(&account)));
                     }
                     // Signed out on the server first (an unreachable server changes nothing, and syncing goes on); then
@@ -1007,6 +1024,26 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                                 let _ = reply.send(Err(e));
                             }
                         }
+                    }
+                    // This computer renamed on the server: the saved account, the status and the hub follow. The passes read
+                    // the saved account, so the next one uses the new name too.
+                    Some(Command::RenameDevice(id, name, reply)) => {
+                        if id == account.device && name != account.device_name {
+                            let mut renamed = account.clone();
+                            renamed.device_name = name;
+                            match data.save_account(&renamed) {
+                                Ok(()) => {
+                                    account = renamed;
+                                    control.set_account(Some(&account));
+                                    if let Some(hub) = &hub {
+                                        hub.handle().set_machine(account.device_name.clone()).await;
+                                    }
+                                    say(out, &format!("this computer is now called {}", account.device_name));
+                                }
+                                Err(e) => say(out, &format!("the new name of this computer couldn't be saved here: {e}")),
+                            }
+                        }
+                        let _ = reply.send(Ok(()));
                     }
                     Some(Command::Pause(reply)) => {
                         if !user_paused {
@@ -1164,7 +1201,7 @@ async fn wait_needing_you(
     let _ = out.flush();
     let mut commands_open = true;
     loop {
-        status.write(LoopState::Paused { reason: reason.to_owned(), next_check_ms: None }, false, false);
+        status.write(LoopState::Paused { reason: reason.to_owned(), next_check_ms: None, reason_code: None }, false, false);
         let wake = Duration::from_millis(status.next_beat.saturating_sub(status.now()));
         tokio::select! {
             command = commands.recv(), if commands_open => match command {
@@ -1178,8 +1215,11 @@ async fn wait_needing_you(
                         let _ = reply.send(Err(e));
                     }
                 },
-                Some(Command::Login(_, reply) | Command::Join(_, reply) | Command::Pause(reply) | Command::Resume(reply)) => {
+                Some(Command::Login(_, reply) | Command::Join(_, reply) | Command::LoginSecondFactor(_, reply) | Command::Pause(reply) | Command::Resume(reply)) => {
                     let _ = reply.send(Err(AgentError::NeedsYou(reason.to_owned())));
+                }
+                Some(Command::RenameDevice(_, _, reply)) => {
+                    let _ = reply.send(Ok(()));
                 }
                 Some(Command::Quit(reply)) => {
                     let _ = reply.send(Ok(()));
@@ -1227,6 +1267,20 @@ async fn wait_for_sign_in(
                         return SignedOut::SignedIn;
                     }
                 }
+                Some(Command::LoginSecondFactor(request, reply)) => {
+                    let args = LoginArgs {
+                        url: request.server.clone(),
+                        user: request.user.clone(),
+                        folder: request.folder.as_ref().map(std::path::PathBuf::from),
+                        device_name: request.device_name.clone(),
+                        adopt: request.adopt,
+                    };
+                    let factor = crate::http::Factor { totp_code: request.totp_code.clone(), recovery_code: request.recovery_code.clone() };
+                    let result = crate::cli::login_second_factor_locked(data, &args, &request.challenge, &factor).await;
+                    if signed_in(result, "signed in", control, reply, out) {
+                        return SignedOut::SignedIn;
+                    }
+                }
                 Some(Command::Join(request, reply)) => {
                     let args = JoinArgs {
                         join: request.join.clone(),
@@ -1236,13 +1290,18 @@ async fn wait_for_sign_in(
                         // The caller asks for it with `POST /v1/autostart` once joined.
                         autostart: false,
                     };
-                    let result = crate::cli::join_locked(data, &args, request.password.as_deref()).await;
+                    let factor = (request.totp_code.is_some() || request.recovery_code.is_some())
+                        .then(|| crate::http::Factor { totp_code: request.totp_code.clone(), recovery_code: request.recovery_code.clone() });
+                    let result = crate::cli::join_locked(data, &args, request.password.as_deref(), factor.as_ref()).await;
                     if signed_in(result, "joined", control, reply, out) {
                         return SignedOut::SignedIn;
                     }
                 }
                 Some(Command::Logout(_, reply) | Command::Pause(reply) | Command::Resume(reply)) => {
                     let _ = reply.send(Err(AgentError::NotSignedIn));
+                }
+                Some(Command::RenameDevice(_, _, reply)) => {
+                    let _ = reply.send(Ok(()));
                 }
                 Some(Command::Quit(reply)) => {
                     let _ = reply.send(Ok(()));
@@ -1358,7 +1417,18 @@ mod tests {
         assert!(matches!(pass_end(&Err(protocol), None), PassEnd::NeedsYou { recheck: Recheck::Slowly, .. }));
         // A full account: the admin may allow more at any time.
         let full = AgentError::Server(TransportError::QuotaExceeded { used: 10, limit: 10 });
-        assert!(matches!(pass_end(&Err(full), None), PassEnd::NeedsYou { recheck: Recheck::Slowly, .. }));
+        assert!(
+            matches!(pass_end(&Err(full), None), PassEnd::NeedsYou { recheck: Recheck::Slowly, reason_code: Some(ref code), .. } if code == "quota_exceeded")
+        );
+        // A full server: the admin may free space at any time, and the pause says it is the server, not the account.
+        let server_full = AgentError::Server(TransportError::ServerFull);
+        match pass_end(&Err(server_full), None) {
+            PassEnd::NeedsYou { reason, reason_code, recheck: Recheck::Slowly } => {
+                assert!(reason.contains("The server is full") && !reason.contains("account"), "{reason}");
+                assert_eq!(reason_code.as_deref(), Some("server_full"));
+            }
+            other => panic!("{other:?}"),
+        }
         assert!(matches!(pass_end(&Err(AgentError::Revoked), None), PassEnd::NeedsYou { recheck: Recheck::Never, .. }));
     }
 
@@ -1455,12 +1525,12 @@ mod tests {
             let next_check_ms = Some(at + jitter[(i + 1) % jitter.len()]);
             if i == 100 {
                 // A pause in between is a real change: written at once, then left alone the same way.
-                status.write(LoopState::Paused { reason: "gone".into(), next_check_ms }, false, false);
+                status.write(LoopState::Paused { reason: "gone".into(), next_check_ms, reason_code: None }, false, false);
                 assert!(file.exists(), "a new state is written at once");
                 std::fs::remove_file(&file).unwrap();
                 for _ in 0..50 {
                     let next_check_ms = Some(at + jitter[i % jitter.len()]);
-                    status.write(LoopState::Paused { reason: "gone".into(), next_check_ms }, false, false);
+                    status.write(LoopState::Paused { reason: "gone".into(), next_check_ms, reason_code: None }, false, false);
                 }
                 assert!(!file.exists(), "an unchanged pause isn't written again before the heartbeat");
                 status.write(LoopState::Retrying { next_try_ms, message: "offline".into() }, false, false);

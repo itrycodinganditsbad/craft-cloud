@@ -35,8 +35,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use craft_cloud_proto::api::{
-    CommitRequest, CommitResponse, DeviceInfo, ErrorBody, InfoResponse, JoinRequest, LoginRequest, LoginResponse, MAX_MISSING_IDS, MissingRequest,
-    MissingResponse, PROTOCOL_MAX, PROTOCOL_MIN, PairingCreated, PairingStatus, SpaceResponse, codes,
+    AccountInfo, ChangePasswordRequest, CommitRequest, CommitResponse, DeviceInfo, ErrorBody, HistoryResponse, InfoResponse, JoinRequest,
+    LoginRequest, LoginResponse, MAX_MISSING_IDS, MissingRequest, MissingResponse, PROTOCOL_MAX, PROTOCOL_MIN, PairingCreated, PairingStatus,
+    RecoveryCodes, RenameDeviceRequest, RestoreRequest, RestoreResponse, RevokedOthers, SecondFactorRequest, SpaceResponse, TwoFactorChallenge,
+    TwoFactorConfirmRequest, TwoFactorProofRequest, TwoFactorSetupRequest, TwoFactorSetupResponse, TwoFactorStatus, codes,
 };
 use craft_cloud_proto::limits::{MAX_BATCH_OPS, MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, MAX_PAGE_NODES};
 use craft_cloud_proto::local::MAX_MACHINE_BYTES;
@@ -59,6 +61,8 @@ pub const MAX_DEVICES: usize = 1000;
 const MAX_CODE_BYTES: usize = 64;
 /// Longest server message shown to the user, in characters.
 const MAX_MESSAGE_CHARS: usize = 300;
+/// The whole of an audit export, from connecting to the last byte (it is read as it comes, with the usual idle limit).
+const EXPORT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// No data at all for this long fails the request.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
@@ -441,6 +445,8 @@ fn error_for(status: StatusCode, body: Option<ErrorBody>) -> TransportError {
         (Some(codes::QUOTA_EXCEEDED), Some(ErrorBody { quota: Some(quota), .. })) => {
             return TransportError::QuotaExceeded { used: quota.used, limit: quota.limit };
         }
+        // By the code alone: the numbers in the body are only for the admin.
+        (Some(codes::SERVER_FULL), _) => return TransportError::ServerFull,
         _ => {}
     }
     match status {
@@ -492,6 +498,25 @@ pub fn check_compatible(info: &InfoResponse) -> Result<(), TransportError> {
     Ok(())
 }
 
+/// The most bytes the server takes of a device's `platform` or `app_version`.
+const MAX_DEVICE_DETAIL_BYTES: usize = 32;
+
+/// What this agent says about itself when it signs in or joins: `agent`, the operating system and the crate's
+/// version, for the account's device list (display only). The server takes at most 32 bytes without control
+/// characters per field, so a longer value is cut at a character boundary rather than refused.
+fn device_details() -> (Option<String>, Option<String>, Option<String>) {
+    fn limited(text: &str) -> String {
+        text.chars()
+            .filter(|c| !c.is_control())
+            .scan(0usize, |len, c| {
+                *len += c.len_utf8();
+                (*len <= MAX_DEVICE_DETAIL_BYTES).then_some(c)
+            })
+            .collect()
+    }
+    (Some("agent".to_owned()), Some(limited(std::env::consts::OS)), Some(limited(env!("CARGO_PKG_VERSION"))))
+}
+
 /// Signs in and creates a device. `Unauthorized` means a wrong username or password.
 pub async fn login(server: &ServerUrl, username: &str, password: &str, device_name: &str) -> Result<LoginResponse, TransportError> {
     login_over(&Reqwest::new(server)?, server, username, password, device_name).await
@@ -505,9 +530,176 @@ pub async fn login_over<C: Connection>(
     password: &str,
     device_name: &str,
 ) -> Result<LoginResponse, TransportError> {
-    let body = LoginRequest { username: username.to_owned(), password: password.to_owned(), device_name: device_name.to_owned() };
+    let (client_kind, platform, app_version) = device_details();
+    let body = LoginRequest {
+        username: username.to_owned(),
+        password: password.to_owned(),
+        device_name: device_name.to_owned(),
+        client_kind,
+        platform,
+        app_version,
+    };
     let req = request(Method::POST, server.endpoint("auth/login"), None, 0).json(&body)?;
     json(connection.send(req).await?, MAX_SMALL_JSON_BYTES).await
+}
+
+/// A server's refusal of a call that the agent keeps whole (its status, code and message, the challenge of
+/// `two_factor_required`, the `Retry-After` of a lock), unlike [`TransportError`], which sync relies on and which has no
+/// room for them. Only the calls that need it return this ([`CallError`]); the sync paths, [`error_for`] and
+/// `TransportError` are as they were.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub status: u16,
+    pub error: String,
+    pub message: String,
+    pub two_factor: Option<TwoFactorChallenge>,
+    pub retry_after_secs: Option<u64>,
+}
+
+/// Why a call that returns a [`Refusal`] failed: the server refused it (a wrong password or code, a conflict, a lock: never a
+/// reason to think this device was revoked), or it failed as any call does (offline, a 401 on a signed-in call, a 404).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CallError {
+    #[error("{}", .0.message)]
+    Refused(Refusal),
+    #[error(transparent)]
+    Transport(TransportError),
+}
+
+impl From<TransportError> for CallError {
+    fn from(e: TransportError) -> Self {
+        CallError::Transport(e)
+    }
+}
+
+/// The server's `Retry-After` in seconds, cut to a sane size.
+fn retry_after_of(headers: &HeaderMap) -> Option<u64> {
+    headers.get(RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(|s| s.trim().parse::<u64>().ok()).map(|secs| secs.min(24 * 60 * 60))
+}
+
+/// A failed answer as a [`CallError`]: a 400, 403, 409, 422 or 429 with an error body, a 401 that is `two_factor_required` or
+/// `two_factor_invalid` (the not-signed-in routes' answers; on a signed-in route a 401 is only ever a revoked device) and a
+/// 503 `two_factor_unavailable` are a [`Refusal`]; everything else is what [`error_for`] makes of it.
+async fn failure(resp: Answer) -> CallError {
+    let status = resp.status;
+    let retry = retry_after_of(&resp.headers);
+    let body = body_capped(resp, MAX_SMALL_JSON_BYTES).await.ok().and_then(|b| serde_json::from_slice::<ErrorBody>(&b).ok());
+    if let Some(b) = &body {
+        let refused = match status.as_u16() {
+            400 | 403 | 409 | 422 | 429 => true,
+            401 => matches!(b.error.as_str(), codes::TWO_FACTOR_REQUIRED | codes::TWO_FACTOR_INVALID),
+            503 => b.error == codes::TWO_FACTOR_UNAVAILABLE,
+            _ => false,
+        };
+        if refused {
+            return CallError::Refused(Refusal {
+                status: status.as_u16(),
+                error: b.error.clone(),
+                message: clean(&b.message),
+                two_factor: b.two_factor.clone(),
+                retry_after_secs: retry,
+            });
+        }
+    }
+    CallError::Transport(error_for(status, body))
+}
+
+/// The second factor a person gave: a code from the authenticator app, or a recovery code. Its `Debug` output hides both.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Factor {
+    pub totp_code: Option<String>,
+    pub recovery_code: Option<String>,
+}
+
+impl Factor {
+    /// Reads what a person typed: six digits (spaces allowed) are a code, anything else a recovery code.
+    pub fn typed(text: &str) -> Self {
+        let trimmed = text.trim();
+        let digits: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+        if digits.len() == 6 && digits.bytes().all(|b| b.is_ascii_digit()) {
+            Self { totp_code: Some(digits), recovery_code: None }
+        } else {
+            Self { totp_code: None, recovery_code: Some(trimmed.to_owned()) }
+        }
+    }
+}
+
+impl std::fmt::Debug for Factor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Factor")
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// The first step of a sign-in: a device, or the challenge of an account that has two-factor sign-in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginStep {
+    Device(LoginResponse),
+    SecondFactor(TwoFactorChallenge),
+}
+
+/// Signs in as [`login`] does, but tells the account's second factor from a wrong password: `Unauthorized` (a wrong username
+/// or password) is [`CallError::Transport`], a challenge is [`LoginStep::SecondFactor`].
+pub async fn login_step(server: &ServerUrl, username: &str, password: &str, device_name: &str) -> Result<LoginStep, CallError> {
+    login_step_over(&Reqwest::new(server)?, server, username, password, device_name).await
+}
+
+/// [`login_step`] over another connection (a simulated network, in tests).
+pub async fn login_step_over<C: Connection>(
+    connection: &C,
+    server: &ServerUrl,
+    username: &str,
+    password: &str,
+    device_name: &str,
+) -> Result<LoginStep, CallError> {
+    let (client_kind, platform, app_version) = device_details();
+    let body = LoginRequest {
+        username: username.to_owned(),
+        password: password.to_owned(),
+        device_name: device_name.to_owned(),
+        client_kind,
+        platform,
+        app_version,
+    };
+    let req = request(Method::POST, server.endpoint("auth/login"), None, 0).json(&body)?;
+    let resp = connection.send(req).await?;
+    if resp.status.is_success() {
+        return Ok(LoginStep::Device(json(resp, MAX_SMALL_JSON_BYTES).await?));
+    }
+    match failure(resp).await {
+        CallError::Refused(Refusal { error, two_factor, .. }) if error == codes::TWO_FACTOR_REQUIRED => match two_factor {
+            Some(challenge) => Ok(LoginStep::SecondFactor(challenge)),
+            None => Err(CallError::Transport(TransportError::Protocol("the server asked for a second factor without a challenge".into()))),
+        },
+        other => Err(other),
+    }
+}
+
+/// The second step of a sign-in: the `challenge` and the second factor make the device. A challenge that doesn't work any
+/// more (unknown, expired, used, from before a password change) is `Transport(Unauthorized)` here, which is no revoked device
+/// (the caller says the sign-in has to start again); a wrong code is `Refused` with `two_factor_invalid`, a lock with
+/// `two_factor_locked` and its wait.
+pub async fn second_factor(server: &ServerUrl, challenge: &str, factor: &Factor) -> Result<LoginResponse, CallError> {
+    second_factor_over(&Reqwest::new(server)?, server, challenge, factor).await
+}
+
+/// [`second_factor`] over another connection (a simulated network, in tests).
+pub async fn second_factor_over<C: Connection>(
+    connection: &C,
+    server: &ServerUrl,
+    challenge: &str,
+    factor: &Factor,
+) -> Result<LoginResponse, CallError> {
+    let body =
+        SecondFactorRequest { challenge: challenge.to_owned(), totp_code: factor.totp_code.clone(), recovery_code: factor.recovery_code.clone() };
+    let req = request(Method::POST, server.endpoint("auth/login/second-factor"), None, 0).json(&body)?;
+    let resp = connection.send(req).await?;
+    if resp.status.is_success() {
+        return Ok(json(resp, MAX_SMALL_JSON_BYTES).await?);
+    }
+    Err(failure(resp).await)
 }
 
 /// Why a join ([`join`]) was refused.
@@ -525,13 +717,34 @@ pub enum JoinError {
     /// Too many failed joins from this address; the server's message.
     #[error("{0}")]
     RateLimited(String),
+    /// The account has two-factor sign-in: join again with a code from its authenticator app or a recovery code. The code
+    /// was not used up.
+    #[error("the account has two-factor sign-in: a code from its authenticator app is needed")]
+    TwoFactorRequired,
+    /// The code or recovery code was wrong (the join code still works); the server's message.
+    #[error("{0}")]
+    TwoFactorInvalid(String),
+    /// Too many wrong codes: the second factor is locked for `retry_after_secs`.
+    #[error("{message}")]
+    TwoFactorLocked { message: String, retry_after_secs: Option<u64> },
     #[error(transparent)]
     Transport(TransportError),
 }
 
 /// Redeems a join code (normalised) for a new device named `device_name`; `password` for an invite to a new account.
 pub async fn join(server: &ServerUrl, code: &str, device_name: &str, password: Option<&str>) -> Result<LoginResponse, JoinError> {
-    join_over(&Reqwest::new(server).map_err(JoinError::Transport)?, server, code, device_name, password).await
+    join_with_factor(server, code, device_name, password, None).await
+}
+
+/// [`join`] with the second factor of an account that has two-factor sign-in.
+pub async fn join_with_factor(
+    server: &ServerUrl,
+    code: &str,
+    device_name: &str,
+    password: Option<&str>,
+    factor: Option<&Factor>,
+) -> Result<LoginResponse, JoinError> {
+    join_over_with(&Reqwest::new(server).map_err(JoinError::Transport)?, server, code, device_name, password, factor).await
 }
 
 /// [`join`] over another connection (a simulated network, in tests).
@@ -542,15 +755,43 @@ pub async fn join_over<C: Connection>(
     device_name: &str,
     password: Option<&str>,
 ) -> Result<LoginResponse, JoinError> {
-    let body = JoinRequest { code: code.to_owned(), device_name: device_name.to_owned(), password: password.map(str::to_owned) };
+    join_over_with(connection, server, code, device_name, password, None).await
+}
+
+/// [`join_over`] with a second factor.
+pub async fn join_over_with<C: Connection>(
+    connection: &C,
+    server: &ServerUrl,
+    code: &str,
+    device_name: &str,
+    password: Option<&str>,
+    factor: Option<&Factor>,
+) -> Result<LoginResponse, JoinError> {
+    let (client_kind, platform, app_version) = device_details();
+    let body = JoinRequest {
+        code: code.to_owned(),
+        device_name: device_name.to_owned(),
+        password: password.map(str::to_owned),
+        totp_code: factor.and_then(|f| f.totp_code.clone()),
+        recovery_code: factor.and_then(|f| f.recovery_code.clone()),
+        client_kind,
+        platform,
+        app_version,
+    };
     let req = request(Method::POST, server.endpoint("join"), None, 0).json(&body).map_err(JoinError::Transport)?;
     let resp = connection.send(req).await.map_err(JoinError::Transport)?;
     if resp.status.is_success() {
         return json(resp, MAX_SMALL_JSON_BYTES).await.map_err(JoinError::Transport);
     }
     let status = resp.status;
+    let retry = retry_after_of(&resp.headers);
     let body = body_capped(resp, MAX_SMALL_JSON_BYTES).await.ok().and_then(|b| serde_json::from_slice::<ErrorBody>(&b).ok());
     Err(match body.as_ref().map(|b| b.error.as_str()) {
+        Some(codes::TWO_FACTOR_REQUIRED) => JoinError::TwoFactorRequired,
+        Some(codes::TWO_FACTOR_INVALID) => JoinError::TwoFactorInvalid(body.as_ref().map(|b| clean(&b.message)).unwrap_or_default()),
+        Some(codes::TWO_FACTOR_LOCKED) => {
+            JoinError::TwoFactorLocked { message: body.as_ref().map(|b| clean(&b.message)).unwrap_or_default(), retry_after_secs: retry }
+        }
         Some(codes::INVALID_CODE) => JoinError::InvalidCode,
         Some(codes::PASSWORD_REQUIRED) => JoinError::PasswordRequired,
         Some(codes::WEAK_PASSWORD) => JoinError::WeakPassword(body.as_ref().map(|b| clean(&b.message)).unwrap_or_default()),
@@ -582,6 +823,28 @@ pub struct HttpTransport<C = Reqwest> {
     auth: HeaderValue,
 }
 
+/// A history or restore refusal, retaining the server's HTTP status and stable error code.
+#[derive(Debug)]
+pub enum HistoryCallError {
+    Transport(TransportError),
+    Refused { status: StatusCode, body: Box<ErrorBody> },
+}
+
+async fn history_answer<T: DeserializeOwned>(answer: Answer) -> Result<T, HistoryCallError> {
+    if !answer.status.is_success() {
+        let status = answer.status;
+        let body = body_capped(answer, MAX_SMALL_JSON_BYTES)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ErrorBody>(&bytes).ok())
+            .unwrap_or_else(|| ErrorBody { error: codes::INTERNAL.into(), message: status.to_string(), ..ErrorBody::default() });
+        return Err(HistoryCallError::Refused { status, body: Box::new(body) });
+    }
+    let bytes = body_capped(answer, MAX_SMALL_JSON_BYTES).await.map_err(HistoryCallError::Transport)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| HistoryCallError::Transport(TransportError::Protocol(format!("the server's answer doesn't parse: {e}"))))
+}
+
 impl HttpTransport {
     pub fn new(server: ServerUrl, token: &DeviceToken) -> Result<Self, TransportError> {
         Self::over(Reqwest::new(&server)?, server, token)
@@ -596,6 +859,73 @@ impl<C: Connection> HttpTransport<C> {
 
     pub fn server(&self) -> &ServerUrl {
         &self.server
+    }
+
+    /// The server's newest-first history for one file node.
+    pub async fn file_history(&self, node: NodeId, cursor: Option<&str>, limit: Option<u32>) -> Result<HistoryResponse, HistoryCallError> {
+        let mut url = self.server.endpoint(&format!("nodes/{node}/history"));
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(cursor) = cursor {
+                query.append_pair("cursor", cursor);
+            }
+            if let Some(limit) = limit {
+                query.append_pair("limit", &limit.to_string());
+            }
+        }
+        let req = request(Method::GET, url, Some(&self.auth), MAX_SMALL_JSON_BYTES);
+        let answer = self.send(req).await.map_err(HistoryCallError::Transport)?;
+        history_answer(answer).await
+    }
+
+    /// Makes a prior version the file's content as a new version.
+    pub async fn restore_file(&self, node: NodeId, version: VersionId, expected_version: VersionId) -> Result<RestoreResponse, HistoryCallError> {
+        let req = self
+            .request(Method::POST, &format!("nodes/{node}/restore"), MAX_SMALL_JSON_BYTES)
+            .json(&RestoreRequest { version, expected_version })
+            .map_err(HistoryCallError::Transport)?;
+        let answer = self.send(req).await.map_err(HistoryCallError::Transport)?;
+        history_answer(answer).await
+    }
+
+    /// The server's newest-first trash page.
+    pub async fn trash(&self, cursor: Option<&str>, limit: Option<u32>) -> Result<craft_cloud_proto::api::TrashResponse, HistoryCallError> {
+        let mut url = self.server.endpoint("trash");
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(cursor) = cursor {
+                query.append_pair("cursor", cursor);
+            }
+            if let Some(limit) = limit {
+                query.append_pair("limit", &limit.to_string());
+            }
+        }
+        let req = request(Method::GET, url, Some(&self.auth), MAX_SMALL_JSON_BYTES);
+        let answer = self.send(req).await.map_err(HistoryCallError::Transport)?;
+        history_answer(answer).await
+    }
+
+    /// Restores a deleted node from the server's trash.
+    pub async fn restore_from_trash(&self, node: NodeId) -> Result<craft_cloud_proto::api::TrashRestoreResponse, HistoryCallError> {
+        let req = self.request(Method::POST, &format!("trash/{node}/restore"), MAX_SMALL_JSON_BYTES);
+        let answer = self.send(req).await.map_err(HistoryCallError::Transport)?;
+        history_answer(answer).await
+    }
+
+    /// Marks a deleted node out of the server's trash. This does not free stored data yet.
+    pub async fn remove_from_trash(&self, node: NodeId) -> Result<(), HistoryCallError> {
+        let req = self.request(Method::DELETE, &format!("trash/{node}"), MAX_SMALL_JSON_BYTES);
+        let answer = self.send(req).await.map_err(HistoryCallError::Transport)?;
+        if answer.status.is_success() {
+            return Ok(());
+        }
+        let status = answer.status;
+        let body = body_capped(answer, MAX_SMALL_JSON_BYTES)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ErrorBody>(&bytes).ok())
+            .unwrap_or_else(|| ErrorBody { error: codes::INTERNAL.into(), message: status.to_string(), ..ErrorBody::default() });
+        Err(HistoryCallError::Refused { status, body: Box::new(body) })
     }
 
     fn request(&self, method: Method, path: &str, max_body: usize) -> Request {
@@ -660,6 +990,67 @@ impl<C: Connection> HttpTransport<C> {
         }
     }
 
+    /// A signed-in call whose refusals the agent keeps whole.
+    async fn account_call<T: DeserializeOwned>(&self, req: Request) -> Result<T, CallError> {
+        let resp = self.send(req).await?;
+        if resp.status.is_success() {
+            return Ok(json(resp, MAX_SMALL_JSON_BYTES).await?);
+        }
+        Err(failure(resp).await)
+    }
+
+    /// [`HttpTransport::account_call`] for an answer without a body.
+    async fn account_unit(&self, req: Request) -> Result<(), CallError> {
+        let resp = self.send(req).await?;
+        if resp.status.is_success() {
+            return Ok(());
+        }
+        Err(failure(resp).await)
+    }
+
+    /// Whether the account has two-factor sign-in on (`GET /account/two-factor`).
+    pub async fn two_factor_status(&self) -> Result<TwoFactorStatus, CallError> {
+        self.account_call(self.request(Method::GET, "account/two-factor", 0)).await
+    }
+
+    /// Starts a set-up with the account's password: the new secret, shown once.
+    pub async fn two_factor_setup(&self, password: &str) -> Result<TwoFactorSetupResponse, CallError> {
+        let req = self.request(Method::POST, "account/two-factor/setup", 0).json(&TwoFactorSetupRequest { password: password.to_owned() })?;
+        self.account_call(req).await
+    }
+
+    /// Turns it on with the first code: the recovery codes, shown once.
+    pub async fn two_factor_confirm(&self, totp_code: &str) -> Result<RecoveryCodes, CallError> {
+        let req = self.request(Method::POST, "account/two-factor/confirm", 0).json(&TwoFactorConfirmRequest { totp_code: totp_code.to_owned() })?;
+        self.account_call(req).await
+    }
+
+    /// Turns it off: the password and a code or recovery code.
+    pub async fn two_factor_disable(&self, body: &TwoFactorProofRequest) -> Result<(), CallError> {
+        self.account_unit(self.request(Method::POST, "account/two-factor/disable", 0).json(body)?).await
+    }
+
+    /// New recovery codes: the password and a code from the authenticator app.
+    pub async fn two_factor_recovery_codes(&self, body: &TwoFactorProofRequest) -> Result<RecoveryCodes, CallError> {
+        self.account_call(self.request(Method::POST, "account/two-factor/recovery-codes", 0).json(body)?).await
+    }
+
+    /// Changes the account's password.
+    pub async fn change_password(&self, body: &ChangePasswordRequest) -> Result<(), CallError> {
+        self.account_unit(self.request(Method::POST, "account/password", 0).json(body)?).await
+    }
+
+    /// Signs every other device of the account out.
+    pub async fn revoke_other_devices(&self) -> Result<RevokedOthers, CallError> {
+        self.account_call(self.request(Method::POST, "devices/revoke-others", 0)).await
+    }
+
+    /// Renames one of the account's devices.
+    pub async fn rename_device(&self, device: DeviceId, name: &str) -> Result<DeviceInfo, CallError> {
+        let req = self.request(Method::PATCH, &format!("devices/{device}"), 0).json(&RenameDeviceRequest { name: name.to_owned() })?;
+        self.account_call(req).await
+    }
+
     /// Revokes a device of this account (this one, to sign out).
     pub async fn revoke(&self, device: DeviceId) -> Result<(), TransportError> {
         self.no_content(self.request(Method::DELETE, &format!("devices/{device}"), 0)).await
@@ -672,6 +1063,11 @@ impl<C: Connection> HttpTransport<C> {
             return Err(TransportError::Protocol(format!("the server listed {} devices, more than the {MAX_DEVICES} this agent reads", list.len())));
         }
         Ok(list)
+    }
+
+    /// The account's stored bytes and labeled estimates, fetched without caching.
+    pub async fn usage(&self) -> Result<craft_cloud_proto::api::AccountUsage, TransportError> {
+        json(self.send(self.request(Method::GET, "account/usage", MAX_SMALL_JSON_BYTES)).await?, MAX_SMALL_JSON_BYTES).await
     }
 
     /// A new add-a-computer code from this device (replacing its open one).
@@ -695,6 +1091,51 @@ impl<C: Connection> HttpTransport<C> {
     /// Cancels one of the account's add-a-computer codes.
     pub async fn delete_pairing(&self, id: Uuid) -> Result<(), TransportError> {
         self.no_content(self.request(Method::DELETE, &format!("pairings/{id}"), 0)).await
+    }
+
+    /// The signed-in account (`GET /account`): its role and whether it has two-factor sign-in.
+    pub async fn account_info(&self) -> Result<AccountInfo, CallError> {
+        self.account_call(self.request(Method::GET, "account", MAX_SMALL_JSON_BYTES)).await
+    }
+
+    /// The audit export (`GET /admin/audit/export?<query>`) as the server sends it: the good answer, whose body is read as it
+    /// comes ([`AnswerBody`]), never held whole; a refusal is kept whole. The whole-request time is long (a big export over a
+    /// slow link), the idle time is the usual minute.
+    pub async fn admin_export_stream(&self, query: &[(&str, &str)]) -> Result<Answer, CallError> {
+        let mut url = self.server.endpoint("admin/audit/export");
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
+        }
+        let mut req = request(Method::GET, url, Some(&self.auth), 0);
+        req.timeout = EXPORT_TIMEOUT;
+        let resp = self.send(req).await?;
+        if resp.status.is_success() {
+            return Ok(resp);
+        }
+        Err(failure(resp).await)
+    }
+
+    /// `GET /api/v1/<path>?<query>` of the admin API (or the account's activity), read as `T`; a refusal is kept whole.
+    pub async fn admin_get<T: DeserializeOwned>(&self, path: &str, query: &[(&str, &str)]) -> Result<T, CallError> {
+        let mut url = self.server.endpoint(path);
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
+        }
+        self.account_call(request(Method::GET, url, Some(&self.auth), MAX_SMALL_JSON_BYTES)).await
+    }
+
+    /// `method /api/v1/<path>` of the admin API with `body` (the confirmation among it), answered with a body read as `T`.
+    pub async fn admin_json<T: DeserializeOwned, B: Serialize>(&self, method: Method, path: &str, body: &B) -> Result<T, CallError> {
+        self.account_call(self.request(method, path, MAX_SMALL_JSON_BYTES).json(body)?).await
+    }
+
+    /// [`HttpTransport::admin_json`] for a call answered without a body (`204`, or `202`): the status it succeeded with.
+    pub async fn admin_empty<B: Serialize>(&self, method: Method, path: &str, body: &B) -> Result<StatusCode, CallError> {
+        let resp = self.send(self.request(method, path, MAX_SMALL_JSON_BYTES).json(body)?).await?;
+        if resp.status.is_success() {
+            return Ok(resp.status);
+        }
+        Err(failure(resp).await)
     }
 }
 
@@ -764,6 +1205,26 @@ mod tests {
     use craft_cloud_proto::{Conflict, ConflictKind};
 
     #[test]
+    fn a_second_factor_is_read_as_typed_and_hidden_in_debug() {
+        assert_eq!(Factor::typed(" 123 456 "), Factor { totp_code: Some("123456".into()), recovery_code: None });
+        assert_eq!(Factor::typed("abcd-efgh-jkmn-pqrs"), Factor { totp_code: None, recovery_code: Some("abcd-efgh-jkmn-pqrs".into()) });
+        assert_eq!(Factor::typed("12345").recovery_code.as_deref(), Some("12345"), "five digits are not a code");
+        let shown = format!("{:?}", Factor::typed("123456"));
+        assert!(!shown.contains("123456"), "{shown}");
+        let shown = format!(
+            "{:?}",
+            Refusal {
+                status: 401,
+                error: "x".into(),
+                message: "m".into(),
+                two_factor: Some(TwoFactorChallenge { challenge: "chal-secret".into(), expires_ms: 1 }),
+                retry_after_secs: None
+            }
+        );
+        assert!(!shown.contains("chal-secret"), "{shown}");
+    }
+
+    #[test]
     fn https_is_required_except_on_this_machine() {
         assert!(ServerUrl::parse("https://cloud.example.com").is_ok());
         assert_eq!(ServerUrl::parse("http://cloud.example.com"), Err(UrlError::NotHttps));
@@ -811,7 +1272,12 @@ mod tests {
     #[test]
     fn requests_keep_bodies_and_tokens_out_of_debug_output() {
         let server = ServerUrl::parse("http://127.0.0.1:1").unwrap();
-        let body = LoginRequest { username: "ana".into(), password: "correct horse battery".into(), device_name: "laptop".into() };
+        let body = LoginRequest {
+            username: "ana".into(),
+            password: "correct horse battery".into(),
+            device_name: "laptop".into(),
+            ..LoginRequest::default()
+        };
         let login = request(Method::POST, server.endpoint("auth/login"), None, 0).json(&body).unwrap();
         let shown = format!("{login:?}");
         assert!(!shown.contains("correct horse") && !shown.contains("ana"), "{shown}");
@@ -821,6 +1287,22 @@ mod tests {
         let signed_in = transport.request(Method::GET, "space", 0);
         let shown = format!("{signed_in:?}");
         assert!(!shown.contains("secret-token") && shown.contains("authorization"), "{shown}");
+    }
+
+    /// An admin change carries the admin's password in its body, to the server only: no `Debug` output of the request
+    /// or of the bodies shows it.
+    #[test]
+    fn admin_confirmations_stay_out_of_debug_output() {
+        use craft_cloud_proto::api::{AdminConfirm, AdminCreateUser, AdminUpdateUser};
+        let server = ServerUrl::parse("http://127.0.0.1:1").unwrap();
+        let confirm = AdminConfirm { password: Some("admin-secret-pw".into()), totp_code: Some("918273".into()), ..AdminConfirm::default() };
+        let create =
+            AdminCreateUser { username: "ana".into(), role: "member".into(), password: Some("admin-secret-pw".into()), ..AdminCreateUser::default() };
+        let update = AdminUpdateUser { password: Some("admin-secret-pw".into()), ..AdminUpdateUser::default() };
+        let sent = request(Method::POST, server.endpoint("admin/users/x/disable"), None, 0).json(&confirm).unwrap();
+        assert!(sent.body.as_deref().is_some_and(|b| String::from_utf8_lossy(b).contains("admin-secret-pw")), "the body carries it");
+        let shown = format!("{sent:?} {confirm:?} {create:?} {update:?}");
+        assert!(!shown.contains("admin-secret-pw") && !shown.contains("918273"), "{shown}");
     }
 
     fn body(code: &str) -> ErrorBody {
@@ -839,6 +1321,13 @@ mod tests {
         assert_eq!(error_for(StatusCode::INSUFFICIENT_STORAGE, Some(full)), TransportError::QuotaExceeded { used: 9, limit: 10 });
         // Without the numbers it is only a server error: tried again later.
         assert!(matches!(error_for(StatusCode::INSUFFICIENT_STORAGE, Some(body(codes::QUOTA_EXCEEDED))), TransportError::Unavailable(_)));
+        // The server itself is full: its own error, with or without the numbers.
+        assert_eq!(error_for(StatusCode::INSUFFICIENT_STORAGE, Some(body(codes::SERVER_FULL))), TransportError::ServerFull);
+        let room = craft_cloud_proto::api::ServerRoom { free_bytes: Some(1), total_bytes: Some(2), capacity_bytes: None };
+        assert_eq!(
+            error_for(StatusCode::INSUFFICIENT_STORAGE, Some(ErrorBody { server: Some(room), ..body(codes::SERVER_FULL) })),
+            TransportError::ServerFull
+        );
         assert_eq!(error_for(StatusCode::UNAUTHORIZED, Some(body(codes::UNAUTHORIZED))), TransportError::Unauthorized);
         assert_eq!(error_for(StatusCode::NOT_FOUND, None), TransportError::NotFound);
         assert!(matches!(error_for(StatusCode::TOO_MANY_REQUESTS, Some(body(codes::RATE_LIMITED))), TransportError::Unavailable(_)));
