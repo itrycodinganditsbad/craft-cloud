@@ -2318,6 +2318,18 @@ mod backup {
         names
     }
 
+    /// The second each generation began in, oldest first (a generation is named `<second>-<id>`).
+    fn stamps(remote: &Path) -> Vec<String> {
+        generations(remote).iter().map(|name| name[..16].to_owned()).collect()
+    }
+
+    /// The directory of the one generation that began in `second`.
+    fn generation_dir(remote: &Path, second: &str) -> PathBuf {
+        let found: Vec<String> = generations(remote).into_iter().filter(|name| name.starts_with(second)).collect();
+        assert_eq!(found.len(), 1, "{second}: {found:?}");
+        remote.join("generations").join(&found[0])
+    }
+
     /// Backs the seeded server up twice, restores into an empty directory, and checks the result with `verify`.
     async fn backup_restore_verify<R: Remote>(remote: R) {
         let s = seeded().await;
@@ -2325,7 +2337,8 @@ mod backup {
         let mut out = Vec::new();
         backup_to(&config, remote.clone(), 7, None, T0, &mut out).await.unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("backup 20231114T221320Z is complete"), "{text}");
+        assert!(text.contains("backup 20231114T221320Z-"), "{text}");
+        assert!(text.contains(" is complete"), "{text}");
         assert!(text.contains("chunks: 2 found, 2 copied"), "{text}");
         assert!(text.contains("manifests: 1 found, 1 copied"), "{text}");
 
@@ -2334,7 +2347,7 @@ mod backup {
         backup_to(&config, remote.clone(), 7, None, T0 + 60_000, &mut out).await.unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("chunks: 2 found, 0 copied (0 bytes), 2 already there"), "{text}");
-        assert!(text.contains("backup 20231114T221420Z is complete"), "{text}");
+        assert!(text.contains("backup 20231114T221420Z-"), "{text}");
 
         // A restore refuses a directory with something in it, and changes nothing there.
         let before = tree_snapshot(&s.dir);
@@ -2348,7 +2361,7 @@ mod backup {
         let mut out = Vec::new();
         restore_from(remote.clone(), &restored, None, &mut out).await.unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("restored generation 20231114T221420Z"), "{text}");
+        assert!(text.contains("restored generation 20231114T221420Z-"), "{text}");
         assert!(text.contains("reset-epoch --all"), "{text}");
 
         let restored_config = config_for(&restored);
@@ -2379,7 +2392,7 @@ mod backup {
         for n in 0..4 {
             backup_to(&config, remote.clone(), 2, None, T0 + n * 60_000, &mut Vec::new()).await.unwrap();
         }
-        assert_eq!(generations(&root), ["20231114T221520Z", "20231114T221620Z"].map(String::from));
+        assert_eq!(stamps(&root), ["20231114T221520Z", "20231114T221620Z"].map(String::from));
         for name in generations(&root) {
             assert!(root.join("generations").join(name).join("manifest.json").is_file());
         }
@@ -2408,7 +2421,7 @@ mod backup {
         restore_from(remote.clone(), &restored, None, &mut Vec::new()).await.unwrap();
 
         // One flipped byte in the dump is caught by the manifest's hash, and the half-made directory is removed.
-        let dump = root.join("generations/20231114T221320Z/meta.sqlite");
+        let dump = generation_dir(&root, "20231114T221320Z").join("meta.sqlite");
         let mut bytes = std::fs::read(&dump).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 1;
@@ -2461,7 +2474,7 @@ mod backup {
         let remote = DirRemote::new(&root);
         backup_to(&config, remote.clone(), 7, None, T0, &mut Vec::new()).await.unwrap();
         // The backup server now holds a bigger dump than the manifest recorded (or lies about its size).
-        let dump = root.join("generations/20231114T221320Z/meta.sqlite");
+        let dump = generation_dir(&root, "20231114T221320Z").join("meta.sqlite");
         let mut bytes = std::fs::read(&dump).unwrap();
         bytes.extend_from_slice(&[0u8; 4096]);
         std::fs::write(&dump, bytes).unwrap();
@@ -2472,26 +2485,50 @@ mod backup {
     }
 
     #[tokio::test]
-    async fn a_generation_that_is_there_is_never_written_over_and_the_one_just_written_is_never_pruned() {
+    async fn backups_in_the_same_second_get_generations_of_their_own_and_none_prunes_the_other() {
         let s = seeded().await;
         let config = Config::load(Path::new(&s.config)).unwrap();
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("remote");
         let remote = DirRemote::new(&root);
+        // Two backups that run at once, in the same second, with keep = 1 (the case where one would prune the other).
+        let (mut out_a, mut out_b) = (Vec::new(), Vec::new());
+        let (first, second) =
+            tokio::join!(backup_to(&config, remote.clone(), 1, None, T0, &mut out_a), backup_to(&config, remote.clone(), 1, None, T0, &mut out_b));
+        first.unwrap();
+        second.unwrap();
+        let names = generations(&root);
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names.iter().all(|n| n.starts_with("20231114T221320Z-") && n.len() == 49), "{names:?}");
+        // Each is whole: its manifest names its own dump, whose hash is the manifest's.
+        for name in &names {
+            let dir = root.join("generations").join(name);
+            let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+            assert_eq!(manifest["database"]["file"], format!("generations/{name}/meta.sqlite"));
+            let dump = std::fs::read(dir.join("meta.sqlite")).unwrap();
+            assert_eq!(manifest["database"]["blake3"], blake3::hash(&dump).to_hex().to_string());
+            assert_eq!(manifest["database"]["bytes"], dump.len() as u64);
+        }
+        // The same second again, later: still a new generation, and the other ones that began in that second stay.
         backup_to(&config, remote.clone(), 1, None, T0, &mut Vec::new()).await.unwrap();
-        let dump = root.join("generations/20231114T221320Z/meta.sqlite");
-        let before = std::fs::read(&dump).unwrap();
-        // The same second again (a second run, or a clock stepped back to it): refused, and the good one is untouched.
-        let again = backup_to(&config, remote.clone(), 1, None, T0, &mut Vec::new()).await;
-        assert!(matches!(&again, Err(CliError::Usage(m)) if m.contains("20231114T221320Z") && m.contains("nothing was changed")), "{again:?}");
-        assert_eq!(std::fs::read(&dump).unwrap(), before);
+        assert_eq!(generations(&root).len(), 3);
+        restore_from(remote.clone(), &parent.path().join("restored"), None, &mut Vec::new()).await.unwrap();
         // A newer backup, then one whose clock is behind it, with keep = 1: the one just written stays (and so does the
         // newest), because a clock that went back must not make a backup delete itself.
         backup_to(&config, remote.clone(), 1, None, T0 + 120_000, &mut Vec::new()).await.unwrap();
-        assert_eq!(generations(&root), ["20231114T221520Z"].map(String::from));
+        assert_eq!(stamps(&root), ["20231114T221520Z"].map(String::from));
         backup_to(&config, remote.clone(), 1, None, T0 + 60_000, &mut Vec::new()).await.unwrap();
-        assert_eq!(generations(&root), ["20231114T221420Z", "20231114T221520Z"].map(String::from));
-        assert!(root.join("generations/20231114T221420Z/manifest.json").is_file());
+        assert_eq!(stamps(&root), ["20231114T221420Z", "20231114T221520Z"].map(String::from));
+        assert!(generation_dir(&root, "20231114T221420Z").join("manifest.json").is_file());
+        // A generation of the first version's name (no id) is still read, and a named one restores by its second.
+        let old = root.join("generations/20231114T221000Z");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::copy(generation_dir(&root, "20231114T221520Z").join("meta.sqlite"), old.join("meta.sqlite")).unwrap();
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(generation_dir(&root, "20231114T221520Z").join("manifest.json")).unwrap()).unwrap();
+        manifest["database"]["file"] = "generations/20231114T221000Z/meta.sqlite".into();
+        std::fs::write(old.join("manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        restore_from(remote.clone(), &parent.path().join("old"), Some("20231114T221000Z"), &mut Vec::new()).await.unwrap();
         // A generation without its manifest is a backup that may be running: left alone for a day, then taken for dead.
         let running = root.join("generations/20231114T220000Z");
         std::fs::create_dir_all(&running).unwrap();
@@ -2664,15 +2701,7 @@ mod backup {
         };
         let first = backup("3").await.unwrap();
         assert!(first.contains("chunks: 2 found, 2 copied") && first.contains("is complete"), "{first}");
-        // A generation is named by the second it began in; the same second again is refused (tested above), so wait it out.
-        let same_second = backup("3").await;
-        if matches!(&same_second, Err(CliError::Usage(m)) if m.contains("already")) {
-            tokio::time::sleep(Duration::from_millis(1100)).await;
-        }
-        let second = match same_second {
-            Err(_) => backup("3").await.unwrap(),
-            Ok(out) => out,
-        };
+        let second = backup("3").await.unwrap();
         assert!(second.contains("chunks: 2 found, 0 copied"), "{second}");
         let parent = tempfile::tempdir().unwrap();
         let restored = parent.path().join("restored");

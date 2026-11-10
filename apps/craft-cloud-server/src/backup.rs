@@ -6,8 +6,12 @@
 //!
 //! ```text
 //! chunks/ab/cd/<id>, manifests/ab/cd/<id>   the blobs, as the store holds them
-//! generations/<UTC stamp>/meta.sqlite        one database dump
-//! generations/<UTC stamp>/manifest.json      written last: its presence marks the generation as complete
+//! generations/<UTC stamp>-<id>/meta.sqlite     one database dump
+//! generations/<UTC stamp>-<id>/manifest.json   written last: its presence marks the generation as complete
+//!
+//! A generation's name is the second the backup began in and a random UUIDv7, so two backups that run at once (or in
+//! the same second) write to directories of their own and never into each other's files. Names without the `-<id>`
+//! (written by the first version) are still read.
 //! ```
 //!
 //! The database is dumped first and the blobs after it: a blob the dump refers to was uploaded before the commit that
@@ -274,16 +278,11 @@ pub async fn backup_to<R: Remote>(
         return Err(CliError::Usage("--keep must be at least 1".into()));
     }
     let (meta, local) = open_existing(config).await?;
-    let (stamp, iso) = utc_stamp(now_ms);
+    let (second, iso) = utc_stamp(now_ms);
+    // The second alone is not a name: another backup may begin in it. The random part makes the directory this backup's own.
+    let stamp = format!("{second}-{}", uuid::Uuid::now_v7().simple());
     let dump_path = format!("{GENERATIONS}/{stamp}/{DUMP_NAME}");
     let manifest_path = format!("{GENERATIONS}/{stamp}/{MANIFEST_NAME}");
-    // A generation is named by the second it started in. One that is there already is another backup running, or the
-    // clock went back: writing over it could damage a backup that is good.
-    if remote.size_raw(&dump_path).await?.is_some() || remote.size_raw(&manifest_path).await?.is_some() {
-        return Err(CliError::Usage(format!(
-            "the backup server has a generation {stamp} already (another backup is running, or the clock went back); nothing was changed"
-        )));
-    }
     let work = tempfile::Builder::new().prefix("craft-cloud-backup-").tempdir_in(work_dir.map_or_else(std::env::temp_dir, Path::to_owned))?;
     let dump = work.path().join(DUMP_NAME);
     meta.dump_sqlite(&dump).await?;
@@ -331,9 +330,14 @@ pub async fn restore_from<R: Remote>(remote: R, dir: &Path, generation: Option<&
     let generations = list_generations(&remote).await?;
     let complete: Vec<&String> = generations.iter().filter(|(_, files)| files.iter().any(|f| f == MANIFEST_NAME)).map(|(stamp, _)| stamp).collect();
     let stamp = match generation {
+        // The whole name, or just its stamp (the newest backup that began in that second).
         Some(wanted) => complete
             .iter()
-            .find(|stamp| stamp.as_str() == wanted)
+            .rev()
+            .find(|stamp| {
+                stamp.as_str() == wanted
+                    || (stamp.len() > wanted.len() && stamp.starts_with(wanted) && stamp.get(wanted.len()..=wanted.len()) == Some("-"))
+            })
             .map(|stamp| (*stamp).clone())
             .ok_or_else(|| CliError::Usage(format!("the backup server has no complete generation {wanted}")))?,
         None => complete.last().map(|stamp| (*stamp).clone()).ok_or_else(|| CliError::Usage("the backup server holds no complete backup".into()))?,
@@ -434,7 +438,7 @@ async fn list_generations<R: Remote>(remote: &R) -> Result<BTreeMap<String, Vec<
         for path in &page {
             let mut parts = path.split('/');
             if let (Some(GENERATIONS), Some(stamp), Some(name), None) = (parts.next(), parts.next(), parts.next(), parts.next())
-                && is_stamp(stamp)
+                && is_generation(stamp)
             {
                 found.entry(stamp.to_owned()).or_default().push(name.to_owned());
             }
@@ -449,20 +453,27 @@ async fn list_generations<R: Remote>(remote: &R) -> Result<BTreeMap<String, Vec<
 /// How old a generation without its manifest must be before it is taken for a backup that died, not one still running.
 const ABANDONED_AFTER_MS: i64 = 24 * 3600 * 1000;
 
-/// Deletes the complete generations beyond the `keep` newest, and the incomplete ones that are over a day old. The
-/// generation `current` that was just written is never deleted, whatever the clock said, and a generation without its
-/// manifest that is younger than a day is left alone: it may be a backup that is still running. Returns how many it removed.
+/// Deletes the complete generations beyond the `keep` newest, and the incomplete ones that are over a day old. It runs
+/// after this backup's own manifest is written, and only touches generations that began in an earlier second than
+/// `current`: the generation just written is never deleted, whatever the clock said, one that began in the same second
+/// or later belongs to a backup that may be running, and a generation without its manifest that is younger than a day
+/// is left alone for the same reason. Returns how many it removed.
 async fn prune<R: Remote>(remote: &R, keep: u32, current: &str, now_ms: i64) -> Result<usize, CliError> {
     let generations = list_generations(remote).await?;
     let complete: Vec<&String> = generations.iter().filter(|(_, files)| files.iter().any(|f| f == MANIFEST_NAME)).map(|(stamp, _)| stamp).collect();
     let keep = usize::try_from(keep).unwrap_or(usize::MAX).max(1);
     let kept: Vec<&String> = complete.iter().rev().take(keep).copied().collect();
     let abandoned_before = utc_stamp(now_ms.saturating_sub(ABANDONED_AFTER_MS)).0;
+    let own_second = current.get(..16).unwrap_or(current);
     let doomed = |stamp: &String, files: &Vec<String>| {
         if stamp == current || kept.contains(&stamp) {
             return false;
         }
-        files.iter().any(|f| f == MANIFEST_NAME) || *stamp < abandoned_before
+        let second = stamp.get(..16).unwrap_or(stamp);
+        if second >= own_second {
+            return false;
+        }
+        files.iter().any(|f| f == MANIFEST_NAME) || second < abandoned_before.as_str()
     };
     let mut removed = 0usize;
     for (stamp, files) in generations.iter().filter(|(stamp, files)| doomed(stamp, files)) {
@@ -474,6 +485,20 @@ async fn prune<R: Remote>(remote: &R, keep: u32, current: &str, now_ms: i64) -> 
         removed = removed.saturating_add(1);
     }
     Ok(removed)
+}
+
+/// A generation's name: a stamp, and the `-<32 hex digits>` of a UUIDv7 unless it was written by the first version.
+fn is_generation(text: &str) -> bool {
+    match text.get(..16) {
+        Some(stamp) if text.len() == 16 => is_stamp(stamp),
+        Some(stamp) => {
+            text.len() == 49
+                && is_stamp(stamp)
+                && text.get(16..17) == Some("-")
+                && text.get(17..).is_some_and(|id| id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        }
+        None => false,
+    }
 }
 
 /// `YYYYMMDDTHHMMSSZ`.
@@ -575,6 +600,17 @@ mod tests {
         assert_eq!(utc_stamp(-1).0, "19691231T235959Z");
         assert!(utc_stamp(1_700_000_000_000).0 < utc_stamp(1_700_000_001_000).0);
         assert!(is_stamp(&utc_stamp(1_700_000_000_000).0));
+        let id = uuid::Uuid::now_v7().simple().to_string();
+        assert!(is_generation("20231114T221320Z") && is_generation(&format!("20231114T221320Z-{id}")));
+        for bad in [
+            "20231114T221320Z-",
+            "20231114T221320Z-xyz",
+            "20231114T221320Zx",
+            format!("20231114T221320Z_{id}").as_str(),
+            format!("2023-11-14T221320Z-{id}").as_str(),
+        ] {
+            assert!(!is_generation(bad), "{bad}");
+        }
         assert!(!is_stamp("2023-11-14"));
         assert!(!is_stamp("20231114T221320Zx"));
     }
