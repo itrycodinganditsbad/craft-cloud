@@ -529,13 +529,14 @@ sftp_host_key = "SHA256:…"               # the server's host key; or sftp_know
   supported. The key file, its passphrase and the environment variables are read like S3's keys: nothing is logged or
   shown by the admin pages, and the config file is owner-only on Unix.
 - **The file server must offer the `posix-rename@openssh.com` extension** (every OpenSSH-based SFTP server does). A write
-  goes to a file named `….tmp-<id>` in the target's directory and is renamed over the target in one step, so a reader sees
+  goes to a file named `.tmp-<uuid>` (a UUIDv7, as on disk) in the target's directory and is renamed over the target in one step, so a reader sees
   the old blob or the new one and never a part. A server without the extension is refused at start with a message that
   names it: Craft Cloud never replaces a blob by deleting it first. A failed upload removes its temporary file, on a fresh
   connection when the first one is gone. When that cannot be done (the server was killed, the file server went away), the
   temporary file stays in its shard directory, and the listing does not show it. `craft-cloud-server store clean-temp
-  --config … [--older-than-hours 24]` removes the ones older than that (only exact `.tmp-<id>` names, by the time in the
-  name; an upload that is running or finished is never touched). Run it now and then (say weekly); it walks
+  --config … [--older-than-hours 24]` removes the ones older than that (only exact `.tmp-<uuid>` names, by the time in the
+  name; an upload that is running or finished is never touched). It prints how many it removed and, when there are any, how many
+  younger ones and how many other `.tmp-…` names (not exactly the server's, so left) it saw. Run it now and then (say weekly); it walks
   every shard directory, so on a big store it takes a while.
 - **A successful write means the file server accepted it.** SFTP has no portable `fsync`; when the server offers
   `fsync@openssh.com` the file is flushed before the rename, but what happens at the provider after that is not
@@ -628,8 +629,17 @@ newest complete generation (or the one named with `--generation`, the whole name
 hash and size in its manifest and opens it, then copies the blobs. It builds everything in a directory beside the target
 (`<dir>.restore-<id>`) and moves it into place only when it is all there, so a restore that fails, or is killed, never
 leaves a database with part of its blobs at the target and a re-run is not refused. After a kill, delete the leftover
-`….restore-<id>` directory. The result is `meta.db` and `blobs/`. Then put your `config.toml` and the two-factor key beside them (storage path `…/blobs`, database
-`sqlite:…/meta.db`), run `craft-cloud-server verify --config …`, and, as for any restore, `reset-epoch --all` before
+`….restore-<id>` directory.
+
+**What a restore produces, whatever the server stored its blobs in.** `restore` always writes `meta.db` and a local
+disk tree `blobs/` (`chunks/ab/cd/<id>`, `manifests/ab/cd/<id>`), even if the backed-up server kept its blobs in S3 or on
+an SFTP server. The restored server therefore has to run with `[storage] kind = "disk"` and `path = "<dir>/blobs"`, and
+`[database] url = "sqlite:<dir>/meta.db"`. To go back to S3 (or SFTP) afterwards, first copy the contents of `blobs/` into
+the bucket (or the SFTP root) with the same layout and names, using any tool that copies a directory tree, for example
+`rclone copy <dir>/blobs remote:bucket/prefix` or `aws s3 sync <dir>/blobs s3://bucket/prefix` (the prefix is your
+`[storage] prefix`), check the count, and only then change `[storage]` back. Until the copy is complete the server
+would answer "not found" for blobs that are not there yet. Put your `config.toml` and the two-factor key beside the
+restored files, run `craft-cloud-server verify --config …`, and, as for any restore, `reset-epoch --all` before
 `serve` (see "Restoring a backup"). The blobs of the backup are a superset of what the restored database names: ones
 uploaded after the dump are not referenced and only take up room until a future garbage collection.
 
