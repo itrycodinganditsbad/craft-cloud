@@ -1,4 +1,6 @@
-//! The HTTP API, under `/api/v1`. Everything but `info`, `auth/login` and `join` needs a device token. `GET /live`
+//! The HTTP API, under `/api/v1`. Everything but `info`, `auth/login`, `auth/login/second-factor` and `join` needs a device
+//! token. The account and its devices' routes (`account`, `account/password`, renaming and signing out devices) are in
+//! [`crate::account`], two-factor sign-in's in [`crate::two_factor`]. `GET /live`
 //! becomes the live service's WebSocket ([`crate::live`]); join codes (`pairings`, `join`, and the `/join/{code}` page
 //! outside the API) are in [`crate::join`].
 
@@ -11,35 +13,42 @@ use axum::extract::rejection::{PathRejection, QueryRejection};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, FromRequest, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{MethodRouter, delete, get, post, put};
 use axum::{Json, Router, middleware};
-use craft_cloud_meta::{BlobKind, DeviceAuth, valid_username};
+use craft_cloud_meta::{BlobKind, DeviceAuth, DeviceClient, DeviceRecord, NewChallenge, Origin, RevokeReason, SignIn, valid_username};
 use craft_cloud_proto::api::{
-    CommitRequest, CommitResponse, DeviceInfo, InfoResponse, LoginRequest, LoginResponse, MAX_MISSING_IDS, MissingRequest, MissingResponse,
-    PROTOCOL_MAX, PROTOCOL_MIN, SpaceResponse, codes,
+    AccountUsage, CommitRequest, CommitResponse, DeviceInfo, HISTORY_DEFAULT_LIMIT, HistoryCursor, HistoryResponse, InfoResponse, LoginRequest,
+    LoginResponse, MAX_MISSING_IDS, MissingRequest, MissingResponse, PROTOCOL_MAX, PROTOCOL_MIN, RestoreRequest, RestoreResponse, SpaceResponse,
+    SpaceRole, TRASH_DEFAULT_LIMIT, TrashCursor, TrashItem, TrashResponse, TrashRestoreResponse, UsageEstimateReason, UsageEstimates, codes,
 };
 use craft_cloud_proto::limits::{MAX_BATCH_JSON_BYTES, MAX_BATCH_OPS, MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, MAX_PAGE_NODES};
 use craft_cloud_proto::{ChangeSet, ChunkId, DeviceId, Manifest, ManifestId, NodeId, PageCursor};
 use craft_cloud_store::{BlobKey, StoreError};
 use serde::Deserialize;
 
+use crate::account;
+use crate::audit;
 use crate::auth::{new_token, require_device, verify_password};
 use crate::error::ApiError;
 use crate::join;
 use crate::ratelimit::{client_ip, ip_key};
+use crate::space::{SpaceAccess, SpaceGate, require_space};
 use crate::state::AppState;
+use crate::two_factor;
 
 /// Chunker parameter sets the server accepts.
 pub const CHUNKER_PARAMS: &[&str] = &["fastcdc-v1"];
 /// Login attempts per account and per client address in five minutes.
-const LOGINS_PER_USER: u32 = 10;
-const LOGINS_PER_IP: u32 = 30;
+pub(crate) const LOGINS_PER_USER: u32 = 10;
+pub(crate) const LOGINS_PER_IP: u32 = 30;
 /// Longest change-feed long-poll.
 const MAX_WAIT_SECS: u64 = 60;
 /// `Retry-After` for a refused long-poll.
 const WAITERS_RETRY_SECS: u32 = 5;
 /// Small JSON bodies (login, join and missing-chunk queries).
 pub(crate) const SMALL_JSON_BYTES: usize = 1024 * 1024;
+/// Tiny JSON bodies (a password change, a device's new name): a few short strings, so far less than a small body.
+pub(crate) const TINY_JSON_BYTES: usize = 4 * 1024;
 /// `Retry-After` for a sign-in refused because every password check slot is busy.
 pub(crate) const PASSWORD_RETRY_SECS: u32 = 1;
 
@@ -47,33 +56,77 @@ type Shared = Arc<AppState>;
 
 pub fn router(state: Shared) -> Router {
     let signed_in = Router::new()
+        .route("/account", get(account::get_account))
+        .route("/account/password", post(account::change_password).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route("/account/activity", get(audit::account_activity))
+        .route("/account/two-factor", get(two_factor::get_status))
+        .route("/account/two-factor/setup", post(two_factor::setup).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route("/account/two-factor/confirm", post(two_factor::confirm).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route("/account/two-factor/disable", post(two_factor::disable).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
+        .route("/account/two-factor/recovery-codes", post(two_factor::recovery_codes).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route("/devices", get(list_devices))
-        .route("/devices/{id}", delete(revoke_device))
+        .route("/devices/revoke-others", post(account::revoke_others))
+        .route("/devices/{id}", delete(revoke_device).patch(account::rename_device).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route("/pairings", post(join::create_pairing))
         .route("/pairings/{id}", get(join::pairing_status).delete(join::delete_pairing))
-        .route("/chunks/missing", post(missing_chunks).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)))
-        .route("/chunks/{id}", put(put_chunk).get(get_chunk).layer(DefaultBodyLimit::max(MAX_CHUNK_BYTES as usize)))
-        .route("/manifests/{id}", put(put_manifest).get(get_manifest).layer(DefaultBodyLimit::max(MAX_MANIFEST_BYTES)))
-        .route("/commit", post(commit).layer(DefaultBodyLimit::max(MAX_BATCH_JSON_BYTES)))
-        .route("/saves", post(attach_save).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)))
-        .route("/space", get(space))
-        .route("/tree", get(tree))
-        .route("/changes", get(changes))
-        .route("/live", get(crate::live::connect))
+        .route("/account/usage", get(account_usage))
+        .merge(space_routes(&state))
+        .merge(crate::spaces::routes())
+        // The admin routes carry `require_admin` themselves; `require_device` below wraps them too and runs first.
+        .merge(crate::admin::routes())
+        .merge(audit::admin_routes())
+        .merge(crate::spaces::admin_routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_device));
     let public = Router::new()
         .route("/info", get(info))
         .route("/auth/login", post(login).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)))
+        .route("/auth/login/second-factor", post(two_factor::second_factor).layer(DefaultBodyLimit::max(TINY_JSON_BYTES)))
         .route("/join", post(join::join).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)));
-    Router::new()
+    let app = Router::new()
         .nest("/api/v1", public.merge(signed_in))
         // Version 1 isn't known yet when a client first asks what the server speaks.
         .route("/api/info", get(info))
         // A join link opened in a browser.
         .route("/join/{code}", get(join::join_page))
         .fallback(no_such_endpoint)
-        .method_not_allowed_fallback(wrong_method)
-        .with_state(state)
+        .method_not_allowed_fallback(wrong_method);
+    // The admin pages exist only on a server that was set up for them.
+    let app =
+        if state.web.is_some() { app.nest("/web", crate::web::routes(state.clone())).merge(crate::web::trailing_slash(state.clone())) } else { app };
+    app.with_state(state)
+}
+
+/// A route group's role gate: the layer that refuses a caller whose role in the request's space is below `min` (see
+/// [`crate::space`]). Applied per method, so one path can need different roles for different methods.
+fn gated(state: &Shared, min: SpaceRole, routes: MethodRouter<Shared>) -> MethodRouter<Shared> {
+    routes.route_layer(middleware::from_fn_with_state(SpaceGate { state: state.clone(), min }, require_space))
+}
+
+/// The space-scoped routes, each with the least role it needs (`docs/design/collaboration.md`, 3.2). A route not listed here
+/// has no space layer and takes no `craft-space` header. A new space-scoped route is added here, with its role.
+fn space_routes(state: &Shared) -> Router<Shared> {
+    use SpaceRole::{Editor, Owner, Viewer};
+    Router::new()
+        .route("/chunks/missing", gated(state, Editor, post(missing_chunks)).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)))
+        .route(
+            "/chunks/{id}",
+            gated(state, Viewer, get(get_chunk)).merge(gated(state, Editor, put(put_chunk))).layer(DefaultBodyLimit::max(MAX_CHUNK_BYTES as usize)),
+        )
+        .route(
+            "/manifests/{id}",
+            gated(state, Viewer, get(get_manifest)).merge(gated(state, Editor, put(put_manifest))).layer(DefaultBodyLimit::max(MAX_MANIFEST_BYTES)),
+        )
+        .route("/commit", gated(state, Editor, post(commit)).layer(DefaultBodyLimit::max(MAX_BATCH_JSON_BYTES)))
+        .route("/saves", gated(state, Editor, post(attach_save)).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)))
+        .route("/nodes/{id}/history", gated(state, Viewer, get(history)))
+        .route("/nodes/{id}/restore", gated(state, Editor, post(restore)).layer(DefaultBodyLimit::max(SMALL_JSON_BYTES)))
+        .route("/trash", gated(state, Viewer, get(trash)))
+        .route("/trash/{id}/restore", gated(state, Editor, post(restore_from_trash)))
+        .route("/trash/{id}", gated(state, Owner, delete(remove_from_trash)))
+        .route("/space", gated(state, Viewer, get(space)))
+        .route("/tree", gated(state, Viewer, get(tree)))
+        .route("/changes", gated(state, Viewer, get(changes)))
+        .route("/live", gated(state, Viewer, get(crate::live::connect)))
 }
 
 async fn no_such_endpoint() -> ApiError {
@@ -109,6 +162,7 @@ async fn login(
         return Err(ApiError::invalid("usernames are 1-64 letters, digits, '.', '_' or '-'"));
     }
     check_device_name(&req.device_name)?;
+    let client = device_client(req.client_kind.as_deref(), req.platform.as_deref(), req.app_version.as_deref())?;
     // tokio's clock: the system's monotonic clock in the server, the simulated one in a simulation.
     let now = tokio::time::Instant::now().into_std();
     let ip = client_ip(peer, &headers, &state.trusted_proxies);
@@ -131,7 +185,10 @@ async fn login(
         return Err(ApiError::invalid("passwords are at most 1024 bytes"));
     }
     let user = state.meta.user_by_name(&username).await?;
-    let hash = user.as_ref().map_or(state.dummy_hash.as_str(), |u| u.password_hash.as_str()).to_owned();
+    let known = user.as_ref().map(|u| u.id);
+    // An account without a password (an open invite) costs the same Argon2id check as a name nobody has, and never signs in.
+    let usable = user.as_ref().is_some_and(|u| crate::auth::usable_hash(&u.password_hash));
+    let hash = user.as_ref().filter(|_| usable).map_or(state.dummy_hash.as_str(), |u| u.password_hash.as_str()).to_owned();
     let password = req.password.clone();
     let ok = tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -142,11 +199,29 @@ async fn login(
         tracing::error!(error = %e, "password check task failed");
         ApiError::internal()
     })?;
-    let (Some(user), true) = (user, ok) else {
+    let (Some(user), true) = (user, ok && usable) else {
+        // Written after the answer is decided and in a transaction of its own: a log that cannot be written changes
+        // neither the answer nor the limits above. A name no account has is never put in the log.
+        audit::login_failed(&state, known).await;
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, codes::UNAUTHORIZED, "wrong username or password"));
     };
     let (token, token_hash) = new_token()?;
-    let device = state.meta.create_device(user.id, &req.device_name, &token_hash, state.now_ms()).await?;
+    // A challenge is made only if the account needs a second factor; the token the client gets for it is a secret of its own.
+    let (challenge_token, challenge_hash) = new_token()?;
+    let challenge = NewChallenge { id_hash: challenge_hash, client_key: ip_key(ip) };
+    // Created only if the password just checked is still the account's: one changed meanwhile (and the devices
+    // signed out with it) must not be followed by a device that the old password let in. Answered as a wrong password. The
+    // account's two-factor state is read under the same lock: with it on, there is a challenge and no device.
+    let signed_in =
+        state.meta.sign_in(user.id, (&user.password_hash, user.auth_gen), &req.device_name, &client, &token_hash, &challenge, state.now_ms()).await?;
+    let device = match signed_in {
+        None => return Err(ApiError::new(StatusCode::UNAUTHORIZED, codes::UNAUTHORIZED, "wrong username or password")),
+        Some(SignIn::Device(device)) => device,
+        Some(SignIn::Challenge { expires_ms }) => {
+            tracing::info!("sign-in needs a second factor");
+            return Err(ApiError::two_factor_required(challenge_token, expires_ms));
+        }
+    };
     // The username is the only personal identifier the server could log here: kept to debug.
     tracing::debug!(user = %user.username, "sign-in");
     tracing::info!(%device, "device signed in");
@@ -162,26 +237,63 @@ pub(crate) fn check_device_name(name: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-async fn space(State(state): State<Shared>, Extension(auth): Extension<DeviceAuth>) -> Result<Json<SpaceResponse>, ApiError> {
-    let info = state.meta.space_info(auth.space).await?;
-    Ok(Json(SpaceResponse { space: auth.space, root: info.root, epoch: info.epoch, seq: info.seq, username: auth.username }))
+/// The client fields of a sign-in or join, checked before anything is counted: an unknown `client_kind`, a field over
+/// 32 bytes or a control character is `400 invalid`. The fields are only shown in the device list.
+pub(crate) fn device_client(kind: Option<&str>, platform: Option<&str>, app_version: Option<&str>) -> Result<DeviceClient, ApiError> {
+    Ok(DeviceClient::new(kind, platform, app_version)?)
+}
+
+/// A device as the API shows it; `current` is the device making the request.
+pub(crate) fn device_info(d: DeviceRecord, current: DeviceId) -> DeviceInfo {
+    DeviceInfo {
+        current: d.id == current,
+        id: d.id,
+        name: d.name,
+        created_ms: d.created_ms,
+        last_used_ms: d.last_used_ms,
+        revoked: d.revoked,
+        client_kind: d.client.kind,
+        platform: d.client.platform,
+        app_version: d.client.app_version,
+        revoked_ms: d.revoked_ms,
+        revoke_reason: d.revoke_reason.map(|r| r.as_str().to_owned()),
+    }
+}
+
+async fn space(
+    State(state): State<Shared>,
+    Extension(auth): Extension<DeviceAuth>,
+    Extension(access): Extension<SpaceAccess>,
+) -> Result<Json<SpaceResponse>, ApiError> {
+    let info = state.meta.space_info(access.space).await?;
+    let name = if access.personal { None } else { state.meta.team_space_name(access.space).await? };
+    Ok(Json(SpaceResponse {
+        space: access.space,
+        root: info.root,
+        epoch: info.epoch,
+        seq: info.seq,
+        username: auth.username,
+        kind: Some(if access.personal { "personal" } else { "team" }.to_owned()),
+        name,
+        role: Some(access.role),
+    }))
+}
+
+async fn account_usage(State(state): State<Shared>, Extension(auth): Extension<DeviceAuth>) -> Result<Json<AccountUsage>, ApiError> {
+    let estimate = state.meta.storage_estimate(auth.personal_space()).await?;
+    let index_complete = estimate.reason.is_none();
+    Ok(Json(AccountUsage {
+        stored_bytes: estimate.stored_bytes,
+        quota_bytes: estimate.quota_bytes,
+        trash_bytes: estimate.trash_bytes,
+        history_bytes: estimate.history_bytes,
+        estimates: UsageEstimates { index_complete, reason: estimate.reason.map(|_| UsageEstimateReason::IndexIncomplete) },
+    }))
 }
 
 async fn list_devices(State(state): State<Shared>, Extension(auth): Extension<DeviceAuth>) -> Result<Json<Vec<DeviceInfo>>, ApiError> {
     let devices = state.meta.list_devices(auth.user).await?;
-    Ok(Json(
-        devices
-            .into_iter()
-            .map(|d| DeviceInfo {
-                current: d.id == auth.device,
-                id: d.id,
-                name: d.name,
-                created_ms: d.created_ms,
-                last_used_ms: d.last_used_ms,
-                revoked: d.revoked,
-            })
-            .collect(),
-    ))
+    Ok(Json(devices.into_iter().map(|d| device_info(d, auth.device)).collect()))
 }
 
 async fn revoke_device(
@@ -190,7 +302,7 @@ async fn revoke_device(
     id: Result<Path<DeviceId>, PathRejection>,
 ) -> Result<StatusCode, ApiError> {
     let Path(id) = id?;
-    state.meta.revoke_device(auth.user, id).await?;
+    state.meta.revoke_device_by(auth.user, id, RevokeReason::User, Origin::Device(auth.device), state.now_ms()).await?;
     // Its live connections end now, not at their next request.
     state.live.revoke(id);
     Ok(StatusCode::NO_CONTENT)
@@ -198,14 +310,14 @@ async fn revoke_device(
 
 async fn missing_chunks(
     State(state): State<Shared>,
-    Extension(auth): Extension<DeviceAuth>,
+    Extension(access): Extension<SpaceAccess>,
     request: Request,
 ) -> Result<Json<MissingResponse>, ApiError> {
     let req: MissingRequest = read_json(&state, request, SMALL_JSON_BYTES).await?;
     if req.ids.len() > MAX_MISSING_IDS {
         return Err(ApiError::invalid(format!("ask about at most {MAX_MISSING_IDS} chunks at once")));
     }
-    Ok(Json(MissingResponse { missing: state.meta.missing_chunks(auth.space, &req.ids).await? }))
+    Ok(Json(MissingResponse { missing: state.meta.missing_chunks(access.space, &req.ids).await? }))
 }
 
 fn parse_chunk_id(id: &str) -> Result<ChunkId, ApiError> {
@@ -252,13 +364,14 @@ pub(crate) async fn read_json<T: serde::de::DeserializeOwned>(state: &AppState, 
     }
 }
 
-fn body_too_slow() -> ApiError {
+pub(crate) fn body_too_slow() -> ApiError {
     ApiError::new(StatusCode::REQUEST_TIMEOUT, codes::TIMEOUT, "the request body took too long to arrive")
 }
 
 async fn put_chunk(
     State(state): State<Shared>,
     Extension(auth): Extension<DeviceAuth>,
+    Extension(access): Extension<SpaceAccess>,
     id: Result<Path<String>, PathRejection>,
     request: Request,
 ) -> Result<StatusCode, ApiError> {
@@ -271,22 +384,22 @@ async fn put_chunk(
         return Err(ApiError::invalid("a chunk can't be empty"));
     }
     // A space at its cap doesn't get to store bytes it would then be refused for.
-    state.meta.check_room(auth.space, BlobKind::Chunk, id.as_bytes(), body.len() as u64 + 1).await?;
+    state.meta.check_room(access.space, BlobKind::Chunk, id.as_bytes(), body.len() as u64 + 1).await?;
     // Bytes first, record second: the database never points at a blob that isn't stored.
     state.store.put(BlobKey::chunk(&id), &body).await?;
-    state.meta.add_chunk(auth.space, &id, body.len() as u64 + 1, state.now_ms()).await?;
+    access.meta(&state, auth.user).add_chunk(access.space, &id, body.len() as u64 + 1, state.now_ms()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_chunk(
     State(state): State<Shared>,
-    Extension(auth): Extension<DeviceAuth>,
+    Extension(access): Extension<SpaceAccess>,
     id: Result<Path<String>, PathRejection>,
 ) -> Result<Response, ApiError> {
     let Path(id) = id?;
     let id = parse_chunk_id(&id)?;
     // Only chunks this space uploaded; another space's chunk is "not found", not "forbidden".
-    if !state.meta.missing_chunks(auth.space, &[id]).await?.is_empty() {
+    if !state.meta.missing_chunks(access.space, &[id]).await?.is_empty() {
         return Err(ApiError::not_found("chunk"));
     }
     Ok(octets(stored_blob(&state, BlobKey::chunk(&id)).await?))
@@ -295,6 +408,7 @@ async fn get_chunk(
 async fn put_manifest(
     State(state): State<Shared>,
     Extension(auth): Extension<DeviceAuth>,
+    Extension(access): Extension<SpaceAccess>,
     id: Result<Path<String>, PathRejection>,
     request: Request,
 ) -> Result<StatusCode, ApiError> {
@@ -314,7 +428,7 @@ async fn put_manifest(
         return Err(ApiError::invalid(format!("unknown chunker parameter set {}", manifest.chunker().as_str())));
     }
     let ids: Vec<ChunkId> = manifest.chunks().iter().map(|c| c.id).collect();
-    let mut missing = state.meta.missing_chunks(auth.space, &ids).await?;
+    let mut missing = state.meta.missing_chunks(access.space, &ids).await?;
     if !missing.is_empty() {
         let total = missing.len();
         missing.truncate(MAX_MISSING_IDS);
@@ -325,34 +439,43 @@ async fn put_manifest(
         }
         return Err(err);
     }
-    state.meta.check_room(auth.space, BlobKind::Manifest, id.as_bytes(), body.len() as u64 + 1).await?;
+    state.meta.check_room(access.space, BlobKind::Manifest, id.as_bytes(), body.len() as u64 + 1).await?;
     state.store.put(BlobKey::manifest(&id), &body).await?;
-    state.meta.add_manifest(auth.space, &manifest, body.len() as u64 + 1, state.now_ms()).await?;
+    access.meta(&state, auth.user).add_manifest(access.space, &manifest, body.len() as u64 + 1, state.now_ms()).await?;
+    // The index of its chunks is complete before the upload is acknowledged: a manifest of up to the index budget was indexed
+    // in the transaction above, a longer one is finished here in batches (and by `index build` if this is cut short).
+    state.meta.index_complete(&manifest).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_manifest(
     State(state): State<Shared>,
-    Extension(auth): Extension<DeviceAuth>,
+    Extension(access): Extension<SpaceAccess>,
     id: Result<Path<String>, PathRejection>,
 ) -> Result<Response, ApiError> {
     let Path(id) = id?;
     let id = parse_manifest_id(&id)?;
     // No permit: one indexed query and one blob read. (Uploads' slots are per user and never block this.)
-    if !state.meta.has_manifest(auth.space, &id).await? {
+    if !state.meta.has_manifest(access.space, &id).await? {
         return Err(ApiError::not_found("manifest"));
     }
     Ok(octets(stored_blob(&state, BlobKey::manifest(&id)).await?))
 }
 
-async fn commit(State(state): State<Shared>, Extension(auth): Extension<DeviceAuth>, request: Request) -> Result<Json<CommitResponse>, ApiError> {
+async fn commit(
+    State(state): State<Shared>,
+    Extension(auth): Extension<DeviceAuth>,
+    Extension(access): Extension<SpaceAccess>,
+    request: Request,
+) -> Result<Json<CommitResponse>, ApiError> {
     let req: CommitRequest = read_json(&state, request, MAX_BATCH_JSON_BYTES).await?;
     // Commit and publish run in their own task: a client that disconnects mid-request drops this handler,
     // and the publish must not be skipped for a commit that went through.
     let task_state = state.clone();
+    let meta = access.meta(&state, auth.user);
     let outcome = tokio::spawn(async move {
-        let outcome = task_state.meta.commit(auth.space, auth.device, &req.ops, task_state.now_ms()).await?;
-        task_state.notifier.publish(auth.space, outcome.seq);
+        let outcome = meta.commit(access.space, auth.device, &req.ops, task_state.now_ms()).await?;
+        task_state.notifier.publish(access.space, outcome.seq);
         Ok::<_, ApiError>(outcome)
     })
     .await
@@ -367,14 +490,16 @@ async fn commit(State(state): State<Shared>, Extension(auth): Extension<DeviceAu
 async fn attach_save(
     State(state): State<Shared>,
     Extension(auth): Extension<DeviceAuth>,
+    Extension(access): Extension<SpaceAccess>,
     request: Request,
 ) -> Result<Json<CommitResponse>, ApiError> {
     let req: craft_cloud_proto::api::SaveAttach = read_json(&state, request, SMALL_JSON_BYTES).await?;
     let task_state = state.clone();
+    let meta = access.meta(&state, auth.user);
     // As a commit: the publish is never skipped for a change that went through.
     let outcome = tokio::spawn(async move {
-        let outcome = task_state.meta.attach_save(auth.space, req.node, req.version, &req.save).await?;
-        task_state.notifier.publish(auth.space, outcome.seq);
+        let outcome = meta.attach_save(access.space, req.node, req.version, &req.save).await?;
+        task_state.notifier.publish(access.space, outcome.seq);
         Ok::<_, ApiError>(outcome)
     })
     .await
@@ -383,6 +508,134 @@ async fn attach_save(
         ApiError::internal()
     })??;
     Ok(Json(CommitResponse { seq: outcome.seq, epoch: outcome.epoch }))
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryQuery {
+    cursor: Option<String>,
+    limit: Option<u32>,
+}
+
+/// `GET /nodes/{id}/history`: the versions of a file of the caller's own space, newest first. The node is looked
+/// up in the space of the device token, so another account's node is `not_found`.
+async fn history(
+    State(state): State<Shared>,
+    Extension(access): Extension<SpaceAccess>,
+    id: Result<Path<NodeId>, PathRejection>,
+    q: Result<Query<HistoryQuery>, QueryRejection>,
+) -> Result<Json<HistoryResponse>, ApiError> {
+    let Path(node) = id?;
+    let Query(q) = q?;
+    let after = q.cursor.as_deref().map(str::parse::<HistoryCursor>).transpose().map_err(|_| ApiError::invalid("bad history cursor"))?;
+    let page = state.meta.history(access.space, node, after, q.limit.unwrap_or(HISTORY_DEFAULT_LIMIT)).await?;
+    Ok(Json(HistoryResponse { versions: page.versions, next: page.next.map(|c| c.to_string()) }))
+}
+
+/// `POST /nodes/{id}/restore`: a new version with the content of an old one, as an ordinary update of the file.
+async fn restore(
+    State(state): State<Shared>,
+    Extension(auth): Extension<DeviceAuth>,
+    Extension(access): Extension<SpaceAccess>,
+    id: Result<Path<NodeId>, PathRejection>,
+    request: Request,
+) -> Result<Json<RestoreResponse>, ApiError> {
+    let Path(node) = id?;
+    let req: RestoreRequest = read_json(&state, request, SMALL_JSON_BYTES).await?;
+    // As a commit: the publish is never skipped for a change that went through.
+    let task_state = state.clone();
+    let meta = access.meta(&state, auth.user);
+    let outcome = tokio::spawn(async move {
+        let outcome = meta.restore_version(access.space, auth.device, node, req.version, req.expected_version, task_state.now_ms()).await?;
+        task_state.notifier.publish(access.space, outcome.seq);
+        Ok::<_, ApiError>(outcome)
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "restore task failed");
+        ApiError::internal()
+    })??;
+    Ok(Json(RestoreResponse { version: outcome.version, parent_version: outcome.parent_version, seq: outcome.seq, epoch: outcome.epoch }))
+}
+
+const MS_PER_DAY: i64 = 86_400_000;
+
+#[derive(Debug, Deserialize)]
+struct TrashQuery {
+    cursor: Option<String>,
+    limit: Option<u32>,
+}
+
+/// `GET /trash`: the deleted nodes of the caller's own space, newest deletion first.
+async fn trash(
+    State(state): State<Shared>,
+    Extension(access): Extension<SpaceAccess>,
+    q: Result<Query<TrashQuery>, QueryRejection>,
+) -> Result<Json<TrashResponse>, ApiError> {
+    let Query(q) = q?;
+    let after = q.cursor.as_deref().map(str::parse::<TrashCursor>).transpose().map_err(|_| ApiError::invalid("bad trash cursor"))?;
+    let page = state.meta.trash(access.space, after, q.limit.unwrap_or(TRASH_DEFAULT_LIMIT), state.now_ms()).await?;
+    if page.repaired > 0 {
+        tracing::warn!(count = page.repaired, "deleted nodes without a deletion time were stamped with the current time");
+    }
+    let keep = i64::from(state.trash_days).saturating_mul(MS_PER_DAY);
+    let items = page
+        .entries
+        .into_iter()
+        .map(|e| TrashItem {
+            id: e.id,
+            parent: e.parent,
+            name: e.name,
+            is_dir: e.is_dir,
+            size: e.size,
+            deleted_ms: e.deleted_ms,
+            purge_after_ms: e.deleted_ms.saturating_add(keep),
+        })
+        .collect();
+    Ok(Json(TrashResponse { items, next: page.next.map(|c| c.to_string()) }))
+}
+
+/// `POST /trash/{id}/restore`: a deleted node of the caller's space comes back, in one change.
+async fn restore_from_trash(
+    State(state): State<Shared>,
+    Extension(auth): Extension<DeviceAuth>,
+    Extension(access): Extension<SpaceAccess>,
+    id: Result<Path<NodeId>, PathRejection>,
+) -> Result<Json<TrashRestoreResponse>, ApiError> {
+    let Path(node) = id?;
+    // As a commit: the publish is never skipped for a change that went through.
+    let task_state = state.clone();
+    let meta = access.meta(&state, auth.user);
+    let outcome = tokio::spawn(async move {
+        let outcome = meta.restore_from_trash(access.space, auth.device, node, task_state.now_ms()).await?;
+        task_state.notifier.publish(access.space, outcome.seq);
+        Ok::<_, ApiError>(outcome)
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "trash restore task failed");
+        ApiError::internal()
+    })??;
+    Ok(Json(TrashRestoreResponse {
+        node: outcome.node,
+        parent: outcome.parent,
+        name: outcome.name,
+        renamed: outcome.renamed,
+        version: outcome.version,
+        seq: outcome.seq,
+        epoch: outcome.epoch,
+    }))
+}
+
+/// `DELETE /trash/{id}`: takes a deleted node out of the trash. Only marks it: nothing is freed.
+async fn remove_from_trash(
+    State(state): State<Shared>,
+    Extension(auth): Extension<DeviceAuth>,
+    Extension(access): Extension<SpaceAccess>,
+    id: Result<Path<NodeId>, PathRejection>,
+) -> Result<StatusCode, ApiError> {
+    let Path(node) = id?;
+    access.meta(&state, auth.user).request_purge(access.space, node, state.now_ms()).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn cursor(after_seq: Option<u64>, after_node: Option<NodeId>) -> Result<Option<PageCursor>, ApiError> {
@@ -402,11 +655,24 @@ struct PageQuery {
 
 async fn tree(
     State(state): State<Shared>,
-    Extension(auth): Extension<DeviceAuth>,
+    Extension(access): Extension<SpaceAccess>,
     q: Result<Query<PageQuery>, QueryRejection>,
 ) -> Result<Json<ChangeSet>, ApiError> {
     let Query(q) = q?;
-    Ok(Json(state.meta.tree(auth.space, cursor(q.after_seq, q.after_node)?, q.limit.unwrap_or(MAX_PAGE_NODES)).await?))
+    Ok(Json(state.meta.tree(access.space, cursor(q.after_seq, q.after_node)?, q.limit.unwrap_or(MAX_PAGE_NODES)).await?))
+}
+
+/// Resolves when `device` is revoked (or some revocations were missed, so that it must be looked up).
+async fn revoked(revocations: &mut tokio::sync::broadcast::Receiver<DeviceId>, device: DeviceId) {
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        match revocations.recv().await {
+            Ok(revoked) if revoked == device => return,
+            Ok(_) => {}
+            Err(RecvError::Lagged(_)) => return,
+            Err(RecvError::Closed) => std::future::pending::<()>().await,
+        }
+    }
 }
 
 // The paging fields are written out here rather than flattened from `PageQuery`: serde's `flatten` buffers
@@ -427,28 +693,56 @@ struct ChangesQuery {
 async fn changes(
     State(state): State<Shared>,
     Extension(auth): Extension<DeviceAuth>,
+    Extension(access): Extension<SpaceAccess>,
     q: Result<Query<ChangesQuery>, QueryRejection>,
 ) -> Result<Json<ChangeSet>, ApiError> {
     let Query(q) = q?;
     let cursor = cursor(q.after_seq, q.after_node)?;
     let slot = if q.wait > 0 && cursor.is_none() {
-        let slot = state.notifier.begin_wait(auth.space);
+        let slot = state.notifier.begin_wait(access.space);
         Some(slot.ok_or_else(|| ApiError::rate_limited("too many waiting requests for this space", Some(WAITERS_RETRY_SECS)))?)
     } else {
         None
     };
     if slot.is_some() {
         // Subscribe before reading the sequence number, so a commit in between still wakes us.
-        let mut updates = state.notifier.subscribe(auth.space);
+        let mut updates = state.notifier.subscribe(access.space);
+        let mut members = state.notifier.subscribe_members(access.space);
         let mut stopping = state.notifier.shutdown_signal();
-        if state.meta.space_info(auth.space).await?.seq == q.since {
+        // Listening for revocations first, then looking the device up: a revoke before the lookup is seen by it, one
+        // after it ends the wait, so none is missed between the sign-in check and the wait.
+        let mut revocations = state.live.revocations();
+        if !state.meta.device_active(auth.device).await? {
+            return Err(ApiError::unauthorized());
+        }
+        if state.meta.space_info(access.space).await?.seq == q.since {
             let deadline = Duration::from_secs(q.wait.min(MAX_WAIT_SECS));
-            // Whichever comes first: a commit, the deadline, or the server shutting down.
+            // Whichever comes first: a commit, the deadline, the server shutting down, or this device signed out.
             tokio::select! {
                 _ = tokio::time::timeout(deadline, updates.wait_for(|seq| *seq > q.since)) => {}
                 _ = stopping.wait_for(|stop| *stop) => {}
+                () = revoked(&mut revocations, auth.device) => {}
+                // A change to the space's members: the access is looked at again below, at once.
+                _ = members.changed() => {}
             }
         }
     }
-    Ok(Json(state.meta.changes(auth.space, q.since, cursor, q.limit.unwrap_or(MAX_PAGE_NODES)).await?))
+    // A team space's access can end while the request waits (a member removed, the role lowered, an account disabled): the
+    // wait is over by now, and the answer is the one a request from outside the space gets. Nothing is read for the
+    // caller's own space on a request without the header.
+    if slot.is_some() && !access.personal {
+        match state.meta.space_access(auth.user, access.space).await? {
+            Some(role) if role >= SpaceRole::Viewer => {}
+            _ => return Err(ApiError::not_found("space")),
+        }
+    }
+    let changes = state.meta.changes(access.space, q.since, cursor, q.limit.unwrap_or(MAX_PAGE_NODES)).await?;
+    // A long-poll looks the device up once more after the fetch, the last thing before the answer: a device signed
+    // out while it waited or while the change set was read (by the API, or by the command line in another process,
+    // which wakes nothing) gets no change feed. A revoke that commits after this lookup is a sign-out that happened
+    // after the answer was decided.
+    if slot.is_some() && !state.meta.device_active(auth.device).await? {
+        return Err(ApiError::unauthorized());
+    }
+    Ok(Json(changes))
 }
