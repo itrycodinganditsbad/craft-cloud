@@ -6,14 +6,18 @@
 #   custom    your own certificate: fullchain.pem and private.key in the directory CC_TLS_DIR
 
 {
-	# Not exposed: the admin API listens on loopback inside this container only.
-	admin localhost:2019
+	# No management API. It would listen on loopback inside this container (port 2019, not published) and let any
+	# process in the container change Caddy's configuration; nothing here reloads through it (a certificate or a
+	# Caddyfile change is applied by restarting the container), and the health check below does not use it.
+	admin off
 	# Caddy cannot install its internal CA into a read-only container and would log an error about it.
 	skip_install_trust
 	email "{$CC_ACME_EMAIL}"
 
 	# Caddy logs a failed request (an upstream error, for example) with its full URI, which would hold an invite code
-	# (/join/<code>) and any query. The log keeps neither the URI nor the headers (Authorization, Cookie).
+	# (/join/<code>) and any query. The log keeps neither the URI nor the headers (Authorization, Cookie), and none of
+	# the fields that name the client (its address and port, and the address after X-Forwarded-For). A few messages of
+	# Go's HTTP library, such as a failed TLS handshake, name the address inside their text, where no filter reaches.
 	log {
 		output stderr
 		format filter {
@@ -21,6 +25,9 @@
 			fields {
 				request>uri delete
 				request>headers delete
+				request>remote_ip delete
+				request>remote_port delete
+				request>client_ip delete
 			}
 		}
 	}
@@ -31,6 +38,13 @@
 			read_header 10s
 		}
 	}
+}
+
+# The container's health check asks this, on loopback inside the container (nothing publishes port 8081). It answers
+# as long as Caddy serves; the server behind it has a check of its own.
+http://127.0.0.1:8081 {
+	bind 127.0.0.1
+	respond /healthz 204
 }
 
 # Plain HTTP: redirect to the configured public URL, which keeps a port other than 443. An explicit site for the HTTP

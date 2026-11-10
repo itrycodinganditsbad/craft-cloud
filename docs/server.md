@@ -470,6 +470,14 @@ Set `CC_TLS_MODE` in `.env`:
 Caddy sets a request header timeout of 10 seconds, as the checklist above asks. It writes no access log, because URLs hold invite
 codes (`/join/<code>`); its error log leaves out the request's URI and headers for the same reason.
 
+**Client addresses in the Docker logs.** The audit log above keeps no IP addresses, but the Docker deployment is not IP-free:
+Caddy sits at the edge and sees every client. It writes no access log, and the filter on its error log removes the fields
+that name the client (`remote_ip`, `remote_port` and `client_ip`, the address after `X-Forwarded-For`). A few messages of
+Go's HTTP library, such as a failed TLS handshake, still carry the client address in their text, which no field filter reaches,
+and Docker's own log of the container (`docker logs`) holds whatever Caddy prints. If you add an access log, filter these fields out the same way, and tell the people who use the server what you
+keep. Caddy has no management API in this deployment (`admin off`): a changed Caddyfile or certificate is applied by
+restarting the container.
+
 ### Postgres
 
 ```sh
