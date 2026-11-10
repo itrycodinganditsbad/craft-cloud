@@ -161,6 +161,10 @@ on_sqlite_and_postgres!(
     an_admin_with_two_factor_confirms_a_team_space_with_a_code,
     team_space_names_are_escaped,
     a_space_whose_owners_cannot_sign_in_is_shown_as_having_none,
+    storage_page_is_for_administrators_and_has_secure_headers,
+    storage_compression_form_checks_csrf_confirmation_and_audits,
+    storage_compression_confirmation_uses_two_factor,
+    overview_shows_server_health_and_account_usage_rows,
 );
 
 // ---- helpers ----
@@ -1393,6 +1397,97 @@ async fn user_controlled_text_is_escaped(s: &Web) {
         shown.contains("Effective quota") && shown.contains("Trash estimate (overlapping)") && shown.contains("History estimate (overlapping)"),
         "the account usage is shown"
     );
+}
+
+async fn storage_page_is_for_administrators_and_has_secure_headers(s: &Web) {
+    let anonymous = s.get("/web/storage", None).await;
+    assert_eq!((anonymous.status(), location(&anonymous).as_str()), (StatusCode::SEE_OTHER, "/web/login"));
+
+    // A member cannot get a browser session at all (only administrators can sign in), so the anonymous case covers them.
+    s.add_admin("root").await;
+    let admin = s.sign_in("root").await;
+    let response = s.get("/web/storage", Some(&admin.token)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let csp = header(&response, "content-security-policy");
+    let frame_options = header(&response, "x-frame-options");
+    let content_options = header(&response, "x-content-type-options");
+    let referrer_policy = header(&response, "referrer-policy");
+    let cache_control = header(&response, "cache-control");
+    let html = response.text().await.unwrap();
+    assert!(html.contains("<h1>Storage</h1>") && html.contains("<h2>Compression</h2>") && html.contains("name=\"compression_level\""), "{html}");
+    assert!(csp.contains("script-src 'none'"));
+    assert_eq!(frame_options, "DENY");
+    assert_eq!(content_options, "nosniff");
+    assert_eq!(referrer_policy, "no-referrer");
+    assert_eq!(cache_control, "no-store");
+    assert!(!html.contains("<script"));
+}
+
+async fn storage_compression_form_checks_csrf_confirmation_and_audits(s: &Web) {
+    use craft_cloud_meta::{AuditAction, AuditQuery};
+    s.add_admin("root").await;
+    let admin = s.sign_in("root").await;
+    let device = s.device("root").await;
+    let before: serde_json::Value = s.api(Some(&device), Method::GET, "/admin/storage", None).await.json().await.unwrap();
+    let initial = before["compression"]["level"].as_u64().unwrap();
+    let initial_events = s.meta.audit_list(&AuditQuery { limit: 200, ..Default::default() }).await.unwrap();
+    let count = |events: &[craft_cloud_meta::AuditEvent]| events.iter().filter(|event| event.action == AuditAction::AdminCompressionChanged).count();
+    let initial_count = count(&initial_events);
+
+    let no_csrf = s.post("/web/storage", Some(&admin.token), &[("compression_level", "7"), ("password", PASSWORD)]).await;
+    assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN, "missing csrf");
+    let wrong_csrf = s.post("/web/storage", Some(&admin.token), &[("csrf", "wrong"), ("compression_level", "7"), ("password", PASSWORD)]).await;
+    assert_eq!(wrong_csrf.status(), StatusCode::FORBIDDEN, "wrong csrf");
+    let no_password = s.post("/web/storage", Some(&admin.token), &[("csrf", &admin.csrf), ("compression_level", "7")]).await;
+    assert_eq!(no_password.status(), StatusCode::BAD_REQUEST, "missing confirmation");
+    let wrong_password =
+        s.post("/web/storage", Some(&admin.token), &[("csrf", &admin.csrf), ("compression_level", "7"), ("password", "wrong")]).await;
+    assert_eq!(wrong_password.status(), StatusCode::FORBIDDEN, "wrong confirmation");
+    for level in ["0", "20"] {
+        let invalid = s.act(&admin, "/web/storage", &[("compression_level", level)]).await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST, "level {level}");
+        assert!(invalid.text().await.unwrap().contains("The compression level is 1 to 19."));
+    }
+    let unchanged: serde_json::Value = s.api(Some(&device), Method::GET, "/admin/storage", None).await.json().await.unwrap();
+    assert_eq!(unchanged["compression"]["level"].as_u64(), Some(initial));
+    assert_eq!(count(&s.meta.audit_list(&AuditQuery { limit: 200, ..Default::default() }).await.unwrap()), initial_count);
+
+    let updated = s.act(&admin, "/web/storage", &[("compression_level", "7")]).await;
+    assert_eq!((updated.status(), location(&updated).as_str()), (StatusCode::SEE_OTHER, "/web/storage?notice=compression"));
+    let shown = s.get(&location(&updated), Some(&admin.token)).await.text().await.unwrap();
+    assert!(shown.contains("The compression level was updated."));
+    let after: serde_json::Value = s.api(Some(&device), Method::GET, "/admin/storage", None).await.json().await.unwrap();
+    assert_eq!(after["compression"]["level"].as_u64(), Some(7));
+    let events = s.meta.audit_list(&AuditQuery { limit: 200, ..Default::default() }).await.unwrap();
+    assert_eq!(count(&events), initial_count + 1);
+    let event = events.iter().find(|event| event.action == AuditAction::AdminCompressionChanged).unwrap();
+    assert_eq!(event.actor_user.map(|user| user.0), Some(s.id_of("root").await));
+    assert_eq!(event.actor_device, None);
+}
+
+async fn storage_compression_confirmation_uses_two_factor(s: &Web) {
+    s.add_admin("root").await;
+    let tf = turn_on_two_factor(s, "root").await;
+    let admin = sign_in_with_factor(s, "root", &tf).await;
+    let html = s.get("/web/storage", Some(&admin.token)).await.text().await.unwrap();
+    assert!(html.contains("name=\"totp_code\"") && html.contains("name=\"recovery_code\""));
+    let denied = s.act(&admin, "/web/storage", &[("compression_level", "8")]).await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN, "no second factor");
+    let code = tf.fresh_code(s);
+    let accepted = s.act(&admin, "/web/storage", &[("compression_level", "8"), ("totp_code", &code)]).await;
+    assert_eq!(accepted.status(), StatusCode::SEE_OTHER);
+}
+
+async fn overview_shows_server_health_and_account_usage_rows(s: &Web) {
+    s.add_admin("root").await;
+    let account = s.add_user("ana", Role::Member).await;
+    let admin = s.sign_in("root").await;
+    let overview = s.get("/web", Some(&admin.token)).await.text().await.unwrap();
+    assert!(overview.contains("Server health") && overview.contains("Healthy"), "{overview}");
+    let page = s.get(&format!("/web/users/{}", account.id.0), Some(&admin.token)).await.text().await.unwrap();
+    for label in ["Usage stored", "Physical", "Files", "Effective quota", "Trash estimate (overlapping)", "History estimate (overlapping)"] {
+        assert!(page.contains(&format!("<dt>{label}</dt>")), "missing {label}: {page}");
+    }
 }
 
 async fn old_sessions_are_cleaned_up_at_sign_in(s: &Web) {
