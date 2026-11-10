@@ -47,6 +47,10 @@ struct Counts {
     no_claim: AtomicBool,
     /// How long a `PUT /chunks/{id}` is held before the server goes on with it.
     chunk_delay_ms: AtomicU64,
+    /// Lose the answer to the next `POST /admin/spaces`: the server makes the space, and the caller gets a bad gateway instead.
+    lose_creation_answer: AtomicBool,
+    /// `POST /admin/spaces` requests.
+    creations: AtomicU64,
 }
 
 async fn count(State(counts): State<Arc<Counts>>, request: Request<Body>, next: Next) -> Response {
@@ -64,6 +68,13 @@ async fn count(State(counts): State<Arc<Counts>>, request: Request<Body>, next: 
         counts.claims.fetch_add(1, Ordering::SeqCst);
         if counts.no_claim.load(Ordering::SeqCst) {
             return (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({ "error": "not_found", "message": "no such endpoint" }))).into_response();
+        }
+    }
+    if request.method() == Method::POST && path.ends_with("/admin/spaces") {
+        counts.creations.fetch_add(1, Ordering::SeqCst);
+        if counts.lose_creation_answer.swap(false, Ordering::SeqCst) {
+            let _ = next.run(request).await;
+            return StatusCode::BAD_GATEWAY.into_response();
         }
     }
     next.run(request).await
@@ -1731,4 +1742,92 @@ async fn a_team_file_rewritten_after_the_look_is_kept_beside_the_new_copy() {
     let left: Vec<_> =
         std::fs::read_dir(team.join(".craft-cloud").join("tmp")).map(|d| d.flatten().map(|e| e.file_name()).collect()).unwrap_or_default();
     assert!(left.is_empty(), "{left:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_journal_that_cannot_be_written_stops_the_work_before_the_space_is_made() {
+    let (w, ana, project, files) = ana_with_project().await;
+    hook::set_journal_error(ana.data.path(), Some(FromFolderStep::Creating));
+    let before = w.counts.creations.load(Ordering::SeqCst);
+    let refused = ana.make(&project, "Unrecorded").await.unwrap_err();
+    assert_eq!(refused.code(), Some("internal"), "{refused:?}");
+    assert!(refused.to_string().contains("could not be written"), "{refused}");
+    // The server saw no request that makes a space, holds none, and nothing of the old folder or the journal changed.
+    assert_eq!(w.counts.creations.load(Ordering::SeqCst), before);
+    assert!(space_named(&w, "Unrecorded").await.is_none());
+    assert!(!ana.data.path().join("from-folder.json").exists());
+    assert_eq!(ana.work().await, None);
+    untouched(&project, &files);
+
+    // The disk is fine again: the same call makes the space.
+    hook::set_journal_error(ana.data.path(), None);
+    ana.make(&project, "Unrecorded").await.unwrap();
+    let status = done(&ana).await;
+    team_holds(&w, &status, &files).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_journal_that_cannot_be_written_after_the_space_is_made_stops_before_anything_is_copied() {
+    let (w, ana, project, files) = ana_with_project().await;
+    hook::set_journal_error(ana.data.path(), Some(FromFolderStep::SettingUp));
+    let refused = ana.make(&project, "Half recorded").await.unwrap_err();
+    assert_eq!(refused.code(), Some("internal"), "{refused:?}");
+    // The space exists and is reported, never deleted; nothing was copied or deleted, and the journal still says "creating".
+    let space = space_named(&w, "Half recorded").await.expect("the space was made");
+    let status = ana.work().await.expect("the failure is shown");
+    assert_eq!((status.step, status.failed_at, status.space), (FromFolderStep::Failed, Some(FromFolderStep::Creating), Some(space)), "{status:?}");
+    untouched(&project, &files);
+    assert!(!ana.shared().join("Half recorded").join("brief.txt").exists());
+    let journal: serde_json::Value = serde_json::from_slice(&std::fs::read(ana.data.path().join("from-folder.json")).unwrap()).unwrap();
+    assert_eq!(journal["status"]["step"], "creating", "{journal}");
+
+    // Once the journal can be written, asking again finds the space it made and finishes.
+    hook::set_journal_error(ana.data.path(), None);
+    let again = ana.make(&project, "Half recorded").await.unwrap();
+    assert_eq!(again.space, Some(space));
+    let status = done(&ana).await;
+    team_holds(&w, &status, &files).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_journal_that_cannot_be_written_during_the_work_stops_it_before_the_next_step() {
+    let (w, ana, project, files) = ana_with_project().await;
+    hook::set_journal_error(ana.data.path(), Some(FromFolderStep::Trashing));
+    ana.make(&project, "Unrecorded trash").await.unwrap();
+    let failed = ana.until(FromFolderStep::Failed).await;
+    assert_eq!(failed.failed_at, Some(FromFolderStep::Trashing), "{failed:?}");
+    assert!(failed.message.as_deref().is_some_and(|m| m.contains("could not be written")), "{failed:?}");
+    // Everything is copied, and not one file was deleted from the old folder.
+    untouched(&project, &files);
+    assert!(space_named(&w, "Unrecorded trash").await.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_answer_to_the_creation_keeps_the_journal_and_the_next_try_finds_the_space() {
+    let (w, mut ana, project, files) = ana_with_project().await;
+    w.counts.lose_creation_answer.store(true, Ordering::SeqCst);
+    let lost = ana.make(&project, "Lost answer").await.unwrap_err();
+    assert!(lost.to_string().contains("not known whether"), "{lost}");
+    // The server made the space; the journal says the call was making it, with the time that finds it again.
+    let space = space_named(&w, "Lost answer").await.expect("the server made the space");
+    let journal: serde_json::Value = serde_json::from_slice(&std::fs::read(ana.data.path().join("from-folder.json")).unwrap()).unwrap();
+    assert_eq!(journal["status"]["failed_at"], "creating", "{journal}");
+    assert!(journal["started_ms"].as_i64().is_some(), "{journal}");
+    untouched(&project, &files);
+
+    // The agent is restarted: the work is reported, not forgotten.
+    let _ = ana.crash().await;
+    ana.run();
+    ana.ready().await;
+    let status = ana.work().await.expect("the unfinished work is reported after a restart");
+    assert_eq!((status.failed_at, status.space), (Some(FromFolderStep::Creating), None), "{status:?}");
+
+    // Asked again: the space is found (no second request makes one) and the work is finished.
+    let creations = w.counts.creations.load(Ordering::SeqCst);
+    let again = ana.make(&project, "Lost answer").await.unwrap();
+    assert_eq!(again.space, Some(space));
+    assert_eq!(w.counts.creations.load(Ordering::SeqCst), creations, "the space is looked for before another is asked for");
+    let status = done(&ana).await;
+    team_holds(&w, &status, &files).await;
+    assert_eq!(ana.api(|c| c.spaces()).await.unwrap().spaces.iter().filter(|s| s.kind == "team").count(), 1);
 }
