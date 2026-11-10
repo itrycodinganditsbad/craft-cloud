@@ -20,11 +20,12 @@ pub(crate) const SLOW_TIMEOUT: Duration = Duration::from_secs(90);
 /// Most bytes of an answer's head.
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 
-/// An answer: status and body.
+/// An answer: status and body, and the wait in seconds its `Retry-After` header names (a number of seconds; a date isn't read).
 #[derive(Debug)]
 pub(crate) struct Answer {
     pub status: u16,
     pub body: Vec<u8>,
+    pub retry_after_secs: Option<u64>,
 }
 
 /// Sends `method path` with the token and an optional JSON body to the agent at `addr`; the answer must come within
@@ -74,7 +75,7 @@ pub(crate) fn read_answer(stream: &mut impl Read) -> Result<Answer, Error> {
 pub(crate) fn read_answer_max(stream: &mut impl Read, max: usize) -> Result<Answer, Error> {
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
-    let (status, length, head_len) = loop {
+    let (status, length, head_len, retry_after_secs) = loop {
         let n = stream.read(&mut chunk).map_err(io)?;
         if n == 0 {
             return Err(Error::Protocol("the agent closed the connection before answering".into()));
@@ -86,15 +87,18 @@ pub(crate) fn read_answer_max(stream: &mut impl Read, max: usize) -> Result<Answ
             Ok(httparse::Status::Complete(head_len)) => {
                 let status = response.code.ok_or_else(|| Error::Protocol("an answer without a status".into()))?;
                 let mut length = None;
+                let mut retry_after_secs = None;
                 for header in response.headers.iter() {
                     if header.name.eq_ignore_ascii_case("content-length") {
                         let text = std::str::from_utf8(header.value).map_err(|_| Error::Protocol("a bad Content-Length".into()))?;
                         length = Some(text.trim().parse::<usize>().map_err(|_| Error::Protocol("a bad Content-Length".into()))?);
+                    } else if header.name.eq_ignore_ascii_case("retry-after") {
+                        retry_after_secs = std::str::from_utf8(header.value).ok().and_then(|text| text.trim().parse::<u64>().ok());
                     } else if header.name.eq_ignore_ascii_case("transfer-encoding") {
                         return Err(Error::Protocol("the agent's answer is chunked, which this client doesn't read".into()));
                     }
                 }
-                break (status, length, head_len);
+                break (status, length, head_len, retry_after_secs);
             }
             Ok(httparse::Status::Partial) if buf.len() <= MAX_HEAD_BYTES => continue,
             Ok(httparse::Status::Partial) => return Err(Error::Protocol("the answer's head is too long".into())),
@@ -124,7 +128,7 @@ pub(crate) fn read_answer_max(stream: &mut impl Read, max: usize) -> Result<Answ
         }
         body.truncate(n);
     }
-    Ok(Answer { status, body })
+    Ok(Answer { status, body, retry_after_secs })
 }
 
 #[cfg(test)]
@@ -146,5 +150,15 @@ mod tests {
         assert!(read_answer(&mut &b""[..]).is_err());
         let no_length = b"HTTP/1.1 401 Unauthorized\r\n\r\n{\"error\":\"unauthorized\"}";
         assert_eq!(read_answer(&mut &no_length[..]).unwrap().status, 401);
+    }
+
+    #[test]
+    fn a_retry_after_header_is_kept_when_it_is_a_number_of_seconds() {
+        let text = b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 840\r\ncontent-length: 2\r\n\r\n{}";
+        assert_eq!(read_answer(&mut &text[..]).unwrap().retry_after_secs, Some(840));
+        let date = b"HTTP/1.1 429 Too Many Requests\r\nretry-after: Wed, 21 Oct 2026 07:28:00 GMT\r\ncontent-length: 2\r\n\r\n{}";
+        assert_eq!(read_answer(&mut &date[..]).unwrap().retry_after_secs, None);
+        let none = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}";
+        assert_eq!(read_answer(&mut &none[..]).unwrap().retry_after_secs, None);
     }
 }

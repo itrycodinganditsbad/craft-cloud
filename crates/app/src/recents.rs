@@ -142,7 +142,7 @@ fn open(client: &Client, app: &str, follow: bool) -> Result<(Socket, (Vec<Recent
 fn unavailable(e: &Error) -> bool {
     match e {
         Error::NotRunning(_) | Error::Io(_) => true,
-        Error::Refused { code, .. } => code == codes::NOT_SIGNED_IN,
+        Error::Refused { code, .. } | Error::RefusedWith { code, .. } => code == codes::NOT_SIGNED_IN,
         Error::Version(_) | Error::Protocol(_) => false,
     }
 }

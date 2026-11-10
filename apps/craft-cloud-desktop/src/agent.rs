@@ -10,9 +10,13 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use craft_cloud_app::{Client, DeviceId, DeviceInfo, Error, JoinRequest, PairingInfo, PairingStatus, Status, Uuid};
+use craft_cloud_app::{
+    Client, DeviceId, DeviceInfo, Error, JoinRequest, PairingInfo, PairingStatus, RecoveryCodes, RevokedOthers, Status, TwoFactorProofRequest,
+    TwoFactorSetupResponse, TwoFactorStatus, Uuid,
+};
 
 use crate::model::{Effect, Event};
+use crate::security::{SecurityAnswer, SecurityCall};
 
 /// How often the clock ticks (and the status is asked for).
 pub const TICK: Duration = Duration::from_secs(2);
@@ -33,6 +37,14 @@ pub trait Agent: Send + Sync {
     fn resume(&self) -> Result<Status, Error>;
     fn quit(&self) -> Result<Status, Error>;
     fn set_autostart(&self, on: bool) -> Result<Status, Error>;
+    /// The Security page's calls: the account's two-factor sign-in, its password and its other computers.
+    fn two_factor_status(&self) -> Result<TwoFactorStatus, Error>;
+    fn two_factor_setup(&self, password: &str) -> Result<TwoFactorSetupResponse, Error>;
+    fn two_factor_confirm(&self, totp_code: &str) -> Result<RecoveryCodes, Error>;
+    fn two_factor_disable(&self, request: &TwoFactorProofRequest) -> Result<(), Error>;
+    fn two_factor_recovery_codes(&self, password: &str, totp_code: &str) -> Result<RecoveryCodes, Error>;
+    fn change_password(&self, current: &str, new: &str) -> Result<(), Error>;
+    fn revoke_other_devices(&self) -> Result<RevokedOthers, Error>;
 }
 
 /// The agent through `craft_cloud_app::Client`. It finds the agent again whenever a call finds it gone (the agent
@@ -112,6 +124,27 @@ impl Agent for ClientAgent {
     }
     fn set_autostart(&self, on: bool) -> Result<Status, Error> {
         self.with(|c| c.set_autostart(on))
+    }
+    fn two_factor_status(&self) -> Result<TwoFactorStatus, Error> {
+        self.with(Client::two_factor_status)
+    }
+    fn two_factor_setup(&self, password: &str) -> Result<TwoFactorSetupResponse, Error> {
+        self.with(|c| c.two_factor_setup(password))
+    }
+    fn two_factor_confirm(&self, totp_code: &str) -> Result<RecoveryCodes, Error> {
+        self.with(|c| c.two_factor_confirm(totp_code))
+    }
+    fn two_factor_disable(&self, request: &TwoFactorProofRequest) -> Result<(), Error> {
+        self.with(|c| c.two_factor_disable(request))
+    }
+    fn two_factor_recovery_codes(&self, password: &str, totp_code: &str) -> Result<RecoveryCodes, Error> {
+        self.with(|c| c.two_factor_recovery_codes(password, totp_code))
+    }
+    fn change_password(&self, current: &str, new: &str) -> Result<(), Error> {
+        self.with(|c| c.change_password(current, new))
+    }
+    fn revoke_other_devices(&self) -> Result<RevokedOthers, Error> {
+        self.with(Client::revoke_other_devices)
     }
 }
 
@@ -207,6 +240,15 @@ pub fn call(agent: &dyn Agent, start: &Starter, effect: Effect) -> Option<Event>
             let _ = agent.quit();
             Event::AgentQuit
         }
+        Effect::Security(call) => Event::SecurityAnswer(match call {
+            SecurityCall::Status => SecurityAnswer::Status(agent.two_factor_status()),
+            SecurityCall::Setup { password } => SecurityAnswer::Setup(agent.two_factor_setup(&password)),
+            SecurityCall::Confirm { code } => SecurityAnswer::Confirm(agent.two_factor_confirm(&code)),
+            SecurityCall::Disable(request) => SecurityAnswer::Disable(agent.two_factor_disable(&request)),
+            SecurityCall::RecoveryCodes { password, code } => SecurityAnswer::RecoveryCodes(agent.two_factor_recovery_codes(&password, &code)),
+            SecurityCall::ChangePassword { current, new } => SecurityAnswer::ChangePassword(agent.change_password(&current, &new)),
+            SecurityCall::SignOutOthers => SecurityAnswer::SignOutOthers(agent.revoke_other_devices()),
+        }),
         Effect::OpenFolder(_) | Effect::QuitApp | Effect::QuitTray | Effect::AppAutostart(_) | Effect::PickFolder(_) => return None,
     })
 }
@@ -218,17 +260,71 @@ pub(crate) mod fake {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// The password, code and recovery code the fake's account takes.
+    pub const PASSWORD: &str = "correct horse battery";
+    pub const CODE: &str = "123456";
+    pub const RECOVERY: &str = "ABCD-EFGH-JKMN-PQRS";
+
+    /// What the fake agent's server has of the account's two-factor sign-in.
+    #[derive(Debug, Clone, Default)]
+    pub struct FakeFactor {
+        pub enabled: bool,
+        pub pending: bool,
+        /// A server from before two-factor sign-in: its calls are `not_found`.
+        pub unsupported: bool,
+        /// Every check of a code is refused as locked (840 s to wait).
+        pub locked: bool,
+        pub other_computers: u32,
+    }
+
     pub struct FakeAgent {
         pub status: Mutex<Status>,
         pub gone: AtomicBool,
         /// What `join` answers, in turn (then the status).
         pub joins: Mutex<Vec<Result<Status, Error>>>,
         pub asked: Mutex<Vec<String>>,
+        pub factor: Mutex<FakeFactor>,
+    }
+
+    fn refused(code: &str, message: &str) -> Error {
+        Error::Refused { code: code.into(), message: message.into() }
     }
 
     impl FakeAgent {
         pub fn new(status: Status) -> Self {
-            Self { status: Mutex::new(status), gone: AtomicBool::new(false), joins: Mutex::new(Vec::new()), asked: Mutex::new(Vec::new()) }
+            Self {
+                status: Mutex::new(status),
+                gone: AtomicBool::new(false),
+                joins: Mutex::new(Vec::new()),
+                asked: Mutex::new(Vec::new()),
+                factor: Mutex::new(FakeFactor::default()),
+            }
+        }
+
+        /// A refusal or nothing: whether a call of the account's two-factor sign-in gets through at all.
+        fn factor_gate(&self, what: &str) -> Result<(), Error> {
+            self.answer(what, |_| ())?;
+            if self.factor.lock().unwrap().unsupported {
+                return Err(refused("not_found", "no such endpoint"));
+            }
+            Ok(())
+        }
+
+        /// A code is checked: locked, wrong or right.
+        fn check_code(&self, code: Option<&str>) -> Result<(), Error> {
+            if self.factor.lock().unwrap().locked {
+                return Err(Error::RefusedWith {
+                    code: "two_factor_locked".into(),
+                    message: "locked".into(),
+                    two_factor: None,
+                    retry_after_secs: Some(840),
+                });
+            }
+            if code == Some(CODE) || code == Some(RECOVERY) { Ok(()) } else { Err(refused("two_factor_invalid", "the code is wrong")) }
+        }
+
+        fn codes() -> RecoveryCodes {
+            RecoveryCodes { recovery_codes: (0..10).map(|n| format!("AAAA-BBBB-CCCC-{n:04}")).collect() }
         }
 
         fn answer<T>(&self, what: &str, ok: impl FnOnce(&Status) -> T) -> Result<T, Error> {
@@ -286,6 +382,78 @@ pub(crate) mod fake {
         }
         fn set_autostart(&self, on: bool) -> Result<Status, Error> {
             self.answer("set_autostart", |s| Status { autostart: Some(on), ..s.clone() })
+        }
+        fn two_factor_status(&self) -> Result<TwoFactorStatus, Error> {
+            self.factor_gate("two_factor_status")?;
+            let f = self.factor.lock().unwrap();
+            Ok(TwoFactorStatus {
+                enabled: f.enabled,
+                enabled_ms: f.enabled.then_some(1_000),
+                recovery_codes_left: if f.enabled { 10 } else { 0 },
+                pending: f.pending,
+            })
+        }
+        fn two_factor_setup(&self, password: &str) -> Result<TwoFactorSetupResponse, Error> {
+            self.factor_gate("two_factor_setup")?;
+            if password != PASSWORD {
+                return Err(refused("wrong_password", "wrong"));
+            }
+            let mut f = self.factor.lock().unwrap();
+            if f.enabled {
+                return Err(refused("conflict", "on already"));
+            }
+            f.pending = true;
+            Ok(TwoFactorSetupResponse {
+                secret: "JBSWY3DPEHPK3PXP".into(),
+                otpauth_uri: "otpauth://totp/Craft%20Cloud:fabio?secret=JBSWY3DPEHPK3PXP&issuer=Craft%20Cloud".into(),
+                expires_ms: 1_790_000_600_000,
+            })
+        }
+        fn two_factor_confirm(&self, totp_code: &str) -> Result<RecoveryCodes, Error> {
+            self.factor_gate("two_factor_confirm")?;
+            if !self.factor.lock().unwrap().pending {
+                return Err(refused("conflict", "no set-up to confirm"));
+            }
+            if totp_code != CODE {
+                return Err(refused("two_factor_invalid", "the code is wrong"));
+            }
+            let mut f = self.factor.lock().unwrap();
+            f.enabled = true;
+            f.pending = false;
+            Ok(Self::codes())
+        }
+        fn two_factor_disable(&self, request: &TwoFactorProofRequest) -> Result<(), Error> {
+            self.factor_gate("two_factor_disable")?;
+            if request.password != PASSWORD {
+                return Err(refused("wrong_password", "wrong"));
+            }
+            self.check_code(request.totp_code.as_deref().or(request.recovery_code.as_deref()))?;
+            self.factor.lock().unwrap().enabled = false;
+            Ok(())
+        }
+        fn two_factor_recovery_codes(&self, password: &str, totp_code: &str) -> Result<RecoveryCodes, Error> {
+            self.factor_gate("two_factor_recovery_codes")?;
+            if password != PASSWORD {
+                return Err(refused("wrong_password", "wrong"));
+            }
+            self.check_code(Some(totp_code))?;
+            Ok(Self::codes())
+        }
+        fn change_password(&self, current: &str, new: &str) -> Result<(), Error> {
+            self.answer("change_password", |_| ())?;
+            if current != PASSWORD {
+                return Err(refused("wrong_password", "wrong"));
+            }
+            if new.len() < 8 {
+                return Err(refused("weak_password", "passwords are 8 to 1024 bytes"));
+            }
+            Ok(())
+        }
+        fn revoke_other_devices(&self) -> Result<RevokedOthers, Error> {
+            self.answer("revoke_other_devices", |_| ())?;
+            let mut f = self.factor.lock().unwrap();
+            let revoked = std::mem::take(&mut f.other_computers);
+            Ok(RevokedOthers { revoked })
         }
     }
 }
