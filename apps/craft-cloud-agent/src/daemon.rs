@@ -721,7 +721,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                 }
             }
         };
-        let (Some(account), Some(transport)) = (saved, transport) else {
+        let (Some(mut account), Some(transport)) = (saved, transport) else {
             control.set_account(None);
             status.forget_passes();
             say(out, &format!("not signed in: waiting for a sign-in ({})", crate::cli::SIGN_IN_HINT));
@@ -994,7 +994,7 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                     None => stop_open = false,
                 },
                 command = commands.recv(), if commands_open => match command {
-                    Some(Command::Login(_, reply) | Command::Join(_, reply)) => {
+                    Some(Command::Login(_, reply) | Command::Join(_, reply) | Command::LoginSecondFactor(_, reply)) => {
                         let _ = reply.send(Err(crate::cli::already_signed_in(&account)));
                     }
                     // Signed out on the server first (an unreachable server changes nothing, and syncing goes on); then
@@ -1007,6 +1007,26 @@ pub async fn run_loop(data: &DataDir, options: RunOptions, mut stop: mpsc::Unbou
                                 let _ = reply.send(Err(e));
                             }
                         }
+                    }
+                    // This computer renamed on the server: the saved account, the status and the hub follow. The passes read
+                    // the saved account, so the next one uses the new name too.
+                    Some(Command::RenameDevice(id, name, reply)) => {
+                        if id == account.device && name != account.device_name {
+                            let mut renamed = account.clone();
+                            renamed.device_name = name;
+                            match data.save_account(&renamed) {
+                                Ok(()) => {
+                                    account = renamed;
+                                    control.set_account(Some(&account));
+                                    if let Some(hub) = &hub {
+                                        hub.handle().set_machine(account.device_name.clone()).await;
+                                    }
+                                    say(out, &format!("this computer is now called {}", account.device_name));
+                                }
+                                Err(e) => say(out, &format!("the new name of this computer couldn't be saved here: {e}")),
+                            }
+                        }
+                        let _ = reply.send(Ok(()));
                     }
                     Some(Command::Pause(reply)) => {
                         if !user_paused {
@@ -1178,8 +1198,11 @@ async fn wait_needing_you(
                         let _ = reply.send(Err(e));
                     }
                 },
-                Some(Command::Login(_, reply) | Command::Join(_, reply) | Command::Pause(reply) | Command::Resume(reply)) => {
+                Some(Command::Login(_, reply) | Command::Join(_, reply) | Command::LoginSecondFactor(_, reply) | Command::Pause(reply) | Command::Resume(reply)) => {
                     let _ = reply.send(Err(AgentError::NeedsYou(reason.to_owned())));
+                }
+                Some(Command::RenameDevice(_, _, reply)) => {
+                    let _ = reply.send(Ok(()));
                 }
                 Some(Command::Quit(reply)) => {
                     let _ = reply.send(Ok(()));
@@ -1227,6 +1250,20 @@ async fn wait_for_sign_in(
                         return SignedOut::SignedIn;
                     }
                 }
+                Some(Command::LoginSecondFactor(request, reply)) => {
+                    let args = LoginArgs {
+                        url: request.server.clone(),
+                        user: request.user.clone(),
+                        folder: request.folder.as_ref().map(std::path::PathBuf::from),
+                        device_name: request.device_name.clone(),
+                        adopt: request.adopt,
+                    };
+                    let factor = crate::http::Factor { totp_code: request.totp_code.clone(), recovery_code: request.recovery_code.clone() };
+                    let result = crate::cli::login_second_factor_locked(data, &args, &request.challenge, &factor).await;
+                    if signed_in(result, "signed in", control, reply, out) {
+                        return SignedOut::SignedIn;
+                    }
+                }
                 Some(Command::Join(request, reply)) => {
                     let args = JoinArgs {
                         join: request.join.clone(),
@@ -1236,13 +1273,18 @@ async fn wait_for_sign_in(
                         // The caller asks for it with `POST /v1/autostart` once joined.
                         autostart: false,
                     };
-                    let result = crate::cli::join_locked(data, &args, request.password.as_deref()).await;
+                    let factor = (request.totp_code.is_some() || request.recovery_code.is_some())
+                        .then(|| crate::http::Factor { totp_code: request.totp_code.clone(), recovery_code: request.recovery_code.clone() });
+                    let result = crate::cli::join_locked(data, &args, request.password.as_deref(), factor.as_ref()).await;
                     if signed_in(result, "joined", control, reply, out) {
                         return SignedOut::SignedIn;
                     }
                 }
                 Some(Command::Logout(_, reply) | Command::Pause(reply) | Command::Resume(reply)) => {
                     let _ = reply.send(Err(AgentError::NotSignedIn));
+                }
+                Some(Command::RenameDevice(_, _, reply)) => {
+                    let _ = reply.send(Ok(()));
                 }
                 Some(Command::Quit(reply)) => {
                     let _ = reply.send(Ok(()));

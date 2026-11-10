@@ -36,6 +36,18 @@ pub struct State {
     /// the server's changes.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sent_deletes: BTreeMap<NodeId, VersionId>,
+    /// Folders this machine asked the server to delete in a commit whose answer it never recorded. A folder has no
+    /// version to tell a delete that went through and a later restore from one that never arrived, so the pull judges
+    /// it by the change feed: a folder the server reports changed and live (brought back from the trash after the
+    /// delete, or changed by another machine first) is let go, once the files it held are settled, and arrives as it is
+    /// on the server, instead of being deleted a second time; one the feed doesn't mention was never touched, and its delete is sent again. Cleared
+    /// once a pass has applied the server's changes.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub sent_dir_deletes: BTreeSet<NodeId>,
+    /// Of `sent_dir_deletes`, the folders the pull of this pass saw the server report changed and live. Only for the
+    /// rest of the pass: never saved.
+    #[serde(skip)]
+    pub live_dirs: BTreeSet<NodeId>,
     /// Server deletes held behind a link: tracked nodes missing here while a link or special file that appeared
     /// since the last finished push carries a name from the node's last local path, so it may be the node, moved with
     /// its folder (seed 112337's no-pass order; see the push). Each is held for as long as any of its links stands
