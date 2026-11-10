@@ -91,6 +91,7 @@ fn main() -> ExitCode {
         options,
         Box::new(move |cc| {
             let _ = window.set(cc.egui_ctx.clone());
+            ui::kit::apply(&cc.egui_ctx);
             // The tray is made on this (the event loop's) thread, as Windows and macOS need.
             let wake_ctx = cc.egui_ctx.clone();
             let clicks = tray::Clicks { to: outside_tx.clone(), wake: Arc::new(move || wake_ctx.request_repaint()) };

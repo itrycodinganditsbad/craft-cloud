@@ -9,6 +9,16 @@
 //! # live_bytes_per_user = 1_073_741_824         # cap on what one account's live documents hold, in bytes (1 GiB)
 //! # public_url = "https://cloud.example.com"    # where computers reach the server; `user invite` prints it
 //!
+//! # [audit]
+//! # retention_days = 365        # how long security events are kept (1 to 3650); `audit prune` deletes older ones
+//!
+//! # [web_admin]                 # the admin pages under /web, off unless enabled; needs behind_proxy and an https public_url
+//! # enabled = true
+//! # idle_minutes = 480          # a browser session ends after this long unused (5 to 1440)
+//! # absolute_hours = 168        # and at the latest after this long (1 to 720)
+//! # [retention]
+//! # trash_days = 30   # how long a deleted file stays in the trash before the server may remove it (1 to 3650)
+//!
 //! [database]
 //! url = "sqlite:/var/lib/craft-cloud/meta.db"   # or postgres://user:pass@host/db
 //!
@@ -16,6 +26,10 @@
 //! kind = "disk"
 //! path = "/var/lib/craft-cloud/blobs"
 //! # kind = "s3", bucket, prefix, region, endpoint, access_key_id, secret_access_key, allow_http
+//!
+//! [two_factor]                  # optional: without it, two-factor sign-in can't be set up
+//! key_file = "two-factor.key"   # 32 random bytes, made by `init`; relative to this file
+//! # key_file_old = "old.key"    # while rotating the key, see `two-factor rekey`
 //! ```
 //!
 //! The server speaks plain HTTP. It refuses to listen anywhere but loopback unless `behind_proxy = true`,
@@ -55,10 +69,51 @@ pub enum ConfigError {
          agent could not tell a full account from a file that is too big. Raise it, or remove it for no cap"
     )]
     StoredBytesCapTooSmall(u64, u32),
+    #[error("retention.trash_days = {0} is not between {MIN_TRASH_DAYS} and {MAX_TRASH_DAYS}")]
+    TrashDays(u32),
     #[error("public_url = {0:?} is not a server address like https://cloud.example.com (a host, an optional port and path, no query)")]
     PublicUrl(String),
     #[error("storage.{0} is missing (set it in the config or the {1} environment variable)")]
     MissingS3Credential(&'static str, &'static str),
+    #[error("audit.retention_days = {0} is out of range: keep security events for {1} to {2} days")]
+    AuditRetention(u32, u32, u32),
+    #[error(
+        "web_admin.enabled = true needs public_url = \"https://host[:port]\" with no path: the browser's cookie is only sent over \
+         HTTPS, and the pages check the Origin of every form against that address"
+    )]
+    WebAdminPublicUrl,
+    #[error(
+        "web_admin.enabled = true needs behind_proxy = true: the server speaks plain HTTP, and the session cookie is marked Secure, \
+         so a TLS reverse proxy must stand in front of it"
+    )]
+    WebAdminNeedsProxy,
+    #[error("web_admin.{0} = {1} is out of range: {2} to {3}")]
+    WebAdminRange(&'static str, u32, u32, u32),
+}
+
+/// Fewest and most days a deleted node waits in the trash.
+pub const MIN_TRASH_DAYS: u32 = 1;
+pub const MAX_TRASH_DAYS: u32 = 3650;
+/// Days in the trash when `retention.trash_days` is not set.
+pub const DEFAULT_TRASH_DAYS: u32 = 30;
+
+/// `[retention]`: how long things are kept. Only the trash today; nothing is removed by it yet.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionConfig {
+    /// Days a deleted node stays in the trash before the server may remove it for good (shown as `purge_after_ms`).
+    #[serde(default = "default_trash_days")]
+    pub trash_days: u32,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self { trash_days: DEFAULT_TRASH_DAYS }
+    }
+}
+
+fn default_trash_days() -> u32 {
+    DEFAULT_TRASH_DAYS
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -90,12 +145,105 @@ pub struct Config {
     /// trailing slash. Unset: `user invite` prints the bare code and says to put the address in front.
     #[serde(default)]
     pub public_url: Option<String>,
+    /// The security audit log. The section is optional and its defaults are safe.
+    #[serde(default)]
+    pub audit: AuditConfig,
+    /// The admin pages in the browser (`/web`). Off unless the section says `enabled = true`.
+    #[serde(default)]
+    pub web_admin: WebAdminConfig,
+    #[serde(default)]
+    pub retention: RetentionConfig,
     pub database: DatabaseConfig,
     pub storage: StorageConfig,
+    /// The key for the secrets of two-factor sign-in. Without it two-factor sign-in can't be set up (`503
+    /// two_factor_unavailable`), and a server whose database already holds secrets refuses to start. `init` makes the
+    /// key file and writes this section. The server never makes the key itself: a second server on the same database,
+    /// or a restore without the key, would otherwise seal secrets nobody can open.
+    #[serde(default)]
+    pub two_factor: Option<TwoFactorConfig>,
+    /// The directory the config file is in, which `key_file` paths are relative to. Set by [`Config::load`], never read
+    /// from the file.
+    #[serde(skip)]
+    pub dir: Option<PathBuf>,
+}
+
+/// `[two_factor]`: where the key for two-factor secrets is.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TwoFactorConfig {
+    /// A file of 32 random bytes (mode 0600; Windows has no equivalent here, keep it out of everyone's reach). A relative
+    /// path is relative to the directory of `config.toml`.
+    pub key_file: PathBuf,
+    /// The key the secrets were sealed with before a rotation: new secrets are sealed with `key_file`, old ones still
+    /// open with this one until `two-factor rekey` has rewritten them. Remove it after that.
+    #[serde(default)]
+    pub key_file_old: Option<PathBuf>,
 }
 
 fn default_live_bytes() -> u64 {
     craft_cloud_meta::DEFAULT_LIVE_BYTES_PER_SPACE
+}
+
+/// `[audit]`: how the security audit log is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditConfig {
+    /// Days a security event is kept: `audit prune` deletes older ones, and a write does so now and then (at most once an
+    /// hour). 1 to 3650, default 365. A server that no one writes to keeps expired events until `audit prune` runs.
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u32,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self { retention_days: default_retention_days() }
+    }
+}
+
+fn default_retention_days() -> u32 {
+    365
+}
+
+/// `[web_admin]`: the admin pages in the browser and the lifetimes of their sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebAdminConfig {
+    /// Serve the admin pages under `/web`. Default off: a server that was not told to speak to browsers does not. Needs
+    /// `behind_proxy = true` and an `https://` `public_url` without a path.
+    #[serde(default)]
+    pub enabled: bool,
+    /// A session ends when it was not used for this many minutes: 5 to 1440, default 480 (8 hours).
+    #[serde(default = "default_idle_minutes")]
+    pub idle_minutes: u32,
+    /// A session ends this many hours after sign-in, however busy it is: 1 to 720, default 168 (7 days).
+    #[serde(default = "default_absolute_hours")]
+    pub absolute_hours: u32,
+}
+
+impl Default for WebAdminConfig {
+    fn default() -> Self {
+        Self { enabled: false, idle_minutes: default_idle_minutes(), absolute_hours: default_absolute_hours() }
+    }
+}
+
+fn default_idle_minutes() -> u32 {
+    8 * 60
+}
+
+fn default_absolute_hours() -> u32 {
+    7 * 24
+}
+
+impl WebAdminConfig {
+    /// The idle lifetime of a session in milliseconds.
+    pub fn idle_ms(&self) -> i64 {
+        i64::from(self.idle_minutes) * 60_000
+    }
+
+    /// The absolute lifetime of a session in milliseconds.
+    pub fn absolute_ms(&self) -> i64 {
+        i64::from(self.absolute_hours) * 3_600_000
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize)]
@@ -164,7 +312,19 @@ impl std::fmt::Debug for Secret {
 impl Config {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read { path: path.to_owned(), source })?;
-        Self::parse(&text)
+        let mut config = Self::parse(&text)?;
+        // A relative path to the config file has a parent too, possibly empty: that is the working directory.
+        config.dir = Some(path.parent().map(Path::to_owned).unwrap_or_default());
+        Ok(config)
+    }
+
+    /// `path` of a `[two_factor]` key file as the server opens it: relative paths are relative to the config file's
+    /// directory (when the config was loaded from a file).
+    pub fn key_path(&self, path: &Path) -> PathBuf {
+        match (&self.dir, path.is_absolute()) {
+            (Some(dir), false) => dir.join(path),
+            _ => path.to_owned(),
+        }
     }
 
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
@@ -186,9 +346,35 @@ impl Config {
         {
             return Err(ConfigError::StoredBytesCapTooSmall(cap, MAX_CHUNK_BYTES));
         }
+        if !(craft_cloud_meta::MIN_RETENTION_DAYS..=craft_cloud_meta::MAX_RETENTION_DAYS).contains(&config.audit.retention_days) {
+            return Err(ConfigError::AuditRetention(
+                config.audit.retention_days,
+                craft_cloud_meta::MIN_RETENTION_DAYS,
+                craft_cloud_meta::MAX_RETENTION_DAYS,
+            ));
+        }
+        let web = &config.web_admin;
+        for (name, value, low, high) in [("idle_minutes", web.idle_minutes, 5, 1440), ("absolute_hours", web.absolute_hours, 1, 720)] {
+            if !(low..=high).contains(&value) {
+                return Err(ConfigError::WebAdminRange(name, value, low, high));
+            }
+        }
+        if !(MIN_TRASH_DAYS..=MAX_TRASH_DAYS).contains(&config.retention.trash_days) {
+            return Err(ConfigError::TrashDays(config.retention.trash_days));
+        }
         let mut config = config;
         if let Some(url) = &config.public_url {
             config.public_url = Some(public_url(url)?);
+        }
+        if config.web_admin.enabled {
+            // The pages' address is an origin: https, a host and maybe a port, and no path to put in front of `/web`.
+            let origin_only = config.public_url.as_deref().and_then(|url| url.strip_prefix("https://")).is_some_and(|rest| !rest.contains('/'));
+            if !origin_only {
+                return Err(ConfigError::WebAdminPublicUrl);
+            }
+            if !config.behind_proxy {
+                return Err(ConfigError::WebAdminNeedsProxy);
+            }
         }
         Ok(config)
     }
@@ -324,8 +510,93 @@ path = "/tmp/blobs"
     }
 
     #[test]
+    fn the_audit_section_is_optional_and_checked() {
+        assert_eq!(Config::parse(DISK).unwrap().audit.retention_days, 365, "a year by default");
+        let with = |section: &str| Config::parse(&format!("{DISK}\n{section}\n"));
+        assert_eq!(with("[audit]").unwrap().audit.retention_days, 365);
+        assert_eq!(with("[audit]\nretention_days = 30").unwrap().audit.retention_days, 30);
+        for days in [1, 3650] {
+            assert_eq!(with(&format!("[audit]\nretention_days = {days}")).unwrap().audit.retention_days, days);
+        }
+        for days in ["0", "3651", "-1", "\"30\"", "1.5"] {
+            assert!(with(&format!("[audit]\nretention_days = {days}")).is_err(), "{days}");
+        }
+        assert!(matches!(with("[audit]\nretention_days = 0"), Err(ConfigError::AuditRetention(0, 1, 3650))));
+        assert!(matches!(with("[audit]\nkeep = 5"), Err(ConfigError::Parse(_))), "unknown keys are refused");
+    }
+
+    #[test]
+    fn the_web_admin_is_off_by_default_and_checked_when_on() {
+        let c = Config::parse(DISK).unwrap();
+        assert_eq!(c.web_admin, WebAdminConfig { enabled: false, idle_minutes: 480, absolute_hours: 168 }, "off, 8 hours idle, 7 days at most");
+        assert_eq!((c.web_admin.idle_ms(), c.web_admin.absolute_ms()), (8 * 3_600_000, 7 * 24 * 3_600_000));
+        let proxied = DISK.replace("127.0.0.1:8080", "0.0.0.0:8080");
+        let with = |top: &str, section: &str| Config::parse(&format!("{top}\n{proxied}\n[web_admin]\n{section}\n"));
+        let proxy = "behind_proxy = true\ntrusted_proxies = [\"10.0.0.1\"]";
+        let good = format!("{proxy}\npublic_url = \"https://cloud.example.com\"");
+        let c = with(&good, "enabled = true\nidle_minutes = 30\nabsolute_hours = 12").unwrap();
+        assert_eq!((c.web_admin.enabled, c.web_admin.idle_minutes, c.web_admin.absolute_hours), (true, 30, 12));
+        // Each missing piece of the setup is refused with its own message.
+        assert!(matches!(with(proxy, "enabled = true"), Err(ConfigError::WebAdminPublicUrl)), "no public_url");
+        for url in ["http://cloud.example.com", "https://cloud.example.com/cloud"] {
+            let bad = format!("{proxy}\npublic_url = \"{url}\"");
+            assert!(matches!(with(&bad, "enabled = true"), Err(ConfigError::WebAdminPublicUrl)), "{url}");
+        }
+        let no_proxy = format!("public_url = \"https://cloud.example.com\"\n{DISK}\n[web_admin]\nenabled = true\n");
+        assert!(matches!(Config::parse(&no_proxy), Err(ConfigError::WebAdminNeedsProxy)));
+        // Off, none of it matters; the lifetimes are always in range; unknown keys are errors.
+        assert!(!Config::parse(&format!("{DISK}\n[web_admin]\nenabled = false\n")).unwrap().web_admin.enabled);
+        for section in ["idle_minutes = 4", "idle_minutes = 1441", "absolute_hours = 0", "absolute_hours = 721"] {
+            assert!(matches!(Config::parse(&format!("{DISK}\n[web_admin]\n{section}\n")), Err(ConfigError::WebAdminRange(..))), "{section}");
+        }
+        assert!(matches!(Config::parse(&format!("{DISK}\n[web_admin]\ncookie = 1\n")), Err(ConfigError::Parse(_))));
+    }
+
+    #[test]
+    fn the_trash_period_has_a_default_and_bounds() {
+        assert_eq!(Config::parse(DISK).unwrap().retention, RetentionConfig { trash_days: 30 });
+        // A table has to come after the top-level keys, so the section goes at the end.
+        let at_end = |days: &str| Config::parse(&format!("{DISK}\n[retention]\ntrash_days = {days}\n"));
+        assert_eq!(at_end("1").unwrap().retention.trash_days, 1);
+        assert_eq!(at_end("3650").unwrap().retention.trash_days, 3650);
+        for bad in ["0", "3651", "-1", "\"30\"", "1.5"] {
+            assert!(at_end(bad).is_err(), "{bad}");
+        }
+        assert!(matches!(at_end("0"), Err(ConfigError::TrashDays(0))));
+        assert!(matches!(at_end("3651"), Err(ConfigError::TrashDays(3651))));
+        // Nothing but `trash_days` is accepted in the section, and the section may be empty.
+        assert!(matches!(Config::parse(&format!("{DISK}\n[retention]\ngc_wait_hours = 24\n")), Err(ConfigError::Parse(_))));
+        assert_eq!(Config::parse(&format!("{DISK}\n[retention]\n")).unwrap().retention.trash_days, 30);
+    }
+
+    #[test]
     fn unknown_keys_are_errors() {
         assert!(matches!(Config::parse(&format!("lisen = 1\n{DISK}")), Err(ConfigError::Parse(_))));
+    }
+
+    #[test]
+    fn the_two_factor_section_is_optional_and_strict() {
+        assert_eq!(Config::parse(DISK).unwrap().two_factor, None, "a config from before two-factor sign-in still loads");
+        let with = |section: &str| Config::parse(&format!("{DISK}\n[two_factor]\n{section}\n"));
+        let c = with("key_file = \"two-factor.key\"").unwrap();
+        assert_eq!(c.two_factor, Some(TwoFactorConfig { key_file: "two-factor.key".into(), key_file_old: None }));
+        let c = with("key_file = \"new.key\"\nkey_file_old = \"old.key\"").unwrap();
+        assert_eq!(c.two_factor.unwrap().key_file_old, Some("old.key".into()));
+        assert!(matches!(with("key_file = \"k\"\nkey = \"x\""), Err(ConfigError::Parse(_))), "an unknown key in the section");
+        assert!(matches!(with("key_file_old = \"old.key\""), Err(ConfigError::Parse(_))), "key_file is required");
+    }
+
+    #[test]
+    fn key_files_are_relative_to_the_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, format!("{DISK}\n[two_factor]\nkey_file = \"two-factor.key\"\n")).unwrap();
+        let c = Config::load(&path).unwrap();
+        assert_eq!(c.key_path(Path::new("two-factor.key")), dir.path().join("two-factor.key"));
+        let absolute = dir.path().join("elsewhere.key");
+        assert_eq!(c.key_path(&absolute), absolute);
+        // A config that was parsed from text has no directory: the path stays as it is.
+        assert_eq!(Config::parse(DISK).unwrap().key_path(Path::new("k")), PathBuf::from("k"));
     }
 
     #[test]

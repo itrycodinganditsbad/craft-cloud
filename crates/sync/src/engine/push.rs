@@ -649,8 +649,16 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                         _ => None,
                     })
                     .collect();
-                if !deletes.is_empty() {
+                let dir_deletes: Vec<NodeId> = only_ops
+                    .iter()
+                    .filter_map(|op| match op {
+                        Op::Delete { node, expected: None } => Some(*node),
+                        _ => None,
+                    })
+                    .collect();
+                if !deletes.is_empty() || !dir_deletes.is_empty() {
                     self.state.sent_deletes.extend(deletes.iter().copied());
+                    self.state.sent_dir_deletes.extend(dir_deletes.iter().copied());
                     self.checkpoint()?;
                 }
                 let result = self.transport.commit(&only_ops).await;
@@ -659,6 +667,9 @@ impl<F: Fs, T: Transport> Engine<F, T> {
                 if matches!(result, Ok(_) | Err(TransportError::Rejected(_))) {
                     for (node, _) in &deletes {
                         self.state.sent_deletes.remove(node);
+                    }
+                    for node in &dir_deletes {
+                        self.state.sent_dir_deletes.remove(node);
                     }
                 }
                 match result {

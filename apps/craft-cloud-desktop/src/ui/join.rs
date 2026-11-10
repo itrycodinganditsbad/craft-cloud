@@ -24,7 +24,7 @@ pub(super) fn form(ui: &mut egui::Ui, form: &mut JoinForm, joining: bool, events
             if form.folder != before {
                 form.ask_adopt = false;
             }
-            if ui.button("Change…").clicked() {
+            if ui.add(super::kit::Button::new("Change…")).clicked() {
                 events.push(Event::ChangeFolder);
             }
         });
@@ -40,14 +40,14 @@ pub(super) fn form(ui: &mut egui::Ui, form: &mut JoinForm, joining: bool, events
         ui.add_space(8.0);
     }
     if form.ask_adopt && !joining {
-        ui.group(|ui| {
+        super::kit::card(ui, None, |ui| {
             ui.label(RichText::new("This folder already has files in it.").strong());
             ui.label("Sync them too? Files that differ from your cloud's are kept as copies; nothing is deleted.");
             ui.horizontal(|ui| {
-                if ui.button("Sync them").clicked() {
+                if ui.add(super::kit::Button::new("Sync them")).clicked() {
                     events.push(Event::SyncExistingFiles(true));
                 }
-                if ui.button("Choose another folder").clicked() {
+                if ui.add(super::kit::Button::new("Choose another folder")).clicked() {
                     events.push(Event::SyncExistingFiles(false));
                 }
             });
@@ -84,7 +84,7 @@ pub(super) fn password(ui: &mut egui::Ui, pw: &mut PasswordForm, events: &mut Ve
         events.push(Event::SubmitPassword);
     }
     ui.add_space(4.0);
-    if ui.button("Back").clicked() {
+    if ui.add(super::kit::Button::new("Back")).clicked() {
         events.push(Event::CancelPassword);
     }
 }
