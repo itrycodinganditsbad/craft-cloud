@@ -28,7 +28,7 @@ sequence of offline edits, crashes, pulled cables, server restores or unplugged 
 
 1. **Sync** (this page): accounts, storage, versioned folder sync, selective sync.
 2. **Collaboration** (own spec, later): sharing, review comments, team spaces and libraries, maybe
-   per-folder locking. Depends on Phase 1.
+   per-folder locking. Depends on Phase 1. Specified in [`collaboration.md`](collaboration.md).
 
 ## Naming and clean room
 
