@@ -104,8 +104,11 @@ services:
       - ${CC_TLS_DIR:-./tls}:/certs:ro
     tmpfs:
       - /tmp
-    # Runs as root inside the container (the official image does), with no capability except binding ports 80 and 443.
-    cap_add: [NET_BIND_SERVICE]
+    # Runs as root inside the container (the official image does). NET_BIND_SERVICE is for ports 80 and 443. In the
+    # `custom` TLS mode the certificate directory belongs to whoever ran install.sh (mode 0700, the key 0600), and a root
+    # without DAC_OVERRIDE and DAC_READ_SEARCH cannot open it ("permission denied"). DAC_READ_SEARCH lets it read files
+    # and search directories, and nothing else: it cannot write or change what it mounts.
+    cap_add: [NET_BIND_SERVICE, DAC_READ_SEARCH]
     depends_on:
       server: {condition: service_healthy}
     healthcheck:

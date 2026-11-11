@@ -113,8 +113,8 @@ digest).
 
 Every service has a read-only root filesystem, no capabilities (`cap_drop: [ALL]`), `no-new-privileges`, memory and
 process limits, and a `noexec` tmpfs for `/tmp`. The exceptions are explained next to each service: Postgres and
-`secrets-init` start as root and need a few capabilities to fix ownership, Caddy needs to bind ports 80 and 443, and
-`secrets-init` (in the Postgres and S3 overlays) is not read-only because Compose writes its secret files into the
+`secrets-init` start as root and need a few capabilities to fix ownership, Caddy needs to bind ports 80 and 443 and
+to read a custom certificate that belongs to you, and `secrets-init` (in the Postgres and S3 overlays) is not read-only because Compose writes its secret files into the
 root filesystem.
 
 Three networks keep the parts apart: `edge` (published ports and outbound access, Caddy only), `frontend` (internal;
@@ -147,7 +147,9 @@ Set `CC_TLS_MODE` in `.env`:
   `CC_PUBLIC_URL`).
 - `internal`: a certificate from Caddy's own CA, for tests. Clients do not trust it. There is no HSTS in this mode.
 - `custom`: your own certificate. Put `fullchain.pem` and `private.key` in `packaging/docker/tls/` (or `CC_TLS_DIR`),
-  readable by root only, and restart Caddy to load a renewed one.
+  and restart Caddy to load a renewed one. `install.sh` creates `tls/` with mode 0700 for you, and the key can stay
+  readable by you alone (mode 0600): Caddy runs as root in its container with the capability `DAC_READ_SEARCH`, which
+  lets it read files and open directories whatever their owner and mode, and nothing else.
 
 Caddy sets a request header timeout of 10 seconds, as the checklist above asks. It writes no access log, because URLs hold invite
 codes (`/join/<code>`); its error log leaves out the request's URI and headers for the same reason.
