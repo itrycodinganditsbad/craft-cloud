@@ -2,8 +2,9 @@
 //! appear in the process list or shell history: `printf '%s\n' "$PASSWORD" | craft-cloud-server user add …`.
 
 use std::io::{BufRead, Read, Write};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use craft_cloud_meta::{Meta, Role, valid_username};
@@ -84,6 +85,13 @@ pub enum Command {
         config: Option<PathBuf>,
         #[command(subcommand)]
         action: LiveAction,
+    },
+    /// Ask a running server whether it answers (`GET /api/info`). Prints nothing and exits 0 if it does; otherwise
+    /// exits 1 with one line on standard error. For a container's health check, which has no shell and no `curl`.
+    Healthcheck {
+        /// The address the server listens on, as seen from here.
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        addr: String,
     },
 }
 
@@ -179,6 +187,11 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
             init(&dir, &admin, &listen, (behind_proxy, &trusted_proxies), input, out).await
         }
         Command::Serve { .. } => Err(CliError::Usage("serve is run by main".into())),
+        Command::Healthcheck { addr } => {
+            let addr: SocketAddr = addr.parse().map_err(|_| CliError::Usage(format!("bad address {addr}")))?;
+            // Blocking for at most `HEALTH_TIMEOUT`: this process does nothing else.
+            check_health(addr, HEALTH_TIMEOUT)
+        }
         Command::User { config, action } => {
             let config = Config::load(&config_path(config)?)?;
             let (meta, _) = open(&config).await?;
@@ -256,6 +269,46 @@ pub async fn run(command: Command, input: &mut impl BufRead, out: &mut impl Writ
             writeln!(out, "emptied the {app} recents of {}; every machine sends its own again when it next connects", user.username)?;
             Ok(())
         }
+    }
+}
+
+/// How long `healthcheck` waits for the whole exchange: connecting, sending and reading the status line.
+pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Sends `GET /api/info` to `addr` and succeeds only if the status line says 200. The whole exchange must finish
+/// within `timeout`. The body is never read, and nothing the server sends is printed.
+pub fn check_health(addr: SocketAddr, timeout: Duration) -> Result<(), CliError> {
+    let fail = |what: &str| CliError::Usage(format!("{addr} is not healthy: {what}"));
+    let deadline = Instant::now() + timeout;
+    let left = || deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero());
+    let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(|e| fail(&format!("can't connect: {e}")))?;
+    let request = format!("GET /api/info HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    stream.set_write_timeout(left()).map_err(|e| fail(&e.to_string()))?;
+    stream.write_all(request.as_bytes()).map_err(|e| fail(&format!("can't send the request: {e}")))?;
+    // The status line fits in 64 bytes. It counts only when it is complete (ends in CRLF): an answer that stops inside
+    // it, or goes on for 64 bytes without a line end, is not a healthy server.
+    let mut head = [0u8; 64];
+    let mut len = 0;
+    let line_end = loop {
+        if let Some(end) = head.get(..len).and_then(|read| read.windows(2).position(|pair| pair == b"\r\n")) {
+            break end;
+        }
+        let wait = left().ok_or_else(|| fail("no answer in time"))?;
+        stream.set_read_timeout(Some(wait)).map_err(|e| fail(&e.to_string()))?;
+        let Some(room) = head.get_mut(len..).filter(|room| !room.is_empty()) else { return Err(fail("not an HTTP answer")) };
+        match stream.read(room) {
+            Ok(0) => return Err(fail("the answer ended inside the status line")),
+            Ok(n) => len += n,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Err(fail("no answer in time")),
+            Err(e) => return Err(fail(&format!("can't read the answer: {e}"))),
+        }
+    };
+    let line = String::from_utf8_lossy(head.get(..line_end).unwrap_or_default());
+    let mut parts = line.split_whitespace();
+    match (parts.next(), parts.next()) {
+        (Some(version), Some("200")) if version.starts_with("HTTP/1.") => Ok(()),
+        (Some(version), Some(status)) if version.starts_with("HTTP/") => Err(fail(&format!("status {}", status.chars().take(3).collect::<String>()))),
+        _ => Err(fail("not an HTTP answer")),
     }
 }
 
@@ -511,6 +564,14 @@ mod tests {
             let cli = Cli::try_parse_from(args).unwrap();
             assert!(matches!(&cli.command, Command::ResetEpoch { config, .. } if config.as_deref() == Some(Path::new("c.toml"))));
         }
+    }
+
+    #[test]
+    fn healthcheck_parses_with_and_without_an_address() {
+        let cli = Cli::try_parse_from(["craft-cloud-server", "healthcheck"]).unwrap();
+        assert!(matches!(&cli.command, Command::Healthcheck { addr } if addr == "127.0.0.1:8080"));
+        let cli = Cli::try_parse_from(["craft-cloud-server", "healthcheck", "--addr", "127.0.0.1:9000"]).unwrap();
+        assert!(matches!(&cli.command, Command::Healthcheck { addr } if addr == "127.0.0.1:9000"));
     }
 
     #[test]
