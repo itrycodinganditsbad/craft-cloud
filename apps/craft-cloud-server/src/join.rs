@@ -21,12 +21,12 @@ use axum::extract::rejection::PathRejection;
 use axum::extract::{ConnectInfo, Extension, Path, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::IntoResponse;
-use craft_cloud_meta::DeviceAuth;
+use craft_cloud_meta::{DeviceAuth, DeviceClient};
 use craft_cloud_proto::api::{JoinRequest, LoginResponse, PairingCreated, PairingStatus, codes};
 use craft_cloud_proto::join::{Code, PAIRING_CHARS, PAIRING_TTL_MS};
 use uuid::Uuid;
 
-use crate::api::{PASSWORD_RETRY_SECS, SMALL_JSON_BYTES, check_device_name, read_json};
+use crate::api::{PASSWORD_RETRY_SECS, SMALL_JSON_BYTES, check_device_name, device_client, read_json};
 use crate::auth::{check_password_rules, hash_password, new_token};
 use crate::error::ApiError;
 use crate::ratelimit::{client_ip, ip_key};
@@ -82,6 +82,8 @@ pub async fn join(
 ) -> Result<Json<LoginResponse>, ApiError> {
     let req: JoinRequest = read_json(&state, request, SMALL_JSON_BYTES).await?;
     check_device_name(&req.device_name)?;
+    // Checked before the try is counted, as the device name is: a body that is refused for it costs nothing.
+    let client = device_client(req.client_kind.as_deref(), req.platform.as_deref(), req.app_version.as_deref())?;
     // tokio's clock: the system's monotonic clock in the server, the simulated one in a simulation.
     let now = tokio::time::Instant::now().into_std();
     let key = ip_key(client_ip(peer, &headers, &state.trusted_proxies));
@@ -90,14 +92,14 @@ pub async fn join(
     let Some(counted) = state.joins.count(&key, JOINS_PER_IP, now) else {
         return Err(ApiError::rate_limited("too many tries with codes that don't work; wait a minute", None));
     };
-    let result = redeem(&state, &req).await;
+    let result = redeem(&state, &req, &client).await;
     if !result.as_ref().is_err_and(|e| e.code == codes::INVALID_CODE) {
         state.joins.refund(&key, counted);
     }
     result.map(Json)
 }
 
-async fn redeem(state: &AppState, req: &JoinRequest) -> Result<LoginResponse, ApiError> {
+async fn redeem(state: &AppState, req: &JoinRequest, client: &DeviceClient) -> Result<LoginResponse, ApiError> {
     let code = Code::parse_any(&req.code).ok_or_else(ApiError::invalid_code)?;
     let code_hash = code.hash();
     let now_ms = state.now_ms();
@@ -110,7 +112,7 @@ async fn redeem(state: &AppState, req: &JoinRequest) -> Result<LoginResponse, Ap
         Some(false) | None => None,
     };
     let (token, token_hash) = new_token()?;
-    let redeemed = state.meta.redeem(&code_hash, &req.device_name, &token_hash, new_password_hash.as_deref(), now_ms).await?;
+    let redeemed = state.meta.redeem_with(&code_hash, &req.device_name, client, &token_hash, new_password_hash.as_deref(), now_ms).await?;
     tracing::info!(device = %redeemed.device, "device joined with a code");
     Ok(LoginResponse { device: redeemed.device, token })
 }

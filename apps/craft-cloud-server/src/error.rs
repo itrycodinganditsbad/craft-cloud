@@ -95,6 +95,8 @@ impl From<MetaError> for ApiError {
             MetaError::NotFound(what) => Self::not_found(what),
             MetaError::InvalidCode => Self::invalid_code(),
             MetaError::PasswordRequired => Self::password_required(),
+            MetaError::DeviceRevoked => Self::unauthorized(),
+            MetaError::Conflict(message) => Self::new(StatusCode::CONFLICT, codes::CONFLICT, message),
             MetaError::UsernameTaken => Self::new(StatusCode::CONFLICT, codes::USERNAME_TAKEN, "the username is taken"),
             MetaError::QuotaExceeded { used, limit } => Self::quota_exceeded(used, limit),
             MetaError::DocFull { .. } | MetaError::LiveFull { .. } | MetaError::TooManyDocs { .. } | MetaError::TooManyDocRows { .. } => {
@@ -166,5 +168,18 @@ impl IntoResponse for ApiError {
             response.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(secs));
         }
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_change_that_lost_a_race_is_a_conflict_and_a_signed_out_caller_is_unauthorized() {
+        let conflict = ApiError::from(MetaError::Conflict("changed meanwhile"));
+        assert_eq!((conflict.status, conflict.code), (StatusCode::CONFLICT, codes::CONFLICT));
+        let revoked = ApiError::from(MetaError::DeviceRevoked);
+        assert_eq!((revoked.status, revoked.code), (StatusCode::UNAUTHORIZED, codes::UNAUTHORIZED));
     }
 }

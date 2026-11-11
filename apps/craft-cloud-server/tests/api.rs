@@ -1430,3 +1430,476 @@ async fn live_subscriptions_are_capped_per_device() {
     live_quiet(&mut ws).await;
     assert_eq!(live_subscribe(&mut other, doc, 0).await, vec![ServerFrame::Subscribed { doc, head: 0 }]);
 }
+
+// ---- device sessions: the account, passwords and devices ----
+
+/// Postgres and disk: for the scenarios that need no blob store but must run on both databases (the S3 settings
+/// are not needed for them).
+async fn postgres_disk() -> Option<Server> {
+    let Ok(admin_url) = std::env::var("CRAFT_CLOUD_TEST_PG") else {
+        assert!(std::env::var_os("CRAFT_CLOUD_REQUIRE_BACKENDS").is_none(), "CRAFT_CLOUD_REQUIRE_BACKENDS is set but CRAFT_CLOUD_TEST_PG is not");
+        return None;
+    };
+    use sqlx::Connection;
+    let name = format!("cc_test_{}", uuid::Uuid::now_v7().simple());
+    let mut conn = sqlx::PgConnection::connect(&admin_url).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}"))).execute(&mut conn).await.unwrap();
+    let guard = PgGuard { admin_url: admin_url.clone(), name: name.clone() };
+    let (base, _) = admin_url.rsplit_once('/').unwrap();
+    let meta = Meta::open(&format!("{base}/{name}")).await.unwrap();
+    let blobs = tempfile::tempdir().unwrap();
+    let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
+    Some(start(meta, store, vec![blobs], Some(guard)).await)
+}
+
+macro_rules! on_sqlite_and_postgres {
+    ($($scenario:ident),* $(,)?) => {
+        mod accounts_on_sqlite {
+            $( #[tokio::test(flavor = "multi_thread", worker_threads = 4)] async fn $scenario() { super::$scenario(&super::sqlite_disk().await).await; } )*
+        }
+        mod accounts_on_postgres {
+            $( #[tokio::test(flavor = "multi_thread", worker_threads = 4)] async fn $scenario() {
+                let Some(server) = super::postgres_disk().await else { eprintln!("skipped: CRAFT_CLOUD_TEST_PG not set"); return };
+                super::$scenario(&server).await;
+            } )*
+        }
+    };
+}
+
+on_sqlite_and_postgres!(
+    sign_ins_and_joins_may_name_their_client,
+    the_account_route_describes_the_signed_in_account,
+    changing_the_password_signs_out_the_other_devices,
+    a_wrong_current_password_is_403_and_changes_nothing,
+    password_change_tries_are_limited,
+    password_bodies_are_tiny,
+    a_device_is_renamed_by_its_owner_only,
+    other_devices_are_signed_out_at_once,
+    revoking_a_device_records_why_once,
+    an_older_client_reads_the_device_list,
+    a_waiting_long_poll_of_a_signed_out_device_gets_no_changes,
+);
+
+async fn devices_of(s: &Server, token: &str) -> Vec<DeviceInfo> {
+    let res = s.client.get(format!("{}/devices", s.base)).bearer_auth(token).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    res.json().await.unwrap()
+}
+
+async fn change_password(s: &Server, token: &str, current: &str, new: &str) -> reqwest::Response {
+    s.client
+        .post(format!("{}/account/password", s.base))
+        .bearer_auth(token)
+        .json(&json!({ "current_password": current, "new_password": new }))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn login_with(s: &Server, name: &str, password: &str) -> reqwest::Response {
+    s.client
+        .post(format!("{}/auth/login", s.base))
+        .json(&json!({ "username": name, "password": password, "device_name": "laptop" }))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// Whether the token is still accepted: a signed-in route answers 200, or 401 once the device was revoked.
+async fn accepted(s: &Server, token: &str) -> bool {
+    match s.client.get(format!("{}/devices", s.base)).bearer_auth(token).send().await.unwrap().status() {
+        StatusCode::OK => true,
+        StatusCode::UNAUTHORIZED => false,
+        other => panic!("{other}"),
+    }
+}
+
+async fn sign_ins_and_joins_may_name_their_client(s: &Server) {
+    add_user(s, "ana").await;
+    // The fields are shown in the device list.
+    let named = s
+        .client
+        .post(format!("{}/auth/login", s.base))
+        .json(&json!({ "username": "ana", "password": PASSWORD, "device_name": "studio", "client_kind": "agent", "platform": "windows x86_64", "app_version": "0.19.0" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(named.status(), StatusCode::OK);
+    let named: LoginResponse = named.json().await.unwrap();
+    // Without them the answer and the sign-in are as before.
+    let plain = login(s, "ana").await;
+    let devices = devices_of(s, &plain).await;
+    let studio = devices.iter().find(|d| d.id == named.device).unwrap();
+    assert_eq!((studio.client_kind.as_str(), studio.platform.as_str(), studio.app_version.as_str()), ("agent", "windows x86_64", "0.19.0"));
+    let old = devices.iter().find(|d| d.current).unwrap();
+    assert_eq!(
+        (old.client_kind.as_str(), old.platform.as_str(), old.app_version.as_str(), old.revoked_ms, old.revoke_reason.clone()),
+        ("", "", "", None, None)
+    );
+
+    // A refused body costs no attempt: more than the account's ten tries, and it still signs in.
+    let long = "x".repeat(33);
+    for bad in [
+        json!({ "client_kind": "browser" }),
+        json!({ "platform": long }),
+        json!({ "app_version": long }),
+        json!({ "platform": "a\nb" }),
+        json!({ "client_kind": "AGENT" }),
+    ] {
+        for _ in 0..3 {
+            let mut body = json!({ "username": "ana", "password": PASSWORD, "device_name": "x" });
+            body.as_object_mut().unwrap().extend(bad.as_object().unwrap().clone());
+            let (status, answer) = error(s.client.post(format!("{}/auth/login", s.base)).json(&body).send().await.unwrap()).await;
+            assert_eq!((status, answer.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"), "{bad}");
+        }
+    }
+    login(s, "ana").await;
+
+    // The same for a join: with the fields it records them, a bad one is refused and the code is not used up.
+    let made = new_pairing(s, &plain).await;
+    for bad in [json!({ "client_kind": "browser" }), json!({ "app_version": long })] {
+        let mut body = json!({ "code": made.code, "device_name": "pc" });
+        body.as_object_mut().unwrap().extend(bad.as_object().unwrap().clone());
+        let (status, answer) = error(s.client.post(format!("{}/join", s.base)).json(&body).send().await.unwrap()).await;
+        assert_eq!((status, answer.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"), "{bad}");
+    }
+    let body = json!({ "code": made.code, "device_name": "mac", "client_kind": "desktop", "platform": "macos", "app_version": "1.2" });
+    let joined = joined(s.client.post(format!("{}/join", s.base)).json(&body).send().await.unwrap()).await;
+    let list = devices_of(s, &joined.token).await;
+    let mac = list.iter().find(|d| d.current).unwrap();
+    assert_eq!((mac.client_kind.as_str(), mac.platform.as_str(), mac.app_version.as_str()), ("desktop", "macos", "1.2"));
+}
+
+async fn the_account_route_describes_the_signed_in_account(s: &Server) {
+    add_user(s, "ana").await;
+    let token = login(s, "ana").await;
+    let before = craft_cloud_server::state::now_ms();
+    let res = s.client.get(format!("{}/account", s.base)).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let account: serde_json::Value = res.json().await.unwrap();
+    let keys: std::collections::BTreeSet<_> = account.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys, ["created_ms", "password_changed_ms", "role", "two_factor_enabled", "user_id", "username"].into(), "flat, no nested object");
+    assert_eq!((account["username"].as_str(), account["role"].as_str()), (Some("ana"), Some("member")));
+    assert_eq!((account["password_changed_ms"].is_null(), account["two_factor_enabled"].as_bool()), (true, Some(false)));
+    assert!(account["user_id"].as_str().is_some_and(|id| id.parse::<uuid::Uuid>().is_ok()));
+    assert!(account["created_ms"].as_i64().is_some());
+    // Signed in only.
+    assert_eq!(s.client.get(format!("{}/account", s.base)).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    // The time of the change is the server's.
+    assert_eq!(change_password(s, &token, PASSWORD, "a brand new password").await.status(), StatusCode::NO_CONTENT);
+    let account: serde_json::Value = s.client.get(format!("{}/account", s.base)).bearer_auth(&token).send().await.unwrap().json().await.unwrap();
+    let changed = account["password_changed_ms"].as_i64().unwrap();
+    assert!((before..=craft_cloud_server::state::now_ms()).contains(&changed), "{changed}");
+}
+
+async fn changing_the_password_signs_out_the_other_devices(s: &Server) {
+    add_user(s, "ana").await;
+    add_user(s, "bob").await;
+    let (pc, laptop, phone) = (login(s, "ana").await, login(s, "ana").await, login(s, "ana").await);
+    let bob = login(s, "bob").await;
+    let mut ws = live_ready(s, &laptop).await;
+    let pairing = new_pairing(s, &laptop).await;
+    let invite = Code::generate(INVITE_CHARS).unwrap();
+    s.meta.create_invite("ana", &invite.hash(), craft_cloud_server::state::now_ms(), INVITE_TTL_MS).await.unwrap();
+    let bobs_pairing = new_pairing(s, &bob).await;
+    let new = "a brand new password";
+
+    // A password that is too short, or the same one again, is refused and nothing is signed out.
+    let (status, body) = error(change_password(s, &pc, PASSWORD, "short").await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "weak_password"));
+    let (status, body) = error(change_password(s, &pc, PASSWORD, PASSWORD).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "weak_password"), "{}", body.message);
+    assert!(accepted(s, &laptop).await && accepted(s, &phone).await);
+
+    let before = craft_cloud_server::state::now_ms();
+    assert_eq!(change_password(s, &pc, PASSWORD, new).await.status(), StatusCode::NO_CONTENT);
+    // The other devices are signed out, the one that asked is not.
+    assert!(accepted(s, &pc).await);
+    assert!(!accepted(s, &laptop).await && !accepted(s, &phone).await);
+    // A device that is signed in on a live connection is cut off at once.
+    assert_eq!(error_code(live_next(&mut ws).await), "unauthorized");
+    assert_eq!(live_next(&mut ws).await, None, "closed");
+    // The account's open invite and its pairings are gone: neither code works any more.
+    for code in [invite.as_str(), pairing.code.as_str()] {
+        let (status, body) = error(join(s, code, "thief", None).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "invalid_code"));
+    }
+    assert_eq!(pairing_status(s, &pc, pairing.id).await.status(), StatusCode::NOT_FOUND);
+    // The old password no longer signs in, the new one does.
+    assert_eq!(login_with(s, "ana", PASSWORD).await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(login_with(s, "ana", new).await.status(), StatusCode::OK);
+    // The list says why, and when.
+    let devices = devices_of(s, &pc).await;
+    let revoked: Vec<_> = devices.iter().filter(|d| d.revoked).collect();
+    assert_eq!(revoked.len(), 2);
+    for d in revoked {
+        assert_eq!(d.revoke_reason.as_deref(), Some("password"));
+        assert!(d.revoked_ms.is_some_and(|ms| (before..=craft_cloud_server::state::now_ms()).contains(&ms)), "{d:?}");
+    }
+    let me = devices.iter().find(|d| d.current).unwrap();
+    assert_eq!((me.revoked, me.revoked_ms, me.revoke_reason.clone()), (false, None, None));
+    // Another account is never touched.
+    assert!(accepted(s, &bob).await);
+    assert_eq!(pairing_status(s, &bob, bobs_pairing.id).await.status(), StatusCode::OK);
+    assert_eq!(login_with(s, "bob", PASSWORD).await.status(), StatusCode::OK);
+}
+
+async fn a_wrong_current_password_is_403_and_changes_nothing(s: &Server) {
+    add_user(s, "ana").await;
+    let (pc, laptop) = (login(s, "ana").await, login(s, "ana").await);
+    let res = change_password(s, &pc, "not my password", "a brand new password").await;
+    // 403, never 401: a 401 on a signed-in route makes the agent think the device was revoked and sign out.
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let body: ErrorBody = res.json().await.unwrap();
+    assert_eq!(body.error, "wrong_password");
+    assert!(!body.message.contains("not my password") && !body.message.contains("a brand new password"));
+    // Nothing happened: the device and the others are still signed in, the old password still works.
+    assert!(accepted(s, &pc).await && accepted(s, &laptop).await);
+    assert_eq!(login_with(s, "ana", PASSWORD).await.status(), StatusCode::OK);
+    assert_eq!(login_with(s, "ana", "a brand new password").await.status(), StatusCode::UNAUTHORIZED);
+    // A missing token is a 401 (a route that needs a device), not a password answer.
+    let res = s
+        .client
+        .post(format!("{}/account/password", s.base))
+        .json(&json!({ "current_password": PASSWORD, "new_password": "a brand new password" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    // A body that isn't what the route reads is a 400, and nothing changes either.
+    let res =
+        s.client.post(format!("{}/account/password", s.base)).bearer_auth(&pc).json(&json!({ "current_password": PASSWORD })).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(accepted(s, &laptop).await);
+}
+
+async fn password_change_tries_are_limited(s: &Server) {
+    add_user(s, "ana").await;
+    add_user(s, "bob").await;
+    let (pc, laptop) = (login(s, "ana").await, login(s, "ana").await);
+    for _ in 0..5 {
+        assert_eq!(change_password(s, &pc, "not my password", "a brand new password").await.status(), StatusCode::FORBIDDEN);
+    }
+    // The sixth, even with the right password, is refused for the window.
+    let (status, body) = error(change_password(s, &pc, PASSWORD, "a brand new password").await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
+    assert!(accepted(s, &laptop).await, "nothing was changed");
+    // Another account has its own tries.
+    let bob = login(s, "bob").await;
+    assert_eq!(change_password(s, &bob, "not my password", "a brand new password").await.status(), StatusCode::FORBIDDEN);
+}
+
+async fn password_bodies_are_tiny(s: &Server) {
+    add_user(s, "ana").await;
+    let token = login(s, "ana").await;
+    let huge = "x".repeat(5000);
+    let res = change_password(s, &token, &huge, "a brand new password").await;
+    let (status, body) = error(res).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::PAYLOAD_TOO_LARGE, "too_large"));
+    let id = current_device(s, &token).await;
+    let res = s.client.patch(format!("{}/devices/{id}", s.base)).bearer_auth(&token).json(&json!({ "name": huge })).send().await.unwrap();
+    let (status, body) = error(res).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::PAYLOAD_TOO_LARGE, "too_large"));
+    // A password over 1024 bytes in a body that is not too big: refused as invalid, and nothing is counted.
+    for _ in 0..7 {
+        let (status, body) = error(change_password(s, &token, &"x".repeat(1025), "a brand new password").await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"));
+        let (status, body) = error(change_password(s, &token, PASSWORD, &"x".repeat(1025)).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"));
+    }
+    assert_eq!(change_password(s, &token, PASSWORD, "a brand new password").await.status(), StatusCode::NO_CONTENT);
+}
+
+async fn a_device_is_renamed_by_its_owner_only(s: &Server) {
+    add_user(s, "ana").await;
+    add_user(s, "bob").await;
+    let (pc, laptop, bob) = (login(s, "ana").await, login(s, "ana").await, login(s, "bob").await);
+    let (pc_id, laptop_id, bobs_id) = (current_device(s, &pc).await, current_device(s, &laptop).await, current_device(s, &bob).await);
+    let patch = |token: &str, id: craft_cloud_proto::DeviceId, name: serde_json::Value| {
+        let req = s.client.patch(format!("{}/devices/{id}", s.base)).bearer_auth(token).json(&json!({ "name": name }));
+        async move { req.send().await.unwrap() }
+    };
+    // Its own, and another of the account's.
+    let res = patch(&pc, pc_id, json!("studio pc")).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let renamed: DeviceInfo = res.json().await.unwrap();
+    assert_eq!((renamed.id, renamed.name.as_str(), renamed.current), (pc_id, "studio pc", true));
+    let renamed: DeviceInfo = patch(&pc, laptop_id, json!("old laptop")).await.json().await.unwrap();
+    assert_eq!((renamed.name.as_str(), renamed.current), ("old laptop", false));
+    // The list is ordered by creation time, and two sign-ins in the same millisecond tie: compare as a set.
+    let mut names: Vec<_> = devices_of(s, &pc).await.into_iter().map(|d| d.name).collect();
+    names.sort();
+    assert_eq!(names, ["old laptop", "studio pc"]);
+    // Someone else's device and one that doesn't exist are the same answer: not found, never forbidden.
+    for id in [bobs_id, craft_cloud_proto::DeviceId::generate()] {
+        let (status, body) = error(patch(&pc, id, json!("mine now")).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"));
+    }
+    assert_eq!(devices_of(s, &bob).await[0].name, "laptop");
+    // The name rule holds.
+    for bad in [json!(""), json!("x".repeat(129)), json!("tab\there")] {
+        let (status, body) = error(patch(&pc, pc_id, bad.clone()).await).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::BAD_REQUEST, "invalid"), "{bad}");
+    }
+    // A revoked device is not renamed.
+    assert_eq!(s.client.delete(format!("{}/devices/{laptop_id}", s.base)).bearer_auth(&pc).send().await.unwrap().status(), StatusCode::NO_CONTENT);
+    let (status, body) = error(patch(&pc, laptop_id, json!("again")).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "not_found"));
+    // Signed in only.
+    let res = s.client.patch(format!("{}/devices/{pc_id}", s.base)).json(&json!({ "name": "x" })).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+async fn other_devices_are_signed_out_at_once(s: &Server) {
+    add_user(s, "ana").await;
+    add_user(s, "bob").await;
+    let (pc, laptop, phone) = (login(s, "ana").await, login(s, "ana").await, login(s, "ana").await);
+    let bob = login(s, "bob").await;
+    let mut ws = live_ready(s, &laptop).await;
+    let pairing = new_pairing(s, &phone).await;
+    let post = |token: &str| s.client.post(format!("{}/devices/revoke-others", s.base)).bearer_auth(token).send();
+    let before = craft_cloud_server::state::now_ms();
+    let res = post(&pc).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.json::<serde_json::Value>().await.unwrap(), json!({ "revoked": 2 }));
+    assert!(accepted(s, &pc).await && !accepted(s, &laptop).await && !accepted(s, &phone).await);
+    assert_eq!(error_code(live_next(&mut ws).await), "unauthorized");
+    assert_eq!(live_next(&mut ws).await, None, "closed");
+    // A revoked device's add-a-computer code dies with it.
+    let (status, body) = error(join(s, &pairing.code, "thief", None).await).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::NOT_FOUND, "invalid_code"));
+    let devices = devices_of(s, &pc).await;
+    for d in devices.iter().filter(|d| d.revoked) {
+        assert_eq!(d.revoke_reason.as_deref(), Some("others"));
+        assert!(d.revoked_ms.is_some_and(|ms| (before..=craft_cloud_server::state::now_ms()).contains(&ms)), "{d:?}");
+    }
+    assert_eq!(devices.iter().filter(|d| d.revoked).count(), 2);
+    // With nobody else left it says so, and answers the same way again.
+    let res = post(&pc).await.unwrap();
+    assert_eq!(res.json::<serde_json::Value>().await.unwrap(), json!({ "revoked": 0 }));
+    // Another account is never touched, and a request needs a device.
+    assert!(accepted(s, &bob).await);
+    assert_eq!(s.client.post(format!("{}/devices/revoke-others", s.base)).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+}
+
+async fn revoking_a_device_records_why_once(s: &Server) {
+    add_user(s, "ana").await;
+    let (pc, laptop) = (login(s, "ana").await, login(s, "ana").await);
+    let laptop_id = current_device(s, &laptop).await;
+    let before = craft_cloud_server::state::now_ms();
+    let delete = || s.client.delete(format!("{}/devices/{laptop_id}", s.base)).bearer_auth(&pc).send();
+    assert_eq!(delete().await.unwrap().status(), StatusCode::NO_CONTENT);
+    let first = devices_of(s, &pc).await.into_iter().find(|d| d.id == laptop_id).unwrap();
+    assert_eq!((first.revoked, first.revoke_reason.as_deref()), (true, Some("user")));
+    assert!(first.revoked_ms.is_some_and(|ms| (before..=craft_cloud_server::state::now_ms()).contains(&ms)), "{first:?}");
+    // Again: still a 204, and the first time and reason stay.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert_eq!(delete().await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(devices_of(s, &pc).await.into_iter().find(|d| d.id == laptop_id).unwrap(), first);
+}
+
+/// The device list of a client from before the new fields: it reads what it knows and ignores the rest. And a
+/// sign-in body from such a client (no client fields) works.
+async fn an_older_client_reads_the_device_list(s: &Server) {
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct OldDeviceInfo {
+        id: craft_cloud_proto::DeviceId,
+        name: String,
+        created_ms: i64,
+        last_used_ms: i64,
+        revoked: bool,
+        current: bool,
+    }
+    add_user(s, "ana").await;
+    let token = login(s, "ana").await;
+    let list: Vec<OldDeviceInfo> = s.client.get(format!("{}/devices", s.base)).bearer_auth(&token).send().await.unwrap().json().await.unwrap();
+    assert_eq!(list.len(), 1);
+    assert!(list[0].current && !list[0].revoked && list[0].name == "laptop");
+    // The new fields are on the wire, and a reader without them gets what it had.
+    let raw: Vec<serde_json::Value> = s.client.get(format!("{}/devices", s.base)).bearer_auth(&token).send().await.unwrap().json().await.unwrap();
+    for key in ["client_kind", "platform", "app_version", "revoked_ms", "revoke_reason"] {
+        assert!(raw[0].get(key).is_some(), "{key}");
+    }
+    // And the reverse: a list from an older server (without them) reads with empty values.
+    let older = json!({ "id": list[0].id, "name": "pc", "created_ms": 1, "last_used_ms": 2, "revoked": false, "current": true });
+    let parsed: DeviceInfo = serde_json::from_value(older).unwrap();
+    assert_eq!((parsed.client_kind.as_str(), parsed.revoked_ms, parsed.revoke_reason), ("", None, None));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn password_changes_wait_for_a_free_check_slot_and_cost_no_try() {
+    let s = sqlite_disk_with(Limits { password_checks: 1, ..Limits::default() }).await;
+    add_user(&s, "ana").await;
+    let (pc, laptop) = (login(&s, "ana").await, login(&s, "ana").await);
+    // Every slot busy: told to come back in a second, more often than the account's five tries…
+    let busy = s.password_checks.clone().try_acquire_owned().unwrap();
+    for _ in 0..8 {
+        let res = change_password(&s, &pc, PASSWORD, "a brand new password").await;
+        assert_eq!(res.headers().get("retry-after").and_then(|v| v.to_str().ok()), Some("1"));
+        let (status, body) = error(res).await;
+        assert_eq!((status, body.error.as_str()), (StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
+    }
+    assert!(accepted(&s, &laptop).await, "nothing was checked or changed");
+    // …and none of them cost a try: once a slot is free the change goes through.
+    drop(busy);
+    assert_eq!(change_password(&s, &pc, PASSWORD, "a brand new password").await.status(), StatusCode::NO_CONTENT);
+    // The slot is given back after the change.
+    assert_eq!(login_with(&s, "ana", "a brand new password").await.status(), StatusCode::OK);
+}
+
+/// A device signed out while its `/changes` long-poll waits is told so (401) instead of being sent the next change
+/// set: when the API signs it out (the wait ends at once) and when something else does, such as the command line in
+/// another process, which wakes nothing (the next commit ends the wait, and the device is looked up again).
+async fn a_waiting_long_poll_of_a_signed_out_device_gets_no_changes(s: &Server) {
+    add_user(s, "ana").await;
+    let other = login(s, "ana").await;
+    let ana = s.meta.user_by_name("ana").await.unwrap().unwrap();
+    let poll = |token: String, since: u64| {
+        let (client, url) = (s.client.clone(), format!("{}/changes?since={since}&wait=30", s.base));
+        tokio::spawn(async move { client.get(url).bearer_auth(token).send().await.unwrap() })
+    };
+    let commit_a_file = |name: &'static str| {
+        let other = other.clone();
+        async move {
+            let data = format!("{name} {}", uuid::Uuid::now_v7()).into_bytes();
+            let manifest = upload(s, &other, &data).await;
+            let parent = root(s, &other).await;
+            assert_eq!(commit(s, &other, &[create(NodeId::generate(), parent, name, manifest)]).await.status(), StatusCode::OK);
+        }
+    };
+
+    // Signed out through the API: the wait ends at once, with 401.
+    let first = login(s, "ana").await;
+    let since = space_of(s, &other).await.seq;
+    let waiting = poll(first.clone(), since);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!waiting.is_finished(), "the poll waits");
+    let started = Instant::now();
+    assert_eq!(s.client.post(format!("{}/devices/revoke-others", s.base)).bearer_auth(&other).send().await.unwrap().status(), StatusCode::OK);
+    let (status, body) = error(tokio::time::timeout(Duration::from_secs(10), waiting).await.expect("the wait ends").unwrap()).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "unauthorized"));
+    assert!(started.elapsed() < Duration::from_secs(10));
+    commit_a_file("a.txt").await;
+
+    // Signed out behind the server's back: the next commit wakes the poll, and it is refused all the same.
+    let second = login(s, "ana").await;
+    let since = space_of(s, &other).await.seq;
+    let waiting = poll(second.clone(), since);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let second_id = current_device(s, &second).await;
+    s.meta.revoke_device_as(ana.id, second_id, craft_cloud_meta::RevokeReason::Admin, 1).await.unwrap();
+    assert!(!waiting.is_finished(), "nothing woke the poll");
+    commit_a_file("b.txt").await;
+    let (status, body) = error(tokio::time::timeout(Duration::from_secs(10), waiting).await.expect("the commit ends the wait").unwrap()).await;
+    assert_eq!((status, body.error.as_str()), (StatusCode::UNAUTHORIZED, "unauthorized"));
+
+    // A device that stays signed in still gets its changes.
+    let since = space_of(s, &other).await.seq;
+    let waiting = poll(other.clone(), since);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    commit_a_file("c.txt").await;
+    let res = tokio::time::timeout(Duration::from_secs(10), waiting).await.expect("the commit ends the wait").unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.json::<ChangeSet>().await.unwrap().seq, since + 1);
+}

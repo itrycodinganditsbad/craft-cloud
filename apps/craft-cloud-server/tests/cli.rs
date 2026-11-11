@@ -128,6 +128,124 @@ async fn live_reset_doc_takes_a_document_id_and_drops_its_snapshot() {
     assert!(cli(&["live", "--config", c, "reset-doc", "ana", &missing], "").await.is_err(), "no such document");
 }
 
+/// `user reset-password` signs out every device of the account (and deletes its open invite and pairings) and says
+/// how many; `--keep-devices` leaves the devices; `device revoke-all` signs out every device; an unknown user is an
+/// error, not a panic.
+#[tokio::test]
+async fn reset_password_signs_out_every_device_unless_kept() {
+    use craft_cloud_meta::RevokeReason;
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("data");
+    cli(
+        &["init", "--dir", dir.to_str().unwrap(), "--admin", "ana"],
+        "admin password 1
+",
+    )
+    .await
+    .unwrap();
+    let config_path = dir.join("config.toml");
+    let c = config_path.to_str().unwrap();
+    for name in ["bob", "carol", "dora"] {
+        cli(
+            &["user", "--config", c, "add", name],
+            "some password 1
+",
+        )
+        .await
+        .unwrap();
+    }
+    let (meta, _) = craft_cloud_server::cli::open(&Config::load(&config_path).unwrap()).await.unwrap();
+    let devices = |name: &'static str, n: u8| {
+        let meta = meta.clone();
+        async move {
+            let user = meta.user_by_name(name).await.unwrap().unwrap();
+            let mut ids = Vec::new();
+            for _ in 0..n {
+                let token = *blake3::hash(uuid::Uuid::now_v7().as_bytes()).as_bytes();
+                ids.push(meta.create_device(user.id, "pc", &token, 0).await.unwrap());
+            }
+            (user, ids)
+        }
+    };
+
+    // The default: every device is signed out, the invite and the pairing are gone, the count is printed.
+    let (bob, bobs) = devices("bob", 3).await;
+    let invite = Code::generate(INVITE_CHARS).unwrap();
+    meta.create_invite("bob", &invite.hash(), 0, 1_000_000).await.unwrap();
+    let pairing = Code::generate(craft_cloud_proto::join::PAIRING_CHARS).unwrap();
+    let pairing_id = meta.create_pairing(bob.id, bobs[0], &pairing.hash(), 0).await.unwrap();
+    let out = cli(
+        &["user", "--config", c, "reset-password", "bob"],
+        "a brand new password
+",
+    )
+    .await
+    .unwrap();
+    assert!(out.contains("password changed for bob") && out.contains("signed out 3 device(s)"), "{out}");
+    for id in &bobs {
+        assert!(!meta.device_active(*id).await.unwrap());
+    }
+    let listed = meta.list_devices(bob.id).await.unwrap();
+    assert!(listed.iter().all(|d| d.revoked && d.revoke_reason == Some(RevokeReason::Reset) && d.revoked_ms.is_some()), "{listed:?}");
+    assert_eq!(meta.invite_needs_password(&invite.hash(), 1).await.unwrap(), None);
+    assert_eq!(meta.pairing_status(bob.id, pairing_id, 1).await.unwrap(), None);
+    assert!(meta.account(bob.id).await.unwrap().password_changed_ms.is_some());
+    let shown = cli(&["device", "--config", c, "list", "bob"], "").await.unwrap();
+    assert_eq!(shown.matches("(revoked)").count(), 3, "{shown}");
+
+    // `--keep-devices`, before or after the name: the devices stay, the password still changes.
+    let (carol, carols) = devices("carol", 2).await;
+    let out = cli(
+        &["user", "--config", c, "reset-password", "carol", "--keep-devices"],
+        "a brand new password
+",
+    )
+    .await
+    .unwrap();
+    assert!(out.contains("password changed for carol") && out.contains("stay signed in"), "{out}");
+    for id in &carols {
+        assert!(meta.device_active(*id).await.unwrap());
+    }
+    assert!(meta.account(carol.id).await.unwrap().password_changed_ms.is_some());
+    let out = cli(
+        &["user", "--config", c, "reset-password", "--keep-devices", "carol"],
+        "another new password
+",
+    )
+    .await
+    .unwrap();
+    assert!(out.contains("stay signed in"), "{out}");
+
+    // `device revoke-all`.
+    let (dora, doras) = devices("dora", 2).await;
+    let out = cli(&["device", "--config", c, "revoke-all", "dora"], "").await.unwrap();
+    assert!(out.contains("revoked 2 device(s) of dora"), "{out}");
+    for id in &doras {
+        assert!(!meta.device_active(*id).await.unwrap());
+    }
+    assert!(meta.list_devices(dora.id).await.unwrap().iter().all(|d| d.revoke_reason == Some(RevokeReason::Admin)));
+    assert!(cli(&["device", "--config", c, "revoke-all", "dora"], "").await.unwrap().contains("revoked 0 device(s) of dora"));
+    // Another account's devices are untouched.
+    assert!(meta.device_active(carols[0]).await.unwrap());
+
+    // An unknown user is an error, and nothing is read or changed.
+    assert!(matches!(cli(&["user", "--config", c, "reset-password", "nobody"], "a brand new password
+").await, Err(CliError::Usage(m)) if m.contains("nobody")));
+    assert!(matches!(cli(&["device", "--config", c, "revoke-all", "nobody"], "").await, Err(CliError::Usage(m)) if m.contains("nobody")));
+    // A password that breaks the rules signs nobody out.
+    let (_, fresh) = devices("dora", 1).await;
+    assert!(matches!(
+        cli(
+            &["user", "--config", c, "reset-password", "dora"],
+            "short
+"
+        )
+        .await,
+        Err(CliError::Usage(_))
+    ));
+    assert!(meta.device_active(fresh[0]).await.unwrap());
+}
+
 /// `user invite` prints a join string and link to paste on the new computer (with `public_url` set), or the code
 /// and how to finish it (without); a new one replaces the old; `--revoke` ends it.
 #[tokio::test]

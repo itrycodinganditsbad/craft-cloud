@@ -379,7 +379,19 @@ mod tests {
         let device = craft_cloud_api::DeviceId::generate();
         let info = PairingInfo { id, join: "c.example/K7M4-Q9TX".into(), link: "https://c.example/join/K7M4-Q9TX".into(), expires_ms: 9 };
         let used = PairingStatus { state: PairingState::Used, device_name: Some("lptp1".into()) };
-        let list = vec![DeviceInfo { id: device, name: "lptp1".into(), created_ms: 1, last_used_ms: 2, revoked: false, current: false }];
+        let list = vec![DeviceInfo {
+            id: device,
+            name: "lptp1".into(),
+            created_ms: 1,
+            last_used_ms: 2,
+            revoked: false,
+            current: false,
+            client_kind: String::new(),
+            platform: String::new(),
+            app_version: String::new(),
+            revoked_ms: None,
+            revoke_reason: None,
+        }];
         let refused = json(&ErrorAnswer { error: "password_required".into(), message: "choose a password".into() });
         let script = vec![
             (400, refused),

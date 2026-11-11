@@ -32,7 +32,10 @@ pub use live::{
     MAX_LIVE_DOCUMENTS_HOLDING_UPDATES, MAX_LIVE_DOCUMENTS_PER_SPACE, MAX_LIVE_PAGE, SnapshotRef,
 };
 pub use tree::{MAX_PAGE_SAVE_BYTES, SpaceInfo};
-pub use users::{DeviceAuth, DeviceRecord, Role, UserId, UserRecord, valid_username};
+pub use users::{
+    AccountRecord, CLIENT_KINDS, DeviceAuth, DeviceClient, DeviceRecord, MAX_CLIENT_FIELD_BYTES, RevokeReason, Role, UserId, UserRecord,
+    valid_username,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MetaError {
@@ -77,6 +80,14 @@ pub enum MetaError {
     /// An invite to an account without a password was redeemed without a new one; nothing was changed.
     #[error("this invite needs a new password for the account")]
     PasswordRequired,
+    /// The device that asked for a change was revoked while the request ran (it is no longer signed in); nothing was
+    /// changed.
+    #[error("this device is no longer signed in")]
+    DeviceRevoked,
+    /// What the request was based on changed while it ran (the password it checked is no longer the account's);
+    /// nothing was changed and the request may be made again.
+    #[error("{0}")]
+    Conflict(&'static str),
     #[error("invalid input: {0}")]
     Invalid(&'static str),
     #[error("stored data is damaged: {0}")]
