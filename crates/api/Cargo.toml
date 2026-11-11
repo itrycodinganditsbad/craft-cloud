@@ -8,6 +8,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+blake3.workspace = true
 caseless.workspace = true
 serde.workspace = true
 thiserror.workspace = true

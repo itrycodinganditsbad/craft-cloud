@@ -96,7 +96,12 @@ impl Demo {
     /// Opens `rel` (relative to the synced folder `folder`) as `machine`, live through `agent` (opened off this
     /// thread; `wake` is called when it is open or something comes).
     pub fn open(agent: Option<Agent>, folder: &Path, rel: &str, machine: &str, wake: impl Fn() + Send + Sync + Clone + 'static) -> Self {
-        let file = folder.join(rel);
+        Self::open_file(agent, folder.join(rel), rel, machine, wake)
+    }
+
+    /// Opens the file at `file` live under the path `rel` the agent knows it by (an absolute path inside a team space's synced
+    /// folder, for a document of a team space; the path relative to the synced folder otherwise).
+    pub fn open_file(agent: Option<Agent>, file: PathBuf, rel: &str, machine: &str, wake: impl Fn() + Send + Sync + Clone + 'static) -> Self {
         let (doc, bytes, message) = match read_file(&file) {
             Ok((doc, bytes)) => (doc, bytes, String::new()),
             Err(e) => (DemoDoc::default(), Vec::new(), e),
@@ -410,7 +415,10 @@ impl Demo {
                 Mode::Opening(_) => {
                     ui.weak("opening live…");
                 }
-                Mode::Live(session) => craft_cloud_egui::badge(ui, session.status()),
+                Mode::Live(session) => {
+                    craft_cloud_egui::badge(ui, session.status());
+                    craft_cloud_egui::people_badge(ui, &session.people());
+                }
                 Mode::Local(why) => {
                     ui.weak(format!("plain file: {why}"));
                 }
@@ -464,6 +472,9 @@ impl Demo {
         if let Some(ro) = self.session().and_then(|s| s.status().read_only.clone()) {
             ui.colored_label(Color32::from_rgb(0x40, 0x60, 0xb0), format!("Made with a newer kitdemo (layout {}): update it to edit.", ro.version));
         }
+        if self.session().is_some_and(|s| s.status().viewer) {
+            ui.colored_label(Color32::from_rgb(0x40, 0x60, 0xb0), "You can look at this document but not change it.");
+        }
         if let Some(w) = &mut self.watch {
             let entries = w.entries().to_vec();
             ui.collapsing("Recent files", |ui| {
@@ -477,7 +488,7 @@ impl Demo {
 
     fn story(&mut self, ui: &mut Ui) {
         let label = ui.label(egui::RichText::new("Story").strong());
-        let editable = !matches!(self.mode, Mode::Opening(_)) && self.session().is_none_or(|s| s.status().read_only.is_none());
+        let editable = !matches!(self.mode, Mode::Opening(_)) && self.session().is_none_or(|s| s.status().read_only.is_none() && !s.status().viewer);
         ui.horizontal(|ui| {
             let range = self.cursor.map(|(a, b)| a.min(b)..a.max(b));
             if ui.add_enabled(editable && range.as_ref().is_some_and(|r| !r.is_empty()), egui::Button::new("Bold")).clicked()
@@ -527,7 +538,7 @@ impl Demo {
 
     fn layers(&mut self, ui: &mut Ui) {
         ui.label(egui::RichText::new("Layers").strong());
-        let editable = !matches!(self.mode, Mode::Opening(_)) && self.session().is_none_or(|s| s.status().read_only.is_none());
+        let editable = !matches!(self.mode, Mode::Opening(_)) && self.session().is_none_or(|s| s.status().read_only.is_none() && !s.status().viewer);
         ui.add_enabled_ui(editable, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Add layer").clicked() {
