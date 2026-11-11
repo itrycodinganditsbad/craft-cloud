@@ -16,6 +16,14 @@ pub const LICENSES: &str = "LICENSES.txt";
 const MORE_FILES: &[(&str, &[&str])] =
     &[("epaint_default_fonts", &["fonts/UFL.txt", "fonts/OFL.txt", "fonts/Hack-Regular.txt", "fonts/emoji-icon-font-mit-license.txt"])];
 
+/// The fonts the app bundles (`apps/craft-cloud-desktop/assets/fonts/`, built into `craft-cloud`), whose licence texts
+/// go in `LICENSES.txt` after the crates'. They are workspace files, not crates, so nothing else would list them.
+const BUNDLED_FONT_LICENCES: &[&str] = &[
+    "apps/craft-cloud-desktop/assets/fonts/OFL-Archivo.txt",
+    "apps/craft-cloud-desktop/assets/fonts/OFL-Inter.txt",
+    "apps/craft-cloud-desktop/assets/fonts/OFL-GeistMono.txt",
+];
+
 /// Crates that ship no licence file, whose licence text is the same as another crate's in the programs: (crate, the
 /// crate whose text it is, why). `clipboard-win` leaves its BSL-1.0 file out of its package; `error-code`, by the same
 /// author under the same licence and a dependency of it, ships it.
@@ -38,7 +46,26 @@ pub struct Crate {
 pub fn write(root: &Path, to: &Path) -> Result<(), String> {
     let crates = shipped(root)?;
     let own = |name: &str| read(&root.join(name));
-    let text = render(&own("NOTICE")?, &own("LICENSE-MIT")?, &own("LICENSE-APACHE")?, &crates)?;
+    let mut text = render(&own("NOTICE")?, &own("LICENSE-MIT")?, &own("LICENSE-APACHE")?, &crates)?;
+    text.push_str(&format!(
+        "
+{}
+Fonts bundled in the app (Archivo, Inter, Geist Mono; unmodified)
+{}
+",
+        "=".repeat(80),
+        "=".repeat(80)
+    ));
+    for file in BUNDLED_FONT_LICENCES {
+        text.push_str(&format!(
+            "
+{file}:
+
+{}
+",
+            own(file)?.trim_end()
+        ));
+    }
     std::fs::write(to, text).map_err(|e| format!("{}: {e}", to.display()))
 }
 
@@ -287,7 +314,15 @@ mod tests {
             }
         }
         assert!(checked >= 3, "the fonts, Loro's MPL crates and xxhash-rust are in the programs everywhere: {checked}");
-        for part in ["UBUNTU FONT LICENCE", "SIL OPEN FONT LICENSE", "Boost Software License", "https://crates.io/crates/im/"] {
+        for part in [
+            "UBUNTU FONT LICENCE",
+            "SIL OPEN FONT LICENSE",
+            "The Archivo Project Authors",
+            "The Inter Project Authors",
+            "The Geist Project Authors",
+            "Boost Software License",
+            "https://crates.io/crates/im/",
+        ] {
             assert!(text.contains(part), "{part} missing");
         }
     }

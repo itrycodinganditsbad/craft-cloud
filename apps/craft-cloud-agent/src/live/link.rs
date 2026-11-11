@@ -8,6 +8,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use craft_cloud_proto::SpaceId;
+use craft_cloud_proto::api::SPACE_HEADER;
 use craft_cloud_proto::live::MAX_FRAME_BYTES;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -63,8 +65,9 @@ fn tls_config() -> Result<rustls::ClientConfig, DialError> {
     Ok(config)
 }
 
-/// Opens the live connection to `server`, signed in with `token`.
-pub async fn dial(server: &ServerUrl, token: &DeviceToken) -> Result<LiveSocket, DialError> {
+/// Opens the live connection to `server`, signed in with `token`. With a `space` the upgrade names it in the `craft-space`
+/// header (a team space; one connection carries one space), without, the account's personal space.
+pub async fn dial(server: &ServerUrl, token: &DeviceToken, space: Option<SpaceId>) -> Result<LiveSocket, DialError> {
     let url = server.live_url();
     let host = url.host_str().ok_or_else(|| DialError::Unavailable("the server address has no host".into()))?.to_owned();
     let port = url.port_or_known_default().ok_or_else(|| DialError::Unavailable("the server address has no port".into()))?;
@@ -92,6 +95,11 @@ pub async fn dial(server: &ServerUrl, token: &DeviceToken) -> Result<LiveSocket,
     let auth = token.bearer().map_err(|e| DialError::Unavailable(e.to_string()))?;
     request.headers_mut().insert(AUTHORIZATION, auth);
     request.headers_mut().insert(USER_AGENT, tokio_tungstenite::tungstenite::http::HeaderValue::from_static(USER_AGENT_VALUE));
+    if let Some(space) = space {
+        let value = tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&space.to_string())
+            .map_err(|_| DialError::Unavailable("a space ID that can't be sent".into()))?;
+        request.headers_mut().insert(SPACE_HEADER, value);
+    }
     let config = WebSocketConfig::default().max_message_size(Some(MAX_FRAME_BYTES)).max_frame_size(Some(MAX_FRAME_BYTES));
     match tokio::time::timeout(STEP_TIMEOUT, tokio_tungstenite::client_async_with_config(request, stream, Some(config))).await {
         Ok(Ok((socket, _))) => Ok(socket),

@@ -23,6 +23,8 @@ async fn an_old_agent_is_too_old_for_blobs_of_any_size() {
         autostart: None,
         last_sync_ms: None,
         removed: false,
+        spaces: Vec::new(),
+        from_folder: None,
     };
     let app = Router::new()
         .route("/v1/status", get(move || async move { axum::Json(status.clone()) }))

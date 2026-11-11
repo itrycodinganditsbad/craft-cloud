@@ -14,11 +14,11 @@ pub mod live;
 pub mod manifest;
 pub mod ops;
 
-pub use craft_cloud_api::{ids, limits, local, name};
+pub use craft_cloud_api::{colour, ids, limits, local, name};
 
-pub use conflict::{ConflictStamp, conflict_name};
+pub use conflict::{ConflictName, ConflictStamp, conflict_name, parse_conflict_name};
 pub use hash::{BlobKind, ChunkId, FileHash, HexIdError, ManifestId};
 pub use ids::{DeviceId, DocId, Epoch, NodeId, SpaceId, VersionId};
 pub use manifest::{ChunkRef, ChunkerParamsId, Manifest, ManifestError};
-pub use name::{FoldKey, Name, NameError, UNICODE_VERSION};
+pub use name::{FoldKey, MAX_SPACE_NAME_CHARS, Name, NameError, SpaceName, SpaceNameError, UNICODE_VERSION, fold_search};
 pub use ops::{ChangeSet, Conflict, ConflictKind, FileState, NewVersion, NodeKind, NodeState, Op, PageCursor, SaveRecord};
