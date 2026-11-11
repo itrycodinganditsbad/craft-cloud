@@ -29,13 +29,15 @@ pub(crate) mod tree;
 mod value;
 pub(crate) mod writer;
 
+/// A palette colour (a name and an sRGB value for light and for dark backgrounds): what a [`Person`] is shown in.
+pub use craft_cloud_api::PaletteColour;
 pub use error::KitError;
 pub use mapping::{Attrs, Mappings, OpaqueSource, RemotePatch, Span, TableSource, TextSource, TimelineSource, Touched, TreeSource};
 pub use opaque::Opaque;
 pub use props::{Props, PropsRead};
 pub use session::{
     Agent, Badge, CATCH_UP_EVERY, LiveDocument, MAX_BACKOFF, MAX_QUEUE_BYTES, MAX_UNDO_TEXT_BYTES, NotLive, Open, PRESENCE_EVERY, PRESENCE_TTL, Peer,
-    Polled, REPLACE_WITH_FILE, ReadOnly, SavePoint, SaveRecord, Session, Status, UndoKind,
+    Person, Polled, REPLACE_WITH_FILE, ReadOnly, SavePoint, SaveRecord, Session, Status, UndoKind,
 };
 pub use table::{TableTouch, TableView};
 pub use text::RichText;

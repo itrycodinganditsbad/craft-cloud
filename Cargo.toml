@@ -6,7 +6,7 @@ members = ["crates/*", "apps/*", "xtask"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.94"
+rust-version = "1.95"
 repository = "https://github.com/itrycodinganditsbad/craft-cloud"
 
 [workspace.lints.rust]
@@ -28,6 +28,13 @@ craft-cloud-agent = { path = "apps/craft-cloud-agent" }
 craft-cloud-app = { path = "crates/app" }
 craft-cloud-kit = { path = "crates/kit" }
 craft-cloud-egui = { path = "crates/egui" }
+# Two-factor sign-in: AES-256-GCM for the stored TOTP secrets (RustCrypto, pure Rust), and HMAC-SHA-1 for the codes
+# themselves (authenticator apps speak SHA-1). `subtle` compares codes in constant time, `zeroize` wipes secrets.
+aes-gcm = "0.10.3"
+hmac = "0.13"
+sha1 = "0.11"
+subtle = "2.6"
+zeroize = "1.9"
 argon2 = "0.6"
 async-trait = "0.1.89"
 # `ws`: the server's live service and the agent's local API are WebSockets (tokio-tungstenite, MIT).
@@ -47,16 +54,28 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 file-id = "0.2.3"
 notify = { version = "8.2", default-features = false, features = ["macos_fsevent"] }
 jiff = { version = "0.2.38", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo", "tzdb-bundle-platform"] }
+# Total and free bytes of a filesystem (the admin's storage overview); rustix on Unix, windows-sys on Windows.
+fs4 = { version = "1.1", default-features = false, features = ["sync"] }
+# Decoding a SQLite URL's path as sqlx does (the admin's storage overview finds the database file with it).
+percent-encoding = "2.3"
 rustix = { version = "1.1.5", default-features = false, features = ["std", "fs"] }
 toml = "1.1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 bytes = "1.10"
+# The SFTP blob store and backup (feature `sftp` of `craft-cloud-store`): an SSH client and the SFTP protocol on top of
+# it, both pure Rust and Apache-2.0. No default features: no RSA keys (the `rsa` crate has an unfixed timing leak), no
+# compression; the crypto comes from aws-lc-rs, which rustls already brings.
+russh = { version = "0.65.1", default-features = false, features = ["aws-lc-rs"] }
+russh-sftp = "3.0.1"
 object_store = { version = "0.14.2", default-features = false, features = ["aws", "ring"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "any", "sqlite", "postgres"] }
 tempfile = "3.20"
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "fs", "sync", "net", "time", "signal", "io-std", "io-util"] }
 blake3 = "1.8.7"
+# The blob store's compression (format 1): zstd, the C reference library built from source by `zstd-sys` (zstd is
+# BSD-3-Clause, as are zstd-safe and zstd-sys). No default features: no legacy formats, no dictionary builder.
+zstd = { version = "0.13.4", default-features = false }
 # The agent's network simulation (tests only): turmoil's simulated network, and a plain hyper client and server on it.
 turmoil = "0.7.2"
 hyper = { version = "1.12", default-features = false }

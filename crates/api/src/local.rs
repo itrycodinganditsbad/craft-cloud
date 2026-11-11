@@ -13,10 +13,18 @@
 //!   `POST /v1/pairings` → [`PairingInfo`], `GET /v1/pairings/{id}` → [`PairingStatus`](crate::api::PairingStatus),
 //!   `DELETE /v1/pairings/{id}` → 204; `GET /v1/devices` → a list of [`DeviceInfo`](crate::api::DeviceInfo),
 //!   `DELETE /v1/devices/{id}` → the list after; `POST /v1/pause`, `/v1/resume` and `/v1/quit` → [`Status`];
+//!   `GET /v1/usage` → [`AccountUsage`](crate::api::AccountUsage) from the signed-in account's server;
+//!   `GET /v1/usage/folders` → [`FolderUsageResponse`] and `GET /v1/conflicts` → [`ConflictsResponse`], both from the
+//!   agent's saved sync state;
 //!   `POST /v1/autostart` ([`AutostartRequest`]) → [`Status`]; `GET /v1/recents`, upgraded to a WebSocket of JSON
 //!   text messages: [`RecentsRequest`] in, [`RecentsEvent`] out; `GET /v1/docs`, upgraded to a WebSocket of live
 //!   documents ([`docs`]: [`DocsRequest`] and binary frames in, [`DocsEvent`] and binary frames out); `PUT /v1/blobs`
-//!   and `GET /v1/blobs/{hash}`: binary content kept out of live documents ([`blobs`]). Errors are the HTTP API's error
+//!   and `GET /v1/blobs/{hash}`: binary content kept out of live documents ([`blobs`]); the admin calls under
+//!   `/v1/admin` ([`paths::ADMIN_SERVER`], [`paths::ADMIN_USERS`]), which the agent passes on to the server's admin API
+//!   with the same bodies and answers (see `docs/agent.md`); `GET /v1/spaces` → [`SpaceList`] and, under
+//!   `/v1/spaces/{id}`, `POST …/accept`, `…/decline` (passed on to the server) and `…/sync` ([`SpaceSyncRequest`]): the
+//!   team spaces of the account and what this computer does with them; `POST /v1/spaces/from-folder` ([`FromFolderRequest`]) →
+//!   [`FromFolderStatus`]: a folder of the personal folder made into a team space (`Status::from_folder` has how it goes). Errors are the HTTP API's error
 //!   body ([`ErrorAnswer`](crate::api::ErrorAnswer) reads its code and message) with its codes and [`codes`].
 //! - **Versions**: [`Status::api`] is the local API version the agent speaks; a client refuses one outside
 //!   [`LOCAL_API_MIN`]..=[`LOCAL_API_MAX`] when it connects.
@@ -26,7 +34,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::NodeId;
+use crate::api::SpaceRole;
+use crate::ids::{DeviceId, Epoch, NodeId, SpaceId, VersionId};
 use crate::limits::MAX_TREE_DEPTH;
 use crate::name::Name;
 
@@ -52,14 +61,18 @@ pub const MAX_TITLE_BYTES: usize = 256;
 pub const MAX_MACHINE_BYTES: usize = 128;
 /// Largest JSON body or WebSocket message of the local API, either way.
 pub const MAX_LOCAL_JSON_BYTES: usize = 1024 * 1024;
+/// Largest body of an admin call (the server's own limit is tiny too: a confirmation and a few fields).
+pub const MAX_ADMIN_JSON_BYTES: usize = 8 * 1024;
+
+pub mod private;
 
 /// Error codes of the local API (the `error` field of [`ErrorAnswer`](crate::api::ErrorAnswer)), beside the HTTP API's
 /// `invalid`, `unauthorized` (the token), `not_found`, `too_large` and `internal`.
 pub mod codes {
     /// A `Host` that isn't `127.0.0.1:<port>`, or an `Origin` header: the request didn't come from a local program.
-    pub const FORBIDDEN: &str = "forbidden";
+    pub const FORBIDDEN: &str = crate::api::codes::FORBIDDEN;
     /// `login`: the server refused the username or password.
-    pub const WRONG_PASSWORD: &str = "wrong_password";
+    pub const WRONG_PASSWORD: &str = crate::api::codes::WRONG_PASSWORD;
     /// `login` while signed in: sign out first.
     pub const ALREADY_SIGNED_IN: &str = "already_signed_in";
     /// `logout`, or recents, while signed out.
@@ -86,9 +99,29 @@ pub mod codes {
     pub const FOLDER_HAS_FILES: &str = "folder_has_files";
     /// `GET /v1/blobs/{hash}`: neither this machine nor the account's server has that blob.
     pub const BLOB_NOT_FOUND: &str = "blob_not_found";
+    /// `login` or `join`: the account has two-factor sign-in. The answer's `two_factor` (see [`ErrorExtras`](super::ErrorExtras))
+    /// holds the challenge for `POST /v1/login/second-factor` (empty for `join`: send the same join again with the code).
+    pub const TWO_FACTOR_REQUIRED: &str = crate::api::codes::TWO_FACTOR_REQUIRED;
+    /// A code or recovery code was wrong (HTTP 401 for `login`, `login/second-factor` and `join`, 403 on the account calls).
+    /// It never means the device was revoked.
+    pub const TWO_FACTOR_INVALID: &str = crate::api::codes::TWO_FACTOR_INVALID;
+    /// Too many wrong codes: try again after the answer's `retry_after_secs` (HTTP 429, also the `Retry-After` header).
+    pub const TWO_FACTOR_LOCKED: &str = crate::api::codes::TWO_FACTOR_LOCKED;
+    /// The server has no key for two-factor secrets, so it can't be set up (HTTP 503).
+    pub const TWO_FACTOR_UNAVAILABLE: &str = crate::api::codes::TWO_FACTOR_UNAVAILABLE;
+    /// A set-up is open on another computer (HTTP 409).
+    pub const TWO_FACTOR_PENDING: &str = crate::api::codes::TWO_FACTOR_PENDING;
+    /// `login/second-factor`: the challenge doesn't work any more (it lasts five minutes and takes five wrong codes, and a
+    /// password change ends it): sign in again from the first step (HTTP 409; a 401 would read as a bad local token).
+    pub const TWO_FACTOR_EXPIRED: &str = "two_factor_expired";
+    /// A state clash on the server (two-factor already on, no set-up to confirm, a password that changed meanwhile), HTTP 409.
+    pub const CONFLICT: &str = crate::api::codes::CONFLICT;
     /// Never sent by an agent: what a client reports when the agent answers a call it doesn't know (`not_found` for
     /// the call itself), as one from before that call answers it. Update Craft Cloud.
     pub const AGENT_TOO_OLD: &str = "agent_too_old";
+    /// The server doesn't know the call (it answered `404 no such endpoint`: it is from before team spaces, or the admin API
+    /// call): the server needs an update (HTTP 409).
+    pub const SERVER_TOO_OLD: &str = "server_too_old";
 }
 
 /// The paths of the local API.
@@ -101,11 +134,34 @@ pub mod paths {
     pub const DOCS: &str = "/v1/docs";
     /// `POST`: join with a join string ([`super::JoinRequest`]) → [`super::Status`].
     pub const JOIN: &str = "/v1/join";
+    /// `POST` ([`super::SecondFactorLoginRequest`]): the second step of a sign-in that answered `two_factor_required` →
+    /// [`super::Status`].
+    pub const LOGIN_SECOND_FACTOR: &str = "/v1/login/second-factor";
+    /// `GET` → [`crate::api::TwoFactorStatus`]; with `/setup`, `/confirm`, `/disable` and `/recovery-codes` below it: the
+    /// signed-in account's two-factor sign-in, passed on to the server ([`super::PasswordRequest`], [`super::TotpRequest`],
+    /// [`super::TwoFactorProofRequest`]). Nothing is stored or logged on the way.
+    pub const TWO_FACTOR: &str = "/v1/account/two-factor";
+    pub const TWO_FACTOR_SETUP: &str = "/v1/account/two-factor/setup";
+    pub const TWO_FACTOR_CONFIRM: &str = "/v1/account/two-factor/confirm";
+    pub const TWO_FACTOR_DISABLE: &str = "/v1/account/two-factor/disable";
+    pub const TWO_FACTOR_RECOVERY_CODES: &str = "/v1/account/two-factor/recovery-codes";
+    /// `GET` → [`crate::api::AccountInfo`]: the signed-in account (its role, and whether it has two-factor sign-in), as the
+    /// server says it.
+    pub const ACCOUNT: &str = "/v1/account";
+    /// `GET /v1/account/activity?cursor&before_ms&limit` → [`crate::api::AuditPage`]: the signed-in account's own security
+    /// events, for every account.
+    pub const ACCOUNT_ACTIVITY: &str = "/v1/account/activity";
+    /// `POST` ([`super::ChangePasswordRequest`]) → 204.
+    pub const ACCOUNT_PASSWORD: &str = "/v1/account/password";
+    /// `POST` → [`crate::api::RevokedOthers`]: sign every other computer of the account out.
+    pub const DEVICES_REVOKE_OTHERS: &str = "/v1/devices/revoke-others";
     /// `POST`: a new add-a-computer code → [`super::PairingInfo`]; `GET`/`DELETE` `/v1/pairings/{id}`: its state, or
     /// cancel it.
     pub const PAIRINGS: &str = "/v1/pairings";
     /// `GET`: the account's computers; `DELETE /v1/devices/{id}`: remove one (never this one).
     pub const DEVICES: &str = "/v1/devices";
+    /// `GET`: the signed-in account's stored bytes and labeled estimates, fetched from its server.
+    pub const USAGE: &str = "/v1/usage";
     /// `POST`: hold syncing (kept across restarts) → [`super::Status`].
     pub const PAUSE: &str = "/v1/pause";
     /// `POST`: sync again after a pause → [`super::Status`].
@@ -116,6 +172,293 @@ pub mod paths {
     pub const AUTOSTART: &str = "/v1/autostart";
     /// `PUT`: a blob → [`super::blobs::Stored`]; `GET /v1/blobs/{hash}`: its bytes ([`super::blobs`]).
     pub const BLOBS: &str = "/v1/blobs";
+    /// `GET`: the server's counters and kinds (an admin's; any other account is refused with `forbidden`) →
+    /// [`AdminServerInfo`](crate::api::AdminServerInfo).
+    pub const ADMIN_SERVER: &str = "/v1/admin/server";
+    /// `GET /v1/admin/storage` → [`AdminStorageOverview`](crate::api::AdminStorageOverview).
+    pub const ADMIN_STORAGE: &str = "/v1/admin/storage";
+    /// `PUT`: the level new writes are compressed at.
+    pub const ADMIN_STORAGE_COMPRESSION: &str = "/v1/admin/storage/compression";
+    /// `GET /v1/admin/users?cursor&limit&query` → [`AdminUserList`](crate::api::AdminUserList); `POST` (an
+    /// [`AdminCreateUser`](crate::api::AdminCreateUser)) → [`AdminCreatedUser`](crate::api::AdminCreatedUser).
+    /// Under `/v1/admin/users/{id}`: `PATCH` ([`AdminUpdateUser`](crate::api::AdminUpdateUser)) → the account's
+    /// [`AdminUserInfo`](crate::api::AdminUserInfo); `DELETE`, and `POST` to `…/disable`, `…/enable`, `…/invite` and
+    /// `…/password-reset`, and `DELETE …/invite` and `…/devices/{device_id}`, each with an
+    /// [`AdminConfirm`](crate::api::AdminConfirm) (the invite and the reset code answer an
+    /// [`AdminCode`](crate::api::AdminCode), the others have no body); `GET …/devices` →
+    /// [`AdminDevices`](crate::api::AdminDevices). The server's status and error code are the agent's.
+    pub const ADMIN_USERS: &str = "/v1/admin/users";
+    /// `GET /v1/admin/users/{id}/usage` → [`AccountUsage`](crate::api::AccountUsage).
+    pub const ADMIN_USER_USAGE: &str = "/v1/admin/users";
+    /// `GET /v1/admin/audit?cursor&before_ms&limit&user&action` → [`AuditPage`](crate::api::AuditPage): the whole security log,
+    /// newest first, filtered (an admin's).
+    pub const ADMIN_AUDIT: &str = "/v1/admin/audit";
+    /// `GET /v1/admin/audit/export?before_ms&user&action`: the log as NDJSON, streamed through (chunked, never held whole by the
+    /// agent): [`AuditEvent`](crate::api::AuditEvent) lines and a last [`AuditExportEnd`](crate::api::AuditExportEnd) line.
+    /// A stream that ends without that last line was cut off.
+    pub const ADMIN_AUDIT_EXPORT: &str = "/v1/admin/audit/export";
+    /// `GET`: version history for a synced file, addressed by its path relative to the sync root.
+    pub const FILE_HISTORY: &str = "/v1/files/history";
+    /// `POST`: restore a prior version of a synced file, addressed by its path relative to the sync root.
+    pub const FILE_RESTORE: &str = "/v1/files/restore";
+    /// `GET`: the server's deleted nodes; `POST` restore and remove calls address node IDs.
+    pub const TRASH: &str = "/v1/trash";
+    pub const TRASH_RESTORE: &str = "/v1/trash/restore";
+    pub const TRASH_REMOVE: &str = "/v1/trash/remove";
+    /// `GET` → [`super::ConflictsResponse`]: the conflict copies in the synced folder, from the agent's saved state.
+    pub const CONFLICTS: &str = "/v1/conflicts";
+    /// `GET` → [`super::FolderUsageResponse`]: local logical bytes by top-level folder and kind, from the agent's saved state.
+    pub const USAGE_FOLDERS: &str = "/v1/usage/folders";
+    /// `GET` → [`super::SpaceList`]: the personal space and the team spaces of the account, invitations among them, with
+    /// what this computer does with each. Under `/v1/spaces/{id}`: `POST …/accept` → the space as the server lists it
+    /// ([`SpaceListItem`](crate::api::SpaceListItem)), `POST …/decline` → 204 (both passed on to the server), and
+    /// `POST …/sync` ([`super::SpaceSyncRequest`]) → the space as [`super::SpaceInfo`], and `POST …/approve-deletes`
+    /// ([`super::ApproveDeletesRequest`]) → [`super::ApproveDeletesAnswer`]. The rest of `/v1/spaces/{id}` is passed on to
+    /// the server as it is (its status and error code are the agent's): `PATCH` ([`UpdateSpace`](crate::api::UpdateSpace): a new
+    /// name, or an administrator's limit) → [`AdminSpaceInfo`](crate::api::AdminSpaceInfo); `GET …/members` →
+    /// [`SpaceMembers`](crate::api::SpaceMembers); `POST …/members` ([`AddSpaceMember`](crate::api::AddSpaceMember)) and
+    /// `PATCH …/members/{user}` ([`ChangeSpaceMember`](crate::api::ChangeSpaceMember)) → the [`SpaceMember`](crate::api::SpaceMember);
+    /// `DELETE …/members/{user}` → 204; `GET …/usage` → [`SpaceUsage`](crate::api::SpaceUsage); and `POST …/leave` → 204, the
+    /// account's own `DELETE …/members/{its id}` (the server first; a refusal changes nothing here), after which the agent looks at
+    /// its list again and the space is lost to it: the sync ends and the local copy is kept.
+    pub const SPACES: &str = "/v1/spaces";
+    /// `POST` ([`super::FromFolderRequest`]) → [`super::FromFolderStatus`]: make a team space from a folder of the personal folder
+    /// (an administrator's call, see the request). The work goes on in the agent; `GET /v1/status` has it in `from_folder`.
+    pub const SPACES_FROM_FOLDER: &str = "/v1/spaces/from-folder";
+    /// The administrator's team space calls, passed on to the server like [`ADMIN_USERS`]: `GET /v1/admin/spaces?cursor&limit&query` →
+    /// [`AdminSpaceList`](crate::api::AdminSpaceList); `POST` ([`AdminCreateSpace`](crate::api::AdminCreateSpace)) →
+    /// [`AdminSpaceInfo`](crate::api::AdminSpaceInfo); under `/v1/admin/spaces/{id}`: `POST …/archive` and `…/unarchive`
+    /// ([`SpaceConfirm`](crate::api::SpaceConfirm)) → 204, and `PUT …/owner` ([`AdminSetSpaceOwner`](crate::api::AdminSetSpaceOwner)) → 204.
+    pub const ADMIN_SPACES: &str = "/v1/admin/spaces";
+}
+
+/// One version in a file's newest-first history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryVersion {
+    pub id: VersionId,
+    pub parent_version: Option<VersionId>,
+    pub epoch: Epoch,
+    pub seq: u64,
+    pub size: u64,
+    pub mtime_ms: i64,
+    pub device: DeviceId,
+    pub created_ms: i64,
+    pub save: bool,
+    pub pruned: bool,
+}
+
+/// A page of a file's newest-first version history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryResponse {
+    pub versions: Vec<HistoryVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+/// The path and page cursor for `GET /v1/files/history`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileHistoryRequest {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// `POST /v1/files/restore`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreRequest {
+    pub path: String,
+    pub version: VersionId,
+    pub expected_version: VersionId,
+}
+
+/// The new version made by a successful restore.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreResponse {
+    pub version: VersionId,
+    pub parent_version: VersionId,
+    pub seq: u64,
+    pub epoch: Epoch,
+}
+
+/// One deleted node from the server's trash. `path` is a local display hint and can be absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrashItem {
+    pub id: NodeId,
+    pub parent: NodeId,
+    pub name: String,
+    pub is_dir: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    pub deleted_ms: i64,
+    pub purge_after_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// A page of the server's trash, newest deletion first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrashResponse {
+    pub items: Vec<TrashItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+/// `{id}` in a local trash restore or remove request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrashNodeRequest {
+    pub id: String,
+}
+
+/// The server's answer after restoring a node from trash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrashRestoreResponse {
+    pub node: NodeId,
+    pub parent: NodeId,
+    pub name: String,
+    pub renamed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<VersionId>,
+    pub seq: u64,
+    pub epoch: Epoch,
+}
+
+/// Most conflict copies `GET /v1/conflicts` lists.
+pub const MAX_CONFLICT_COPIES: usize = 1000;
+
+/// Most folders `GET /v1/usage/folders` lists by name; the rest are summed in `other`.
+pub const MAX_USAGE_FOLDERS: usize = 50;
+
+/// One conflict copy found in the synced folder.
+///
+/// `original_path`, `device` and `at` are `None` for a copy the last pass reported whose name does not follow the
+/// conflict naming. `Debug` leaves the paths out (they are file names).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictCopy {
+    /// The copy, relative to the sync root, `/`-separated.
+    pub path: String,
+    /// The file it is a copy of, when its name says so (a stem shortened to fit the 255-byte name limit stays shortened).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_path: Option<String>,
+    /// The computer whose version the copy holds, as the name has it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    /// The minute it was found, `YYYY-MM-DD HH:MM`, in the local time of the computer that made the copy unless `at_utc`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+    /// `at` is UTC (that computer could not read its offset).
+    #[serde(default)]
+    pub at_utc: bool,
+    /// `at` in milliseconds since the Unix epoch, only when `at_utc`: a local time has no offset in the name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_ms: Option<i64>,
+    /// Logical size in bytes of the copy as this computer last synced it.
+    pub size: u64,
+    /// The copy's modification time (milliseconds since the Unix epoch) as this computer last synced it.
+    pub mtime_ms: i64,
+}
+
+impl std::fmt::Debug for ConflictCopy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConflictCopy").field("size", &self.size).field("at_ms", &self.at_ms).finish_non_exhaustive()
+    }
+}
+
+/// `GET /v1/conflicts`: the conflict copies in the synced folder, newest first.
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ConflictsResponse {
+    pub copies: Vec<ConflictCopy>,
+    /// There are more than [`MAX_CONFLICT_COPIES`]; the oldest are left out.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+impl std::fmt::Debug for ConflictsResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConflictsResponse").field("copies", &self.copies.len()).field("truncated", &self.truncated).finish()
+    }
+}
+
+/// Local logical bytes and file count of one top-level folder (`name` is `""` for the files directly in the sync root).
+/// `Debug` leaves the name out.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderUsage {
+    pub name: String,
+    pub bytes: u64,
+    pub files: u64,
+}
+
+impl std::fmt::Debug for FolderUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FolderUsage").field("bytes", &self.bytes).field("files", &self.files).finish_non_exhaustive()
+    }
+}
+
+/// What the folders beyond [`MAX_USAGE_FOLDERS`] add up to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct OtherFolders {
+    /// How many folders are summed here.
+    pub folders: u64,
+    pub bytes: u64,
+    pub files: u64,
+}
+
+/// The kind classes of `GET /v1/usage/folders`, picked by file extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileKind {
+    Image,
+    Video,
+    Audio,
+    Document,
+    #[serde(rename = "model_3d")]
+    Model3d,
+    Archive,
+    /// Source code, markup and plain text.
+    Code,
+    Other,
+}
+
+impl FileKind {
+    /// Every kind, in the order the response lists them.
+    pub const ALL: [FileKind; 8] = [Self::Image, Self::Video, Self::Audio, Self::Document, Self::Model3d, Self::Archive, Self::Code, Self::Other];
+}
+
+/// Local logical bytes and file count of one kind class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KindUsage {
+    pub kind: FileKind,
+    pub bytes: u64,
+    pub files: u64,
+}
+
+/// `GET /v1/usage/folders`: the sizes of the files this computer has synced, by top-level folder and by kind.
+///
+/// These are **local logical bytes** (the sizes of the files in the synced folder as the last pass recorded them), not
+/// the server's stored bytes: they ignore chunk sharing, history and trash,
+/// by its full size. Only files count; empty folders add nothing. `Debug` leaves the folder names out.
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FolderUsageResponse {
+    pub total_bytes: u64,
+    pub total_files: u64,
+    /// The largest folders (by bytes, then name), at most [`MAX_USAGE_FOLDERS`].
+    pub folders: Vec<FolderUsage>,
+    /// The rest, when there are more folders than that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other: Option<OtherFolders>,
+    /// Every kind class, in the order of [`FileKind::ALL`], also those with no files.
+    pub kinds: Vec<KindUsage>,
+}
+
+impl std::fmt::Debug for FolderUsageResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FolderUsageResponse")
+            .field("total_bytes", &self.total_bytes)
+            .field("total_files", &self.total_files)
+            .field("folders", &self.folders.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Binary content an app keeps out of a live document (images, audio, a font): `PUT /v1/blobs` with the bytes as the
@@ -228,8 +571,14 @@ pub enum RunState {
     Syncing,
     /// The last pass failed for a reason that may pass by itself; it is tried again.
     Retrying { message: String },
-    /// Stopped until someone puts something right.
-    Paused { reason: String },
+    /// Stopped until someone puts something right. `reason_code` names the cause where it is one an app may want to
+    /// treat on its own (`server_full`, `quota_exceeded`: the [`crate::api::codes`] of the same name), so it need not
+    /// match the words of `reason`; absent for other causes, and from an older agent.
+    Paused {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason_code: Option<String>,
+    },
     /// Paused by the user (`POST /v1/pause`), until `POST /v1/resume`, also after a restart: no sync passes and no
     /// live connection; the local API and apps' recents on this machine keep working. Not a problem to put right,
     /// unlike [`RunState::Paused`].
@@ -271,6 +620,345 @@ pub struct Status {
     /// admin): nothing syncs until it signs out and joins again. Its files stay.
     #[serde(default)]
     pub removed: bool,
+    /// The team spaces this computer syncs, or lost access to, one entry each (the fields above describe the personal
+    /// space). An older agent says nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spaces: Vec<SpaceStatus>,
+    /// The work of "make a team space from this folder" ([`FromFolderRequest`]): under way, or how the last one ended. An
+    /// older agent says nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_folder: Option<FromFolderStatus>,
+}
+
+/// What this computer does about one space, in [`SpaceInfo`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpaceSync {
+    /// The space syncs to a folder on this computer.
+    On,
+    /// It doesn't (a team space starts so on every computer: the person chooses).
+    Off,
+    /// It can't: the server is too old for team spaces, or this computer lost access to the space.
+    Unavailable,
+}
+
+/// How the sync of one team space is going, in [`SpaceStatus`] and [`SpaceInfo`]: [`RunState`] for a space, and the two
+/// ways a space stops that a whole agent doesn't. The `Debug` output leaves out the words of `NoAccess`, which name the
+/// space.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum SpaceRun {
+    Idle,
+    Syncing,
+    /// The last pass failed for a reason that may pass by itself; it is tried again.
+    Retrying {
+        message: String,
+    },
+    /// Stopped until someone puts something right (the folder is gone, say).
+    Paused {
+        reason: String,
+        /// The cause as a code an app may act on (`server_full`, `quota_exceeded`, `read_only`), where there is one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason_code: Option<String>,
+    },
+    /// Syncing is paused by the user for every space.
+    PausedByUser,
+    /// The account no longer has access (it was removed, or the invitation withdrawn; an archived space is not this: its members
+    /// keep read access). The local copy is
+    /// kept and no longer syncs; if access comes back it syncs again. `message` says so in words.
+    NoAccess {
+        message: String,
+    },
+    /// The server can't do team spaces yet (it needs an update).
+    Unavailable {
+        message: String,
+    },
+}
+
+impl std::fmt::Debug for SpaceRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Idle => f.write_str("Idle"),
+            Self::Syncing => f.write_str("Syncing"),
+            Self::Retrying { message } => f.debug_struct("Retrying").field("message", message).finish(),
+            Self::Paused { reason, reason_code } => f.debug_struct("Paused").field("reason", reason).field("reason_code", reason_code).finish(),
+            Self::PausedByUser => f.write_str("PausedByUser"),
+            Self::NoAccess { .. } => f.debug_struct("NoAccess").finish_non_exhaustive(),
+            Self::Unavailable { message } => f.debug_struct("Unavailable").field("message", message).finish(),
+        }
+    }
+}
+
+/// One synced team space in [`Status::spaces`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceStatus {
+    pub space: SpaceId,
+    pub run_state: SpaceRun,
+    /// When the last pass that didn't fail finished (milliseconds since the Unix epoch).
+    #[serde(default)]
+    pub last_sync_ms: Option<i64>,
+    /// The account is a viewer here (or the space is archived): the folder follows the space, and nothing of this
+    /// computer goes up.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// One space in `GET /v1/spaces`: the server's view of it (its name, the account's role, whether it is an invitation)
+/// and this computer's (the folder, whether it syncs, how that goes). The `Debug` output leaves out the name and the
+/// folder.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceInfo {
+    pub space: SpaceId,
+    /// `personal` or `team`.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub role: SpaceRole,
+    /// `active`, or `invited` for an invitation not yet accepted.
+    pub state: String,
+    #[serde(default)]
+    pub archived: bool,
+    /// The folder on this computer (absolute): where the space syncs, or would.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+    pub sync: SpaceSync,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_state: Option<SpaceRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sync_ms: Option<i64>,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+impl std::fmt::Debug for SpaceInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpaceInfo")
+            .field("space", &self.space)
+            .field("kind", &self.kind)
+            .field("role", &self.role)
+            .field("state", &self.state)
+            .field("archived", &self.archived)
+            .field("sync", &self.sync)
+            .field("run_state", &self.run_state)
+            .field("read_only", &self.read_only)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `GET /v1/spaces`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SpaceList {
+    pub spaces: Vec<SpaceInfo>,
+}
+
+/// `POST /v1/spaces/{id}/sync`: turn the sync of a team space on or off on this computer. `folder` (absolute) picks
+/// another folder than the default one beside the personal folder; the folder must not lie inside another synced folder or
+/// the agent's data folder. A folder that already has files in it is synced only with `adopt` (files that differ from
+/// the space's become conflict copies; nothing is deleted).
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SpaceSyncRequest {
+    pub on: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub adopt: bool,
+}
+
+impl std::fmt::Debug for SpaceSyncRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpaceSyncRequest").field("on", &self.on).field("adopt", &self.adopt).finish_non_exhaustive()
+    }
+}
+
+/// `POST /v1/spaces/from-folder`: make a team space from a folder of the personal folder ("Make a team space from this folder").
+///
+/// The agent checks the folder, creates the team space on the server (an administrator's call, so `confirm` is the
+/// administrator's password and, with two-factor sign-in, a code; the account becomes the space's first owner), sets up the
+/// team folder beside the personal one and copies the files into it. The team space takes the files from the personal space on
+/// the server (no bytes travel again). Only when the team space holds every file, byte for byte, is the old folder deleted here,
+/// which the personal sync then moves to the server's trash like any deletion. Any failure before that leaves the old folder as it
+/// was. The call answers once the checks are done and the work has started; [`Status::from_folder`] says how it goes.
+///
+/// Asked again for the same folder and name while the work was interrupted or failed with the space already made, the agent
+/// goes on with that space and needs no `confirm`. The `Debug` output hides the confirmation and the names.
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FromFolderRequest {
+    /// The folder to move into a team space (absolute, inside the personal folder).
+    pub folder: String,
+    /// The new team space's name.
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_bytes: Option<u64>,
+    #[serde(flatten)]
+    pub confirm: crate::api::SpaceConfirm,
+}
+
+impl std::fmt::Debug for FromFolderRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FromFolderRequest").field("confirm", &self.confirm).finish_non_exhaustive()
+    }
+}
+
+/// Where the work of [`FromFolderRequest`] is. Every step before `Trashing` leaves the personal folder as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FromFolderStep {
+    /// Looking at the folder and counting its files.
+    Checking,
+    /// Asking the server for the team space.
+    Creating,
+    /// Setting up the team folder and turning its sync on.
+    SettingUp,
+    /// Copying the files into the team folder (`done` of `total`).
+    Copying,
+    /// Waiting for the team space to take everything (`done` of `total` files are on the server).
+    Syncing,
+    /// Comparing the team space with the old folder, file by file.
+    Verifying,
+    /// Deleting the old folder here (the personal sync moves it to the server's trash).
+    Trashing,
+    /// Finished: the files are in the team space and the old folder is gone from here (or `kept` says what stayed).
+    Done,
+    /// Stopped by a problem (`message`, `failed_at`); nothing was lost. Asking again goes on.
+    Failed,
+    /// The agent stopped in the middle of the work. Asking again goes on.
+    Interrupted,
+}
+
+/// `Status::from_folder`: the work of [`FromFolderRequest`], also after it ended (until the next one starts, or the agent signs out).
+/// The `Debug` output leaves out the names and folders.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FromFolderStatus {
+    /// The old folder (absolute).
+    pub folder: String,
+    /// The team space's name.
+    pub name: String,
+    pub step: FromFolderStep,
+    /// The team space, once it exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<SpaceId>,
+    /// The team folder on this computer, once it is set up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_folder: Option<String>,
+    /// Progress of the current step, in files (`Copying`, `Syncing`, `Verifying`); both 0 elsewhere.
+    #[serde(default)]
+    pub done: u64,
+    #[serde(default)]
+    pub total: u64,
+    /// For `Failed` and `Interrupted`: the step that was under way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_at: Option<FromFolderStep>,
+    /// For `Failed`, `Interrupted` and `Done` with files kept: what happened, in words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Files left in the old folder because they were changed after the copy (`Done` only): the old folder is not deleted
+    /// then, only what was copied and unchanged.
+    #[serde(default)]
+    pub kept: u64,
+}
+
+impl std::fmt::Debug for FromFolderStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FromFolderStatus")
+            .field("step", &self.step)
+            .field("space", &self.space)
+            .field("done", &self.done)
+            .field("total", &self.total)
+            .field("failed_at", &self.failed_at)
+            .field("kept", &self.kept)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FromFolderStatus {
+    /// Whether the work is still going on (nothing else may be started meanwhile).
+    pub fn running(&self) -> bool {
+        !matches!(self.step, FromFolderStep::Done | FromFolderStep::Failed | FromFolderStep::Interrupted)
+    }
+}
+
+/// `POST /v1/spaces/{id}/approve-deletes`: approve the deletions of a team space that the mass-delete guard holds back, as
+/// `craft-cloud-agent sync --approve-deletes --space` does (it writes the space's `approval.json`, which the running agent
+/// takes). With a `set` (the identifier the waiting list was shown with) only that set is approved if it is the one waiting;
+/// without, the set is approved if it is the one last shown by this call (the first call lists it and approves nothing).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ApproveDeletesRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set: Option<String>,
+}
+
+/// The most paths one [`ApproveDeletesAnswer`] lists, and the most bytes of paths (so the answer stays far under
+/// [`MAX_LOCAL_JSON_BYTES`] however many files were deleted).
+pub const MAX_HELD_ENTRIES: usize = 1000;
+pub const MAX_HELD_BYTES: usize = 512 * 1024;
+
+/// One deletion waiting for approval: `side` is `server` (it will be deleted on the server) or `here` (on this computer).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldEntry {
+    pub path: String,
+    pub side: String,
+}
+
+impl std::fmt::Debug for HeldEntry {
+    /// The path is a file name: left out.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldEntry").field("side", &self.side).finish_non_exhaustive()
+    }
+}
+
+/// A deletion held behind a link: the path, and the links that may be it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldLink {
+    pub path: String,
+    pub links: Vec<String>,
+}
+
+impl std::fmt::Debug for HeldLink {
+    /// The path and the links are file names: left out.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldLink").finish_non_exhaustive()
+    }
+}
+
+/// The answer to [`ApproveDeletesRequest`]: whether an approval was handed to the agent, what the command line would
+/// have said (cut at 16 KiB here), and the same as data:
+/// - `set` names the deletions waiting for approval (a hash of exactly them), `total` counts them and `entries` lists up to
+///   [`MAX_HELD_ENTRIES`] of them (`truncated` says there are more). Approve with that `set`: only that set is approved, and a
+///   set that changed meanwhile approves nothing and is listed again.
+/// - `held` lists (up to 100) deletions held behind a link, `held_total` counts them, `held_set` names them. They are released
+///   only by naming `held_set`, which an app doesn't do: the command line does.
+///
+/// Every field after `message` is left out by an older agent and read as nothing. The `Debug` output leaves out the lists and
+/// the words, which are file names.
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ApproveDeletesAnswer {
+    pub approved: bool,
+    pub message: String,
+    #[serde(default)]
+    pub set: Option<String>,
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub entries: Vec<HeldEntry>,
+    #[serde(default)]
+    pub held_set: Option<String>,
+    #[serde(default)]
+    pub held_total: u64,
+    #[serde(default)]
+    pub held: Vec<HeldLink>,
+}
+
+impl std::fmt::Debug for ApproveDeletesAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApproveDeletesAnswer")
+            .field("approved", &self.approved)
+            .field("total", &self.total)
+            .field("truncated", &self.truncated)
+            .field("held_total", &self.held_total)
+            .finish_non_exhaustive()
+    }
 }
 
 /// `POST /v1/login`: what `craft-cloud-agent login` asks for. The password goes to the agent and from there to the
@@ -324,6 +1012,12 @@ pub struct JoinRequest {
     /// The new account's password, for an invite that needs one (answered `password_required` without it).
     #[serde(default)]
     pub password: Option<String>,
+    /// The second factor of an account that has two-factor sign-in (answered `two_factor_required` without it, the code not
+    /// used up): a code from the authenticator app, or a recovery code instead. Send the same join again with one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
 }
 
 impl std::fmt::Debug for JoinRequest {
@@ -334,8 +1028,126 @@ impl std::fmt::Debug for JoinRequest {
             .field("device_name", &self.device_name)
             .field("adopt", &self.adopt)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
             .finish()
     }
+}
+
+/// What an error answer carries beyond `error` and `message` ([`ErrorAnswer`](crate::api::ErrorAnswer) reads those two): the
+/// challenge of `two_factor_required` and the wait of `two_factor_locked` (also in the `Retry-After` header). A client reads
+/// it from the same body; every field is missing from answers that have no use for it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorExtras {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub two_factor: Option<crate::api::TwoFactorChallenge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
+}
+
+/// `POST /v1/login/second-factor`: the second step of a sign-in the agent answered `two_factor_required`. The agent keeps
+/// nothing between the two steps, so the first step's `server`, `folder`, `device_name` and `adopt` come again (`user` is
+/// the first step's and is only checked to be sane), with the `challenge` from the answer and a code (`totp_code`) or a recovery
+/// code. Answered with [`Status`]. Its `Debug` output hides the challenge and the codes.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecondFactorLoginRequest {
+    pub server: String,
+    pub user: String,
+    #[serde(default)]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub device_name: Option<String>,
+    #[serde(default)]
+    pub adopt: bool,
+    pub challenge: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
+}
+
+impl std::fmt::Debug for SecondFactorLoginRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecondFactorLoginRequest")
+            .field("server", &self.server)
+            .field("user", &self.user)
+            .field("folder", &self.folder)
+            .field("device_name", &self.device_name)
+            .field("adopt", &self.adopt)
+            .field("challenge", &"<redacted>")
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// `POST /v1/account/two-factor/setup`: the account's password, to start setting two-factor sign-in up. Answered with
+/// [`TwoFactorSetupResponse`](crate::api::TwoFactorSetupResponse). Its `Debug` output hides the password.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PasswordRequest {
+    pub password: String,
+}
+
+impl std::fmt::Debug for PasswordRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasswordRequest").field("password", &"<redacted>").finish()
+    }
+}
+
+/// `POST /v1/account/two-factor/confirm`: the first code of the set-up; answered with
+/// [`RecoveryCodes`](crate::api::RecoveryCodes), shown once. Its `Debug` output hides the code.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TotpRequest {
+    pub totp_code: String,
+}
+
+impl std::fmt::Debug for TotpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TotpRequest").field("totp_code", &"<redacted>").finish()
+    }
+}
+
+/// `POST /v1/account/two-factor/disable` (answered 204) and `/recovery-codes` (answered with
+/// [`RecoveryCodes`](crate::api::RecoveryCodes), with `totp_code` only): the password and one second factor. Its `Debug` output
+/// hides all three.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwoFactorProofRequest {
+    pub password: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
+}
+
+impl std::fmt::Debug for TwoFactorProofRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TwoFactorProofRequest")
+            .field("password", &"<redacted>")
+            .field("totp_code", &self.totp_code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// `POST /v1/account/password`: the account's password change; answered 204, and every other computer is signed out. Its
+/// `Debug` output hides both passwords.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+impl std::fmt::Debug for ChangePasswordRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChangePasswordRequest").field("current_password", &"<redacted>").field("new_password", &"<redacted>").finish()
+    }
+}
+
+/// `PATCH /v1/devices/{id}`: a new name for one of the account's computers; answered with its
+/// [`DeviceInfo`](crate::api::DeviceInfo).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameDeviceRequest {
+    pub name: String,
 }
 
 /// `POST /v1/pairings`: a new add-a-computer code of this account, to enter on the computer being added. It
@@ -388,6 +1200,28 @@ pub struct RecentEntry {
     pub saved_ms: Option<i64>,
     /// The name of the machine it was opened on.
     pub machine: String,
+    /// Other accounts of the space that have the file open right now, as far as the agent knows: only for a file whose live
+    /// document the agent follows (an app on this computer has it open), from the presence it hears, never the account the
+    /// agent is signed in as. Not part of the shared list (it is filled in when the list is handed out); empty when nobody
+    /// else is there, and absent from an older agent's answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_now: Vec<RecentPerson>,
+}
+
+/// Somebody who has a recent file open right now ([`RecentEntry::open_now`]): the account's username and its palette index.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentPerson {
+    /// The account's username.
+    pub name: String,
+    /// The palette index (0 to 11) the account is shown in ([`crate::colour`]), the same on every machine.
+    pub colour: u8,
+}
+
+impl std::fmt::Debug for RecentPerson {
+    /// A username never reaches a debug print or a log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecentPerson").field("name", &format_args!("<{} bytes>", self.name.len())).field("colour", &self.colour).finish()
+    }
 }
 
 /// What an app adds: the agent fills in the node, the time and the machine.
@@ -407,9 +1241,16 @@ pub struct NewRecent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum RecentsRequest {
-    /// Send `app`'s list now and after every change.
-    Subscribe { app: String },
-    /// Add a file to `app`'s list; answered `added` (or `error`) with the same `id`.
+    /// Send `app`'s list now and after every change. With a `space`, the list of that team space (it must sync on this
+    /// computer); without, the personal list as before.
+    Subscribe {
+        app: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<SpaceId>,
+    },
+    /// Add a file to `app`'s list; answered `added` (or `error`) with the same `id`. An absolute `entry.path` inside a
+    /// synced team folder goes to that space's list (and is kept relative to the folder); any other path is the
+    /// personal list's, as before.
     Add { id: u64, app: String, entry: NewRecent },
 }
 
@@ -425,6 +1266,9 @@ pub enum RecentsEvent {
         entries: Vec<RecentEntry>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         push_stopped: bool,
+        /// The team space the list belongs to; absent for the personal list (and from an older agent).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<SpaceId>,
     },
     /// The `add` with this `id` is kept (written to disk; it reaches the server when it can).
     Added { id: u64, entry: RecentEntry },
@@ -455,6 +1299,19 @@ pub enum RecentsEvent {
 /// - A binary [`PRESENCE`] from the app is relayed to the document's other machines and apps (at most 4 KiB).
 /// - `close {doc}`: the app is done with it (the agent keeps it).
 ///
+/// **Team spaces** (live protocol 3): the agent routes a document by the path the app opens (an absolute path inside a
+/// synced team folder goes to that space's live link; a relative path is the personal space's). `opened` then names the
+/// `space`, and says `read_only: true` for a viewer: an update the app sends to a read-only document is refused with
+/// `error {id, seq, code: "read_only"}`, the agent's copy is unchanged, and nothing is sent to the server. An app that
+/// opens with `identity: true` gets other accounts' presence as [`PRESENCE_FROM`] frames and a `members` message (the
+/// space's active members with their names and palette colours) after `opened` and whenever the list changes; an app
+/// that doesn't ask gets only [`PRESENCE`] frames and no `members`.
+///
+/// The agent tells every app with a document open in a space when the account's right to change it changes, as
+/// `role {doc, read_only}` (both ways; the apps that asked for identity and those that did not alike): `opened.read_only`
+/// is as of the open, `role` follows it. An app that holds changes it made as a viewer sends them again when `role` says
+/// `read_only: false`, and, if it ends first, hands them to the agent as [`docs::HELD`] frames.
+///
 /// An app that doesn't read for 10 s is dropped; its documents stay with the agent.
 pub mod docs {
     /// Binary frame kinds.
@@ -462,6 +1319,18 @@ pub mod docs {
     pub const UPDATE: u8 = 2;
     pub const PRESENCE: u8 = 3;
     pub const IMPORT: u8 = 4;
+    /// Presence with the sender's identity, for an app that opened the document with `identity: true`:
+    /// `[u8 5][u64 id, big-endian][16 bytes account ID][the app's bytes]`. An app that did not ask gets [`PRESENCE`].
+    pub const PRESENCE_FROM: u8 = 5;
+    /// A change the app made while the agent refused its changes (`read_only`) and holds on to until the account may write
+    /// again, sent by an app that ends with such changes unsent: `[u8 6][u64 id, big-endian][a Loro update]`, one frame
+    /// per update, in order, numbered like updates. The agent puts it into the document's journal as it does an update, but
+    /// the gate keeps it from the server while the space is read-only; it goes up with the first connection of an account
+    /// that may write. Acked (`ack {id, seq}`) once it is on disk, so an app that ends can wait for that before it closes;
+    /// refused like an update (`not_found` when the space stopped syncing).
+    pub const HELD: u8 = 6;
+    /// The bytes of an account ID in a [`PRESENCE_FROM`] frame.
+    pub const USER_BYTES: usize = 16;
     /// The header of a binary frame: kind and id.
     pub const HEADER_BYTES: usize = 9;
     /// Largest binary frame (a state or an import: a snapshot), either way.
@@ -498,6 +1367,10 @@ pub enum DocsRequest {
         app: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         file_hash: Option<String>,
+        /// The app wants to know who is there: other accounts' presence comes as [`docs::PRESENCE_FROM`] frames and a
+        /// `members` message follows `opened`. Without it (the default, and an older app) only [`docs::PRESENCE`] frames.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        identity: bool,
     },
     /// The app is done with the document.
     Close { doc: crate::ids::DocId },
@@ -591,9 +1464,11 @@ pub enum NotLiveReason {
     Resetting,
 }
 
-/// A control message from the agent on the docs WebSocket ([`docs`]).
+/// A control message from the agent on the docs WebSocket ([`docs`]). New messages are added without a breaking change: match
+/// with a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
+#[non_exhaustive]
 pub enum DocsEvent {
     /// The document is live: its state follows as a binary frame of `state.bytes` bytes. `changed_outside`, for an
     /// open that named its `file_hash`: whether no Craft app's save of this document (this machine's records, or the
@@ -605,6 +1480,13 @@ pub enum DocsEvent {
         state: DocState,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         changed_outside: Option<bool>,
+        /// The account may not change this document (a viewer of its team space, or the space is archived): its updates
+        /// are refused with `read_only` and the agent's copy stays as it is. Absent from an older agent.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        read_only: bool,
+        /// The space the document belongs to (the personal space's ID, or a team space's). Absent from an older agent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<SpaceId>,
     },
     /// The file has never been live: send its content as a binary import frame.
     NeedsImport { id: u64 },
@@ -629,6 +1511,10 @@ pub enum DocsEvent {
         #[serde(default)]
         stopped: bool,
     },
+    /// The account's right to change the space of an open document changed (`read_only`: a viewer, or the space is archived;
+    /// both ways, also when it ends). `opened.read_only` is as of the open; this follows it, so an app that kept changes
+    /// the agent refused can send them again once it says `false`.
+    Role { doc: crate::ids::DocId, read_only: bool },
     /// The file of an open document, as it is on this machine's disk now: the live document's frontiers a Craft app
     /// saved it from (the record of that save, this machine's or the server's version's), or none when no record is
     /// known (edited outside Craft, not synced yet). Sent after `opened` and whenever it changes (the app saved, the
@@ -638,6 +1524,10 @@ pub enum DocsEvent {
         #[serde(default)]
         frontiers: Option<Vec<(u64, u32)>>,
     },
+    /// Who is in the space of the document opened as `id`: the active members, sent after `opened` and whenever the list
+    /// changes, only to an app that opened the document with `identity: true`. In a personal space the list is the
+    /// account alone.
+    Members { id: u64, members: Vec<DocMember> },
     /// A request or a binary frame was refused (`id` and `seq` name it when they can). `code` is one of
     /// [`crate::api::codes`] or [`codes`].
     Error {
@@ -648,6 +1538,32 @@ pub enum DocsEvent {
         code: String,
         message: String,
     },
+}
+
+/// A member of the space of an open document, as `members` lists it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocMember {
+    /// The account's ID (what [`docs::PRESENCE_FROM`] frames name).
+    pub user: uuid::Uuid,
+    /// The account's username.
+    pub name: String,
+    /// The palette index (0 to 11) the account is shown in ([`crate::colour`]), the same on every machine.
+    pub colour: u8,
+    /// This is the account the agent is signed in as.
+    #[serde(rename = "self", default)]
+    pub is_self: bool,
+}
+
+impl std::fmt::Debug for DocMember {
+    /// Names the account by its ID: a username never reaches a debug print or a log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DocMember")
+            .field("user", &self.user)
+            .field("name", &format_args!("<{} bytes>", self.name.len()))
+            .field("colour", &self.colour)
+            .field("is_self", &self.is_self)
+            .finish()
+    }
 }
 
 /// `path` as a recent file's path: `/`-separated names relative to the synced folder, each a valid [`Name`]
@@ -683,12 +1599,12 @@ mod tests {
     /// A list's event says when its push stopped; without the field (an older agent) it hasn't.
     #[test]
     fn a_list_says_when_its_push_stopped() {
-        let stopped = RecentsEvent::Entries { app: "wordcraft".into(), entries: Vec::new(), push_stopped: true };
+        let stopped = RecentsEvent::Entries { app: "wordcraft".into(), entries: Vec::new(), push_stopped: true, space: None };
         let json = serde_json::to_string(&stopped).unwrap();
         assert!(json.contains("\"push_stopped\":true"), "{json}");
         assert_eq!(serde_json::from_str::<RecentsEvent>(&json).unwrap(), stopped);
         let older: RecentsEvent = serde_json::from_str(r#"{"type":"entries","app":"wordcraft","entries":[]}"#).unwrap();
-        assert_eq!(older, RecentsEvent::Entries { app: "wordcraft".into(), entries: Vec::new(), push_stopped: false });
+        assert_eq!(older, RecentsEvent::Entries { app: "wordcraft".into(), entries: Vec::new(), push_stopped: false, space: None });
         let plain = serde_json::to_string(&older).unwrap();
         assert!(!plain.contains("push_stopped"), "{plain}");
     }
@@ -736,9 +1652,29 @@ mod tests {
             device_name: None,
             adopt: false,
             password: Some("hunter2-secret".into()),
+            totp_code: Some("918273".into()),
+            recovery_code: Some("RECOVERY-SECRET".into()),
         };
         let shown = format!("{join:?}");
-        assert!(!shown.contains("K7M4") && !shown.contains("hunter2-secret"), "{shown}");
+        assert!(!shown.contains("K7M4") && !shown.contains("hunter2-secret") && !shown.contains("918273") && !shown.contains("RECOVERY"), "{shown}");
+        let second = SecondFactorLoginRequest {
+            server: "https://c.example".into(),
+            user: "ana".into(),
+            folder: None,
+            device_name: None,
+            adopt: false,
+            challenge: "challenge-secret".into(),
+            totp_code: Some("918273".into()),
+            recovery_code: Some("RECOVERY-SECRET".into()),
+        };
+        let shown = format!("{second:?}");
+        assert!(!shown.contains("challenge-secret") && !shown.contains("918273") && !shown.contains("RECOVERY"), "{shown}");
+        let proof =
+            TwoFactorProofRequest { password: "pw-secret-1".into(), totp_code: Some("918273".into()), recovery_code: Some("RECOVERY-SECRET".into()) };
+        let shown = format!("{proof:?} {:?} {:?}", PasswordRequest { password: "pw-secret-1".into() }, TotpRequest { totp_code: "918273".into() });
+        assert!(!shown.contains("pw-secret-1") && !shown.contains("918273") && !shown.contains("RECOVERY"), "{shown}");
+        let change = format!("{:?}", ChangePasswordRequest { current_password: "old-secret-pw".into(), new_password: "new-secret-pw".into() });
+        assert!(!change.contains("secret-pw"), "{change}");
         let pairing = PairingInfo {
             id: uuid::Uuid::nil(),
             join: "cloud.example.com/K7M4-Q9TX".into(),
@@ -747,7 +1683,20 @@ mod tests {
         };
         assert!(!format!("{pairing:?}").contains("K7M4"));
         let minimal: JoinRequest = serde_json::from_value(serde_json::json!({ "join": "x/y" })).unwrap();
-        assert!(!minimal.adopt && minimal.password.is_none());
+        assert!(!minimal.adopt && minimal.password.is_none() && minimal.totp_code.is_none() && minimal.recovery_code.is_none());
+        // An older app's body reads, and a new body without a second factor is the old one.
+        assert_eq!(
+            serde_json::to_value(&minimal).unwrap(),
+            serde_json::json!({ "join": "x/y", "folder": null, "device_name": null, "adopt": false, "password": null })
+        );
+        // The extras of an error answer are optional and ignored by a reader that doesn't know them.
+        let extras: ErrorExtras = serde_json::from_value(serde_json::json!({ "error": "x", "message": "m" })).unwrap();
+        assert_eq!(extras, ErrorExtras::default());
+        let extras: ErrorExtras = serde_json::from_value(
+            serde_json::json!({ "error": "two_factor_required", "two_factor": { "challenge": "c", "expires_ms": 5 }, "retry_after_secs": 7 }),
+        )
+        .unwrap();
+        assert_eq!((extras.two_factor.map(|t| t.expires_ms), extras.retry_after_secs), (Some(5), Some(7)));
     }
 
     #[test]
@@ -770,12 +1719,22 @@ mod tests {
             autostart: None,
             last_sync_ms: Some(1_790_000_000_000),
             removed: false,
+            spaces: Vec::new(),
+            from_folder: None,
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["run_state"], serde_json::json!({ "kind": "signed_out" }));
         assert_eq!(serde_json::from_value::<Status>(json).unwrap(), status);
         let paused = serde_json::to_value(RunState::PausedByUser).unwrap();
         assert_eq!(paused, serde_json::json!({ "kind": "paused_by_user" }));
+        // A pause names its cause by code where there is one; an older agent sends none, and none is not written.
+        let coded = RunState::Paused { reason: "full".into(), reason_code: Some("server_full".into()) };
+        let json = serde_json::to_value(&coded).unwrap();
+        assert_eq!(json, serde_json::json!({ "kind": "paused", "reason": "full", "reason_code": "server_full" }));
+        assert_eq!(serde_json::from_value::<RunState>(json).unwrap(), coded);
+        let plain = RunState::Paused { reason: "x".into(), reason_code: None };
+        assert_eq!(serde_json::to_value(&plain).unwrap(), serde_json::json!({ "kind": "paused", "reason": "x" }));
+        assert_eq!(serde_json::from_value::<RunState>(serde_json::json!({ "kind": "paused", "reason": "x" })).unwrap(), plain);
         let older: Status = serde_json::from_value(serde_json::json!({
             "api": 1, "signed_in": false, "online": false, "run_state": { "kind": "signed_out" }
         }))
@@ -783,8 +1742,47 @@ mod tests {
         assert_eq!(older.autostart, None, "an older agent says nothing about autostart");
         assert_eq!(older.last_sync_ms, None, "nor about the last sync");
         assert!(!older.removed);
+        assert!(older.spaces.is_empty(), "nor about team spaces");
         let login: LoginRequest = serde_json::from_value(serde_json::json!({ "server": "s", "user": "u", "password": "p", "extra": 1 })).unwrap();
         assert!(!login.adopt && login.folder.is_none(), "missing optional fields default; unknown ones are ignored");
+    }
+
+    #[test]
+    fn spaces_have_a_plain_form_and_their_debug_output_names_nothing() {
+        let space = SpaceId::generate();
+        let info = SpaceInfo {
+            space,
+            kind: "team".into(),
+            name: Some("Studio".into()),
+            role: SpaceRole::Viewer,
+            state: "active".into(),
+            archived: false,
+            folder: Some("/home/ana/Craft Cloud Shared/Studio".into()),
+            sync: SpaceSync::On,
+            run_state: Some(SpaceRun::NoAccess { message: "You no longer have access to Studio. Your local copy is kept.".into() }),
+            last_sync_ms: None,
+            read_only: true,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["sync"], "on");
+        assert_eq!(json["run_state"]["kind"], "no_access");
+        assert!(json.get("last_sync_ms").is_none());
+        assert_eq!(serde_json::from_value::<SpaceInfo>(json).unwrap(), info);
+        let shown = format!("{info:?}");
+        assert!(!shown.contains("Studio") && !shown.contains("Craft Cloud Shared"), "{shown}");
+        assert!(shown.contains("NoAccess"), "the variant is still named: {shown}");
+        let status = SpaceStatus { space, run_state: info.run_state.clone().unwrap(), last_sync_ms: None, read_only: false };
+        let shown = format!("{status:?}");
+        assert!(!shown.contains("Studio"), "the status leaves the name out too: {shown}");
+        let answer = ApproveDeletesAnswer { approved: true, message: "delete on the server: Studio/plan.txt".into(), ..Default::default() };
+        assert!(!format!("{answer:?}").contains("plan.txt"));
+        let older: Status = serde_json::from_value(serde_json::json!({
+            "api": 1, "signed_in": true, "online": true, "run_state": { "kind": "idle" }
+        }))
+        .unwrap();
+        assert!(older.spaces.is_empty());
+        let request: SpaceSyncRequest = serde_json::from_value(serde_json::json!({ "on": true })).unwrap();
+        assert_eq!(request, SpaceSyncRequest { on: true, folder: None, adopt: false });
     }
 
     #[test]
@@ -796,16 +1794,101 @@ mod tests {
         assert_eq!(docs::decode_binary(&frame[..8]), None, "too short for a header");
         assert_eq!(docs::decode_binary(&[]), None);
         let open: DocsRequest = serde_json::from_value(serde_json::json!({ "type": "open", "id": 1, "path": "a.txt", "app": "wordcraft" })).unwrap();
-        assert_eq!(open, DocsRequest::Open { id: 1, path: "a.txt".into(), app: "wordcraft".into(), file_hash: None });
-        let plain =
-            serde_json::to_value(DocsEvent::Opened { id: 1, doc: crate::ids::DocId::generate(), state: DocState::default(), changed_outside: None })
-                .unwrap();
+        assert_eq!(open, DocsRequest::Open { id: 1, path: "a.txt".into(), app: "wordcraft".into(), file_hash: None, identity: false });
+        let plain = serde_json::to_value(DocsEvent::Opened {
+            id: 1,
+            doc: crate::ids::DocId::generate(),
+            state: DocState::default(),
+            changed_outside: None,
+            read_only: false,
+            space: None,
+        })
+        .unwrap();
         assert!(plain.get("changed_outside").is_none(), "none: no field (as an older agent sends it)");
+        assert!(plain.get("read_only").is_none() && plain.get("space").is_none(), "the team fields are left out when they say nothing");
         let not_live = serde_json::to_value(DocsEvent::NotLive { id: 1, reason: NotLiveReason::NotSynced, message: None }).unwrap();
         assert_eq!(not_live, serde_json::json!({ "type": "not_live", "id": 1, "reason": "not_synced", "message": null }));
         let status: DocsEvent =
             serde_json::from_value(serde_json::json!({ "type": "status", "doc": uuid::Uuid::nil(), "online": true, "waiting": 2 })).unwrap();
         assert!(matches!(status, DocsEvent::Status { online: true, waiting: 2, deleted: false, .. }));
+    }
+
+    /// Team spaces on the documents socket: `identity` is asked for, `read_only` and the space come with `opened`, the member
+    /// list names accounts (`self` on the wire), and nothing a debug print shows has a name in it.
+    #[test]
+    fn the_docs_messages_for_team_spaces() {
+        let identity: DocsRequest =
+            serde_json::from_value(serde_json::json!({ "type": "open", "id": 1, "path": "a.txt", "app": "wordcraft", "identity": true })).unwrap();
+        assert!(matches!(identity, DocsRequest::Open { identity: true, .. }));
+        assert!(serde_json::to_value(&identity).unwrap().get("identity").is_some());
+        let space = SpaceId::generate();
+        let opened = DocsEvent::Opened {
+            id: 1,
+            doc: crate::ids::DocId::generate(),
+            state: DocState::default(),
+            changed_outside: None,
+            read_only: true,
+            space: Some(space),
+        };
+        let json = serde_json::to_value(&opened).unwrap();
+        assert_eq!(json.get("read_only"), Some(&serde_json::json!(true)));
+        assert_eq!(json.get("space"), Some(&serde_json::json!(space)));
+        assert_eq!(serde_json::from_value::<DocsEvent>(json).unwrap(), opened);
+        // An older agent's `opened` has neither.
+        let old: DocsEvent = serde_json::from_value(serde_json::json!({
+            "type": "opened", "id": 1, "doc": crate::ids::DocId::generate(), "state": { "online": true, "waiting": 0 }
+        }))
+        .unwrap();
+        assert!(matches!(old, DocsEvent::Opened { read_only: false, space: None, .. }));
+        let user = uuid::Uuid::from_bytes([7; 16]);
+        let members = DocsEvent::Members { id: 3, members: vec![DocMember { user, name: "ana".into(), colour: 4, is_self: true }] };
+        let json = serde_json::to_value(&members).unwrap();
+        assert_eq!(json["members"][0]["self"], serde_json::json!(true), "the wire word is `self`");
+        assert_eq!(json["members"][0]["name"], serde_json::json!("ana"));
+        assert_eq!(serde_json::from_value::<DocsEvent>(json).unwrap(), members);
+        let shown = format!("{members:?}");
+        assert!(!shown.contains("ana"), "a name never reaches a debug print: {shown}");
+        // The binary frame of presence with an identity.
+        assert_eq!(docs::PRESENCE_FROM, 5);
+        let frame = docs::encode_binary(docs::PRESENCE_FROM, 9, &[user.as_bytes().as_slice(), b"cursor"].concat());
+        let (kind, id, body) = docs::decode_binary(&frame).unwrap();
+        assert_eq!((kind, id), (5, 9));
+        assert_eq!(body.split_at(docs::USER_BYTES), (user.as_bytes().as_slice(), b"cursor".as_slice()));
+        // A change an app hands over, and the role that follows `opened`.
+        assert_eq!(docs::HELD, 6);
+        let role = DocsEvent::Role { doc: crate::ids::DocId::generate(), read_only: false };
+        let json = serde_json::to_value(&role).unwrap();
+        assert_eq!(json["type"], serde_json::json!("role"));
+        assert_eq!(serde_json::from_value::<DocsEvent>(json).unwrap(), role);
+    }
+
+    /// A recent entry says who has the file open only when somebody does; an older agent's entry has no such field, and a name
+    /// never reaches a debug print.
+    #[test]
+    fn a_recent_entry_may_say_who_has_it_open() {
+        let older: RecentEntry = serde_json::from_str(r#"{"path":"a.txt","title":"a","opened_ms":1,"machine":"pc"}"#).unwrap();
+        assert!(older.open_now.is_empty());
+        assert!(!serde_json::to_string(&older).unwrap().contains("open_now"), "absent when nobody is there");
+        let there = RecentEntry { open_now: vec![RecentPerson { name: "ben".into(), colour: 3 }], ..older };
+        let json = serde_json::to_value(&there).unwrap();
+        assert_eq!(json["open_now"], serde_json::json!([{ "name": "ben", "colour": 3 }]));
+        assert_eq!(serde_json::from_value::<RecentEntry>(json).unwrap(), there);
+        assert!(!format!("{there:?}").contains("ben"), "a name never reaches a debug print");
+    }
+
+    /// A recents subscription may name a team space; without one it is the personal list, on the wire as before.
+    #[test]
+    fn a_recents_subscription_may_name_a_space() {
+        let personal: RecentsRequest = serde_json::from_value(serde_json::json!({ "type": "subscribe", "app": "wordcraft" })).unwrap();
+        assert_eq!(personal, RecentsRequest::Subscribe { app: "wordcraft".into(), space: None });
+        assert!(serde_json::to_value(&personal).unwrap().get("space").is_none());
+        let space = SpaceId::generate();
+        let team = RecentsRequest::Subscribe { app: "wordcraft".into(), space: Some(space) };
+        assert_eq!(serde_json::from_value::<RecentsRequest>(serde_json::to_value(&team).unwrap()).unwrap(), team);
+        let list = RecentsEvent::Entries { app: "wordcraft".into(), entries: Vec::new(), push_stopped: false, space: Some(space) };
+        assert_eq!(serde_json::to_value(&list).unwrap()["space"], serde_json::json!(space));
+        let personal_list = RecentsEvent::Entries { app: "wordcraft".into(), entries: Vec::new(), push_stopped: false, space: None };
+        assert!(serde_json::to_value(&personal_list).unwrap().get("space").is_none(), "an older client sees what it saw");
     }
 
     #[test]

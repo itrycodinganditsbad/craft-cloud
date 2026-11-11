@@ -62,7 +62,7 @@ never crash, never lose data, no `unsafe`, and how the clean room works.
 |---|---|---|
 | `craft-cloud-proto` | Wire types: names and their rules, IDs, hashes, manifests, commit operations, API bodies, limits, the live protocol's frames, the local API's bodies | done |
 | `craft-cloud-chunker` | FastCDC chunking (`fastcdc-v1`, pinned by golden test vectors) and BLAKE3 hashing | done |
-| `craft-cloud-store` | Chunk storage on disk, S3 or memory; checks every chunk's size and hash on the way in and out | done |
+| `craft-cloud-store` | Chunk storage on disk, S3, SFTP or memory; checks every chunk's size and hash on the way in and out | done |
 | `craft-cloud-meta` | Metadata on SQLite or Postgres: users, devices, the tree, versions, the batch commit, the change feed, live documents and their update logs | done |
 | `craft-cloud-server` | The HTTP API (`/api/v1`), the live service (`/api/v1/live`), authentication, rate limits and the admin CLI | done |
 | `craft-cloud-sync` | The sync engine: compares the folder with the server, uploads, downloads, resolves conflicts | done |

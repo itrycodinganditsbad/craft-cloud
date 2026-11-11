@@ -2,16 +2,36 @@
 //! (`craft-cloud-store`), the live service on a WebSocket ([`live`]), plus the admin command line.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod account;
+pub mod admin;
 pub mod api;
+pub mod audit;
 pub mod auth;
+#[cfg(feature = "sftp")]
+pub mod backup;
+#[cfg(feature = "sftp")]
+pub mod backup_auth;
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod full;
+pub mod gc;
+pub mod health;
 pub mod join;
 pub mod live;
 pub mod notify;
 pub mod ratelimit;
+pub mod secretbox;
+pub mod space;
+pub mod spaces;
 pub mod state;
+pub mod storage_info;
+pub mod storage_tools;
+pub mod totp;
+pub mod two_factor;
+pub mod updates;
+pub mod verify;
+pub mod web;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
