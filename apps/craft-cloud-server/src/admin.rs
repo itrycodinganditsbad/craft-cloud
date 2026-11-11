@@ -215,7 +215,7 @@ struct AdminServerResponse {
 
 async fn server(State(state): State<Shared>) -> Result<Json<AdminServerResponse>, ApiError> {
     let info = server_info(&state).await?;
-    Ok(Json(AdminServerResponse { info, update: state.update_info() }))
+    Ok(Json(AdminServerResponse { info, update: state.update_info().await }))
 }
 
 /// `GET /admin/storage`: bounded account and manifest-index counts, plus the ten largest accounts, and the room the

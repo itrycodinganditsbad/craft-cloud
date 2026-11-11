@@ -185,15 +185,25 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Reads configured update status at most once per minute; file errors never fail an admin page.
-    pub fn update_info(&self) -> Option<crate::updates::UpdateInfo> {
-        let mut cache = self.update_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((at, value)) = &*cache
-            && at.elapsed() < Duration::from_secs(60)
+    /// Reads configured update status at most once per minute; file errors never fail an admin page. The file is
+    /// read on a blocking thread and not while the cache is locked, and a read that does not finish in two seconds
+    /// counts as no status.
+    pub async fn update_info(&self) -> Option<crate::updates::UpdateInfo> {
         {
-            return value.clone();
+            let cache = self.update_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((at, value)) = &*cache
+                && at.elapsed() < Duration::from_secs(60)
+            {
+                return value.clone();
+            }
         }
-        let value = crate::updates::read(&self.updates);
+        let settings = self.updates.clone();
+        let read = tokio::task::spawn_blocking(move || crate::updates::read(&settings));
+        let value = match tokio::time::timeout(Duration::from_secs(2), read).await {
+            Ok(Ok(value)) => value,
+            _ => None,
+        };
+        let mut cache = self.update_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         *cache = Some((std::time::Instant::now(), value.clone()));
         value
     }

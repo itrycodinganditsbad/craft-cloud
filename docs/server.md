@@ -754,33 +754,49 @@ will not start without the key its two-factor secrets were sealed with (see "Two
 The image creates the directory for uid 65532 with mode 0700, so a new named volume gets that owner. A bind mount
 instead of the volume must be prepared first: `chown 65532:65532 DIR && chmod 0700 DIR`.
 
-The browser admin overview can show a GitHub update notice. Docker's `update-check` service contacts only the GitHub
-API for the configured repository; it sends no installation data. The server has no outbound network access and reads
-the checker's status file from a read-only volume. The service starts with a random delay of up to 30 minutes, then
-checks every 12 hours. It writes nothing after a network or response parsing error, preserving the last good result.
+The browser admin overview can show a GitHub update notice. It is opt-in and off by default: nothing contacts GitHub
+unless you turn it on. When it is on, Docker's `update-check` service contacts only the GitHub API for the configured
+repository, with a generic `Craft-Cloud/<version>` User-Agent and no installation data. `install.sh` asks whether to turn
+it on (the answer defaults to no; without a terminal it stays off unless you pass `--update-check`). The server has no
+outbound network access and reads the checker's status file from a read-only volume. The service starts with a random
+delay of up to 30 minutes, then checks every 12 hours. It writes nothing after a network or response parsing error,
+preserving the last good result.
 
-Set these optional values in `.env`:
+Set these values in `.env`:
 
 ```sh
-CC_UPDATE_CHECK=on                 # off disables checking
-CC_UPDATE_REPO=itrycodinganditsbad/craft-cloud
+CC_UPDATE_CHECK=off                # on turns the check on; off (the default) makes no request
+CC_UPDATE_REPO=itrycodinganditsbad/craft-cloud   # also the repository the banner's links point to
 CC_UPDATE_CHANNEL=release          # release or branch
 CC_UPDATE_BRANCH=main              # branch channel only
 CC_INSTALL_DIR=/opt/craft-cloud   # checkout path shown in the command
 ```
 
-After changing update settings, run `docker compose up -d --force-recreate secrets-init` and
+`CC_UPDATE_REPO` is checked as `owner/name` and is written to `[updates] repo` in the rendered config, so the banner
+links to the same repository the checker asks. After changing update settings, run `docker compose up -d --force-recreate secrets-init` and
 `docker compose up -d --force-recreate update-check server` so the rendered config and services use them.
 
-`install.sh` writes its checkout path to `CC_INSTALL_DIR` when it creates `.env`. For a branch check, the server
+`install.sh` writes its checkout path to `CC_INSTALL_DIR` when it creates `.env`; if the path has characters the
+rendered config does not accept, it warns and writes `/path/to/craft-cloud` instead. For a branch check, the server
 compares the latest SHA with the revision embedded at build time. Unknown revisions suppress the notice. A release
 check compares semantic versions. The admin page links to GitHub release notes or the branch comparison and shows
-`cd <install_dir> && ./packaging/docker/update.sh`. Read release notes before running it. The script refuses a dirty
-working tree, asks before it changes anything, pulls with `--ff-only` and builds the new image while the old server
-keeps running, so a failed build changes nothing. Then it stops the server, backs up the data volume (and dumps
-Postgres when configured) into `backups/<time>/`, and starts the new server. It keeps the backup after a failure and
-never rolls back a migrated database automatically.
-`--yes` skips its confirmation. `--skip-backup` is an explicit override and prints a warning.
+`cd <install_dir> && ./packaging/docker/update.sh`. Read release notes before running it.
+
+`update.sh` runs Git at the repository root and every `docker compose` command in `packaging/docker`, where `.env`
+lives; it refuses to run without that `.env`. It works with an owner-only umask (`umask 077`). It refuses a dirty working
+tree and a detached HEAD, fetches, and decides whether there is work by comparing the upstream commit with the
+revision the running server image was built from, so a checkout that is already current but still runs an old image
+(after an interrupted run) is updated too. It asks before it changes anything, then fast-forwards to exactly the
+commit it showed (`git merge --ff-only`), records the new version and revision in `.env`, and builds the new image
+while the old server keeps running, so a failed build leaves the server as it was. Then it stops the server, dumps
+Postgres when configured (the database service keeps running), copies the data volume into `backups/<time>/`, and
+starts the new server. If a step after the merge fails, its message says what has already changed (the source is
+updated, the image rebuilt) and how to go back with `git reset --hard <old commit>` on your branch. The backup stays
+after a failure; a migrated database is never rolled back automatically. `--yes` skips the confirmation.
+`--skip-backup` is an explicit override and prints a warning.
+
+Every update adds a full copy of the data volume, blobs included, to `backups/`. Nothing removes old ones: check the
+free space and delete backups you no longer need.
 
 To upgrade manually, stop the server and back up first. SQLite backup: copy `meta.db*`, `blobs/` and
 `two-factor.key` from the `data` volume. Postgres backup: `pg_dump` from `db`, plus `blobs/` and `two-factor.key`.
@@ -789,7 +805,7 @@ database when it opens it and refuses a database newer than itself, so do not go
 restoring the pre-upgrade backup.
 
 For a plain binary install, use manual upgrades with a backup. `packaging/docker/update-check.sh` checks every 12
-hours on its own, so run it as a long-running service (a systemd unit, not a timer) with `CC_UPDATE_REPO`, `CC_UPDATE_CHANNEL`, `CC_UPDATE_BRANCH`, and
+hours on its own, so run it as a long-running service (a systemd unit, not a timer) with `CC_UPDATE_CHECK=on`, `CC_VERSION` (for the User-Agent), `CC_UPDATE_REPO`, `CC_UPDATE_CHANNEL`, `CC_UPDATE_BRANCH`, and
 `CC_UPDATE_STATUS_DIR` set to a directory writable by the checker and readable by the server. Set the server's
 `[updates].status_file` to `<CC_UPDATE_STATUS_DIR>/status.json`. The checker contacts GitHub's API and sends no
 installation data. Do not grant an updater service root rights: the server must not be able to replace itself.

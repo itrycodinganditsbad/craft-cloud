@@ -4,10 +4,14 @@
 #
 #   ./install.sh [--domain cloud.example.org] [--tls acme|internal|custom] [--email you@example.org]
 #                [--db sqlite|postgres] [--http-port 80] [--https-port 443] [--admin name | --no-admin] [--no-start]
+#                [--update-check]
 #
 # Missing values are asked for when a terminal is attached; without one, --domain is required. The admin's password
 # is read from standard input without echo (or from a pipe: printf '%s\n' "$PASSWORD" | ./install.sh ... --admin you)
 # and goes to the server over a pipe: never into an argument, the environment or a log.
+#
+# The update check (a service that asks api.github.com every 12 hours whether a newer Craft Cloud exists) is off unless
+# you answer y when asked, or pass --update-check. Without a terminal it is off unless --update-check is given.
 #
 # It never overwrites an existing `.env`. It runs from a clone of the repository or an unpacked release archive; it
 # downloads nothing itself (Docker pulls the pinned base images).
@@ -30,6 +34,7 @@ https_port=
 admin=
 no_admin=0
 no_start=0
+update_check=off
 interactive=0
 [ -t 0 ] && interactive=1
 
@@ -56,8 +61,12 @@ while [ $# -gt 0 ]; do
             no_start=1
             shift
             ;;
+        --update-check)
+            update_check=on
+            shift
+            ;;
         -h | --help)
-            sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *) die "unknown option $1 (see --help)" ;;
@@ -111,6 +120,12 @@ if [ "$tls_mode" = acme ] && [ -z "$acme_email" ] && [ "$interactive" -eq 1 ]; t
     IFS= read -r acme_email || acme_email=
 fi
 
+if [ "$update_check" = off ] && [ "$interactive" -eq 1 ]; then
+    printf 'Check GitHub for a newer Craft Cloud every 12 hours? [y/N] '
+    IFS= read -r answer || answer=
+    case $answer in y | Y) update_check=on ;; esac
+fi
+
 printf '%s' "$domain" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$' || die "the domain has characters that are not allowed"
 case $tls_mode in acme | internal | custom) ;; *) die "--tls must be acme, internal or custom" ;; esac
 case $db_kind in sqlite | postgres) ;; *) die "--db must be sqlite or postgres" ;; esac
@@ -140,6 +155,12 @@ version=$(sh ./workspace-version.sh)
 revision=$(git rev-parse HEAD 2>/dev/null || true)
 [ -n "$revision" ] || revision=unknown
 install_dir=$(cd ../.. && pwd)
+# The checkout path is only shown in the update banner, but render-config.sh refuses other characters, which would stop
+# the stack at its first start. Fall back to a placeholder the administrator reads as "your checkout".
+if ! printf '%s' "$install_dir" | grep -Eq '^[A-Za-z0-9._/ -]+$'; then
+    echo "install.sh: warning: the checkout path has characters that the update banner can't show; it will say /path/to/craft-cloud instead." >&2
+    install_dir=/path/to/craft-cloud
+fi
 
 # --- .env ---------------------------------------------------------------------------------------------------------
 # A random password of 40 URL-safe characters (the database password becomes part of a database URL).
@@ -166,6 +187,7 @@ compose_file=compose.yaml
     echo "CC_VERSION=$version"
     echo "CC_REVISION=$revision"
     echo "CC_INSTALL_DIR=$install_dir"
+    echo "CC_UPDATE_CHECK=$update_check"
     if [ "$db_kind" = postgres ]; then
         echo "CC_SECRET_DB_SUPERUSER_PASSWORD=$(random_password)"
         echo "CC_SECRET_DB_PASSWORD=$(random_password)"

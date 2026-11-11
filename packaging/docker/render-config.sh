@@ -9,6 +9,8 @@
 #   DB_KIND         sqlite (default) or postgres
 #   STORAGE_KIND    disk (default) or s3
 #   CC_INSTALL_DIR  checkout path shown in the update command
+#   CC_UPDATE_CHECK on or off (default off): whether the status file is configured
+#   CC_UPDATE_REPO  owner/name of the repository the update banner links to
 #   S3_BUCKET S3_PREFIX S3_REGION S3_ENDPOINT S3_ALLOW_HTTP   with STORAGE_KIND=s3 (bucket and region required)
 # Secrets are read from files in $SECRETS_DIR (default /run/secrets), never from the environment:
 #   db_password                                   with DB_KIND=postgres
@@ -62,7 +64,9 @@ check "CC_INSTALL_DIR" "$install_dir" '^[A-Za-z0-9._/ -]+$'
 
 db_kind=${DB_KIND:-sqlite}
 storage_kind=${STORAGE_KIND:-disk}
-update_check=${CC_UPDATE_CHECK:-on}
+update_repo=${CC_UPDATE_REPO:-itrycodinganditsbad/craft-cloud}
+check "CC_UPDATE_REPO" "$update_repo" '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+update_check=${CC_UPDATE_CHECK:-off}
 case $update_check in
     on) active=" $db_kind $storage_kind updates " ;;
     off) active=" $db_kind $storage_kind " ;;
@@ -140,6 +144,7 @@ while IFS= read -r line || [ -n "$line" ]; do
     replace TRUSTED_PROXY "$trusted_proxy"
     replace PUBLIC_URL "$public_url"
     replace INSTALL_DIR "$install_dir"
+    replace UPDATE_REPO "$update_repo"
     replace DB_PASSWORD "$db_password"
     replace S3_BUCKET "$s3_bucket"
     replace S3_PREFIX "$s3_prefix"

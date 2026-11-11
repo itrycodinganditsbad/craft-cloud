@@ -43,8 +43,8 @@ expect_line 'behind_proxy = true'
 expect_line 'trusted_proxies = ["172.29.215.2"]'
 expect_line 'public_url = "https://cloud.example.org"'
 expect_line '[updates]'
-expect_line 'status_file = "/var/lib/craft-cloud-updates/status.json"'
 expect_line 'install_dir = "/opt/craft-cloud"'
+expect_line 'repo = "itrycodinganditsbad/craft-cloud"'
 expect_line 'url = "sqlite:/var/lib/craft-cloud/meta.db"'
 expect_line 'kind = "disk"'
 expect_line 'path = "/var/lib/craft-cloud/blobs"'
@@ -57,8 +57,16 @@ reject_line 's3'
 reject_line '#sqlite#'
 reject_line "$password"
 
+# The update check is opt-in: without CC_UPDATE_CHECK=on there is no status file.
+reject_line 'status_file ='
 run CC_UPDATE_CHECK=off || fail "updates-off profile failed: $(cat "$work/err")"
 reject_line 'status_file ='
+run CC_UPDATE_CHECK=on || fail "updates-on profile failed: $(cat "$work/err")"
+expect_line 'status_file = "/var/lib/craft-cloud-updates/status.json"'
+# CC_UPDATE_REPO sets the repository the banner links to, with or without the check.
+run CC_UPDATE_REPO=someone/craft-cloud.fork || fail "update repo profile failed: $(cat "$work/err")"
+expect_line 'repo = "someone/craft-cloud.fork"'
+reject_line 'itrycodinganditsbad'
 
 # 2. Postgres.
 run DB_KIND=postgres || fail "postgres profile failed: $(cat "$work/err")"
@@ -103,6 +111,10 @@ refuse 'empty URL' PUBLIC_URL=
 refuse 'network instead of an address' TRUSTED_PROXY=172.29.215.0/24
 refuse 'quote in the proxy' 'TRUSTED_PROXY=1.2.3.4"]'
 refuse 'unknown database' DB_KIND=mysql
+refuse 'bad update check value' CC_UPDATE_CHECK=yes
+refuse 'update repo with a quote' 'CC_UPDATE_REPO=a/b"c'
+refuse 'update repo without a slash' CC_UPDATE_REPO=justaname
+refuse 'update repo with a path' CC_UPDATE_REPO=a/b/c
 refuse 'unknown storage' STORAGE_KIND=ftp
 refuse 'quote in the bucket' STORAGE_KIND=s3 'S3_BUCKET=a"b' S3_REGION=us-east-1
 refuse 's3 without a region' STORAGE_KIND=s3 S3_BUCKET=files

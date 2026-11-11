@@ -344,7 +344,7 @@ pub(super) async fn overview(State(state): State<Shared>, request: Request) -> R
     let server = crate::admin::server_info(&state).await?;
     let storage = state.meta.admin_storage_overview().await?;
     let mut body = heading("Overview");
-    if let Some(update) = state.update_info().filter(|update| update.available) {
+    if let Some(update) = state.update_info().await.filter(|update| update.available) {
         body.push_str(&update_banner(&state.updates, &update));
     }
     body.push_str(&server_health(&server));
@@ -383,7 +383,11 @@ pub(super) async fn overview(State(state): State<Shared>, request: Request) -> R
 
 fn update_banner(settings: &crate::updates::UpdateSettings, update: &crate::updates::UpdateInfo) -> String {
     let summary = if update.channel == "branch" {
-        format!("Newer commit available: {} (you run {})", &update.latest[..7], &update.current[..7])
+        format!(
+            "Newer commit available: {} (you run {})",
+            update.latest.get(..7).unwrap_or(&update.latest),
+            update.current.get(..7).unwrap_or(&update.current)
+        )
     } else {
         format!("Update available: {} (you run {})", update.latest, update.current)
     };

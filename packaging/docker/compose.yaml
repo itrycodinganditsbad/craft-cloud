@@ -38,7 +38,8 @@ services:
       DB_KIND: sqlite
       STORAGE_KIND: disk
       CC_INSTALL_DIR: ${CC_INSTALL_DIR:-/opt/craft-cloud}
-      CC_UPDATE_CHECK: ${CC_UPDATE_CHECK:-on}
+      CC_UPDATE_CHECK: ${CC_UPDATE_CHECK:-off}
+      CC_UPDATE_REPO: ${CC_UPDATE_REPO:-itrycodinganditsbad/craft-cloud}
     volumes:
       - ./secrets-init.sh:/secrets-init.sh:ro
       - ./make-key.sh:/make-key.sh:ro
@@ -134,8 +135,9 @@ services:
     image: alpine:3.22.1@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1
     entrypoint: ["/bin/sh", "/update-check.sh"]
     environment:
-      CC_UPDATE_CHECK: ${CC_UPDATE_CHECK:-on}
+      CC_UPDATE_CHECK: ${CC_UPDATE_CHECK:-off}
       CC_UPDATE_REPO: ${CC_UPDATE_REPO:-itrycodinganditsbad/craft-cloud}
+      CC_VERSION: ${CC_VERSION:-}
       CC_UPDATE_CHANNEL: ${CC_UPDATE_CHANNEL:-release}
       CC_UPDATE_BRANCH: ${CC_UPDATE_BRANCH:-main}
     volumes:
