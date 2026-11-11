@@ -401,7 +401,7 @@ allow the call is `403 read_only`. The server reads the role from the database o
 
 ## The admin pages in the browser
 
-The server can serve admin pages: users, invites and reset codes, a user's devices, team spaces, the audit log and its download, in
+The server can serve admin pages: users, invites and reset codes, a user's devices, team spaces, storage, the audit log and its download, in
 plain server-rendered HTML (no script, no Node, nothing to build). They are **off by default** and only administrators can
 sign in. They do the same things as the admin API with the same confirmation (your password again for every change, and a
 code when your account has two-factor sign-in).
@@ -435,6 +435,13 @@ filesystem space when available, the ten largest accounts and remembered compres
 there with a form; every change requires the admin's password and, when enabled, a second-factor code. Loading the page does
 not run a storage estimate. Account pages show stored bytes, quota and available trash and history estimates; physical size
 and file counts are not currently measured per account.
+
+When a status file from the update check exists (see "Data, upgrading and backups" under Docker), the Overview shows a banner
+when a newer release or commit is available, with a link to its notes and the command that updates a Docker install. The
+server only reads that file. The pages have no button that updates the server.
+
+The pages follow the browser's light or dark setting and fit a phone's width. [`web-admin.md`](web-admin.md) goes through
+each page, with screenshots.
 
 **Behind the proxy.**
 
@@ -533,7 +540,7 @@ server first: agents and apps keep working unchanged, **except that an account t
 with an agent from before this release** (see "Two-factor sign-in"). Then update the desktop package with its matching agent,
 then agents installed on their own. The `init` of a data directory made before this release did not make a key: add one
 with `[two_factor] key_file` in `config.toml` (32 random bytes, owner-only) before anyone sets up two-factor sign-in. A config
-that has the new `[audit]` or `[web_admin]` section is refused by an older server (it rejects unknown settings), so remove the section before
+that has the new `[audit]`, `[web_admin]` or `[updates]` section is refused by an older server (it rejects unknown settings), so remove the section before
 going back to one. To turn the admin pages on after the upgrade: take the backup, start the new server (it migrates), then add
 `[web_admin]` as described above and restart behind the proxy. Several servers on one Postgres database must all run this
 release before any of them is given `[web_admin]`, as for every migration. Likewise a config with `capacity` in `[storage]`
@@ -877,6 +884,7 @@ To set it up by hand, copy `.env.example` to `.env`, fill it in, and run `docker
 | `server` | built from `packaging/docker/Dockerfile` | distroless `cc`, uid 65532, plain HTTP on port 8080 inside the stack |
 | `caddy` | `caddy:2.11-alpine` | the only service with published ports (80 and 443); TLS and the redirect from HTTP |
 | `secrets-init` | `caddy:2.11-alpine` | one-shot, no network: renders `config.toml` and writes the secret files |
+| `update-check` | `alpine` | on `edge` only; asks GitHub every 12 hours for a newer release and writes a status file (see "Data, upgrading and backups") |
 | `db`, `db-init` | `postgres:17-alpine` | only with `compose.postgres.yaml` |
 
 Every base image is pinned by the digest of its multi-arch index, with the tag in a comment next to it. To update
@@ -889,7 +897,7 @@ process limits, and a `noexec` tmpfs for `/tmp`. The exceptions are explained ne
 `secrets-init` (in the Postgres and S3 overlays) is not read-only because Compose writes its secret files into the
 root filesystem.
 
-Three networks keep the parts apart: `edge` (published ports and outbound access, Caddy only), `frontend` (internal;
+Three networks keep the parts apart: `edge` (published ports and outbound access: Caddy and `update-check` only), `frontend` (internal;
 Caddy to the server) and `backend` (internal; the server to Postgres, Caddy is not attached).
 
 ### Configuration and secrets
