@@ -8,7 +8,7 @@ use craft_cloud_proto::live::{AppName, recents_doc};
 use craft_cloud_proto::local::RecentEntry;
 
 fn entry(path: &str, opened_ms: i64) -> RecentEntry {
-    RecentEntry { node: None, path: path.into(), title: path.into(), opened_ms, saved_ms: None, machine: "pc".into() }
+    RecentEntry { node: None, path: path.into(), title: path.into(), opened_ms, saved_ms: None, machine: "pc".into(), open_now: Vec::new() }
 }
 
 fn key(n: u32) -> [u8; 16] {

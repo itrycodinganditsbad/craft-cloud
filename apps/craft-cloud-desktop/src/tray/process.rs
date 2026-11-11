@@ -43,6 +43,11 @@ impl<'a> TrayLoop<'a> {
         (state_of(self.status.as_ref()), paused)
     }
 
+    /// The menu's first line, for the last status asked ([`super::status_line`]).
+    pub fn line(&self) -> String {
+        super::status_line(self.status.as_ref())
+    }
+
     /// Carries out a menu click or a command; `false` once the process should end.
     pub fn handle(&mut self, event: Event) -> bool {
         match event {
@@ -130,7 +135,7 @@ pub fn run() -> ExitCode {
     let mut tray_loop = TrayLoop::new(&agent, &outside);
     loop {
         let (state, paused) = tray_loop.poll();
-        tray.show(state, paused);
+        tray.show(state, paused, &tray_loop.line());
         match rx.recv_timeout(TICK) {
             Ok(event) => {
                 if !tray_loop.handle(event) {
@@ -172,6 +177,7 @@ mod tests {
         let outside = Recorded::default();
         let mut tray = TrayLoop::new(&agent, &outside);
         assert_eq!(tray.poll(), (TrayState::Synced, false));
+        assert_eq!(tray.line(), "Online · Up to date");
         assert!(tray.handle(Event::Show));
         assert!(tray.handle(Event::OpenFolder));
         assert!(tray.handle(Event::Pause));
@@ -187,6 +193,8 @@ mod tests {
         let agent = FakeAgent::new(crate::model::tests::status(true));
         agent.gone.store(true, std::sync::atomic::Ordering::SeqCst);
         let outside = Recorded::default();
-        assert_eq!(TrayLoop::new(&agent, &outside).poll(), (TrayState::NeedsAttention, false));
+        let mut tray = TrayLoop::new(&agent, &outside);
+        assert_eq!(tray.poll(), (TrayState::NeedsAttention, false));
+        assert_eq!(tray.line(), "Needs your attention");
     }
 }

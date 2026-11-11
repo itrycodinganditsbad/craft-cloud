@@ -139,6 +139,8 @@ fn down_text(frame: &ServerFrame) -> String {
         ServerFrame::Compact { upto, .. } => format!("compact upto {upto}"),
         ServerFrame::Snapshot { base, manifest, .. } => format!("snapshot base {base} (manifest {manifest})"),
         ServerFrame::Presence { bytes, .. } => format!("presence ({} bytes)", bytes.len()),
+        ServerFrame::WelcomeSpace { protocol, .. } => format!("welcome space {protocol}"),
+        ServerFrame::PresenceFrom { bytes, .. } => format!("presence from ({} bytes)", bytes.len()),
         ServerFrame::CreatedDocument { kept, .. } => format!("created, kept {kept}"),
     }
 }
@@ -299,6 +301,7 @@ impl Sim {
             opened_ms: self.clock + machine.skew,
             saved_ms: None,
             machine: machine.name.clone(),
+            open_now: Vec::new(),
         };
         let mut key = [0u8; 16];
         key[..8].copy_from_slice(&self.rng.next().to_le_bytes());
@@ -998,7 +1001,7 @@ impl Sim {
 }
 
 fn rogue_entry(path: &str, opened_ms: i64) -> RecentEntry {
-    RecentEntry { node: None, path: path.into(), title: path.into(), opened_ms, saved_ms: None, machine: "rogue".into() }
+    RecentEntry { node: None, path: path.into(), title: path.into(), opened_ms, saved_ms: None, machine: "rogue".into(), open_now: Vec::new() }
 }
 
 fn hex(key: &AddKey) -> String {

@@ -864,7 +864,7 @@ async fn a_craft_save_goes_up_with_its_record() {
     let (outside, ours) = off(move || {
         let docs = c.documents().unwrap();
         let ask = |bytes: &[u8]| {
-            let options = craft_cloud_app::live::OpenOptions { file_hash: Some(*blake3::hash(bytes).as_bytes()) };
+            let options = craft_cloud_app::live::OpenOptions { file_hash: Some(*blake3::hash(bytes).as_bytes()), ..Default::default() };
             match docs.open_with("story.txt", "wordcraft", &options).unwrap() {
                 Opened::Live(d) => d.changed_outside(),
                 _ => panic!("not live"),

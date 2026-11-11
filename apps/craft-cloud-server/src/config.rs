@@ -9,13 +9,35 @@
 //! # live_bytes_per_user = 1_073_741_824         # cap on what one account's live documents hold, in bytes (1 GiB)
 //! # public_url = "https://cloud.example.com"    # where computers reach the server; `user invite` prints it
 //!
+//! # [audit]
+//! # retention_days = 365        # how long security events are kept (1 to 3650); `audit prune` deletes older ones
+//!
+//! # [web_admin]                 # the admin pages under /web, off unless enabled; needs behind_proxy and an https public_url
+//! # enabled = true
+//! # idle_minutes = 480          # a browser session ends after this long unused (5 to 1440)
+//! # absolute_hours = 168        # and at the latest after this long (1 to 720)
+//! # [spaces]                   # team spaces
+//! # team_live_bytes = 4_294_967_296   # cap on what one team space's live documents hold, in bytes (4 GiB)
+//! # [retention]
+//! # trash_days = 30   # how long a deleted file stays in the trash before the server may remove it (1 to 3650)
+//!
 //! [database]
 //! url = "sqlite:/var/lib/craft-cloud/meta.db"   # or postgres://user:pass@host/db
 //!
 //! [storage]
 //! kind = "disk"
 //! path = "/var/lib/craft-cloud/blobs"
-//! # kind = "s3", bucket, prefix, region, endpoint, access_key_id, secret_access_key, allow_http
+//! # capacity = "1 TiB"          # what the store may hold, for the admin's storage overview (needed for S3 to show a size)
+//! # kind = "s3", bucket, prefix, region, endpoint, access_key_id, secret_access_key, allow_http, capacity
+//! # refuse_when_full = true     # refuse new uploads when the disk is down to min_free, or the store holds `capacity` (default off)
+//! # min_free = "1 GiB"          # disk only, with refuse_when_full: the free space to keep (default 1 GiB)
+//! # compression = "zstd"   # or "none": store blobs plain (what a server before compression can read)
+//! # compression_level = 3       # zstd level of new writes, 1 to 19 (an admin can change it while the server runs)
+//! # compression_min_saving = 5  # keep a compressed blob only when it is at least this many percent smaller (1 to 50)
+//!
+//! [two_factor]                  # optional: without it, two-factor sign-in can't be set up
+//! key_file = "two-factor.key"   # 32 random bytes, made by `init`; relative to this file
+//! # key_file_old = "old.key"    # while rotating the key, see `two-factor rekey`
 //! ```
 //!
 //! The server speaks plain HTTP. It refuses to listen anywhere but loopback unless `behind_proxy = true`,
@@ -55,10 +77,63 @@ pub enum ConfigError {
          agent could not tell a full account from a file that is too big. Raise it, or remove it for no cap"
     )]
     StoredBytesCapTooSmall(u64, u32),
+    #[error("retention.trash_days = {0} is not between {MIN_TRASH_DAYS} and {MAX_TRASH_DAYS}")]
+    TrashDays(u32),
     #[error("public_url = {0:?} is not a server address like https://cloud.example.com (a host, an optional port and path, no query)")]
     PublicUrl(String),
     #[error("storage.{0} is missing (set it in the config or the {1} environment variable)")]
     MissingS3Credential(&'static str, &'static str),
+    #[error("audit.retention_days = {0} is out of range: keep security events for {1} to {2} days")]
+    AuditRetention(u32, u32, u32),
+    #[error(
+        "web_admin.enabled = true needs public_url = \"https://host[:port]\" with no path: the browser's cookie is only sent over \
+         HTTPS, and the pages check the Origin of every form against that address"
+    )]
+    WebAdminPublicUrl,
+    #[error(
+        "web_admin.enabled = true needs behind_proxy = true: the server speaks plain HTTP, and the session cookie is marked Secure, \
+         so a TLS reverse proxy must stand in front of it"
+    )]
+    WebAdminNeedsProxy,
+    #[error("updates.repo = {0:?} must be owner/name with letters, digits, '-', '_' or '.'")]
+    UpdatesRepo(String),
+    #[error("web_admin.{0} = {1} is out of range: {2} to {3}")]
+    WebAdminRange(&'static str, u32, u32, u32),
+    #[error("storage.min_free only goes with storage.refuse_when_full = true: without it nothing is refused, so the reserve would mean nothing")]
+    MinFreeWithoutRefusing,
+    #[error(
+        "storage.min_free is for a disk store: an S3 bucket has no free space to measure. Remove it, and set storage.capacity to bound the bucket"
+    )]
+    MinFreeOnS3,
+    #[error(
+        "storage.refuse_when_full = true on an S3 store needs storage.capacity: the bucket has no free space to measure, so the capacity is the only limit there is"
+    )]
+    RefuseOnS3WithoutCapacity,
+}
+
+/// Fewest and most days a deleted node waits in the trash.
+pub const MIN_TRASH_DAYS: u32 = 1;
+pub const MAX_TRASH_DAYS: u32 = 3650;
+/// Days in the trash when `retention.trash_days` is not set.
+pub const DEFAULT_TRASH_DAYS: u32 = 30;
+
+/// `[retention]`: how long things are kept. Only the trash today; nothing is removed by it yet.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionConfig {
+    /// Days a deleted node stays in the trash before the server may remove it for good (shown as `purge_after_ms`).
+    #[serde(default = "default_trash_days")]
+    pub trash_days: u32,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self { trash_days: DEFAULT_TRASH_DAYS }
+    }
+}
+
+fn default_trash_days() -> u32 {
+    DEFAULT_TRASH_DAYS
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -90,12 +165,154 @@ pub struct Config {
     /// trailing slash. Unset: `user invite` prints the bare code and says to put the address in front.
     #[serde(default)]
     pub public_url: Option<String>,
+    /// The security audit log. The section is optional and its defaults are safe.
+    #[serde(default)]
+    pub audit: AuditConfig,
+    /// The admin pages in the browser (`/web`). Off unless the section says `enabled = true`.
+    #[serde(default)]
+    pub web_admin: WebAdminConfig,
+    /// Optional local update status written by an external checker.
+    #[serde(default)]
+    pub updates: UpdatesConfig,
+    #[serde(default)]
+    pub retention: RetentionConfig,
+    /// Limits of team spaces. The section is optional.
+    #[serde(default)]
+    pub spaces: SpacesConfig,
     pub database: DatabaseConfig,
     pub storage: StorageConfig,
+    /// The key for the secrets of two-factor sign-in. Without it two-factor sign-in can't be set up (`503
+    /// two_factor_unavailable`), and a server whose database already holds secrets refuses to start. `init` makes the
+    /// key file and writes this section. The server never makes the key itself: a second server on the same database,
+    /// or a restore without the key, would otherwise seal secrets nobody can open.
+    #[serde(default)]
+    pub two_factor: Option<TwoFactorConfig>,
+    /// The directory the config file is in, which `key_file` paths are relative to. Set by [`Config::load`], never read
+    /// from the file.
+    #[serde(skip)]
+    pub dir: Option<PathBuf>,
+}
+
+/// `[updates]`: reads a local status file; the server makes no network requests.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdatesConfig {
+    #[serde(default)]
+    pub status_file: Option<PathBuf>,
+    #[serde(default)]
+    pub install_dir: Option<String>,
+    #[serde(default = "default_update_repo")]
+    pub repo: String,
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self { status_file: None, install_dir: None, repo: default_update_repo() }
+    }
+}
+
+fn default_update_repo() -> String {
+    "itrycodinganditsbad/craft-cloud".to_owned()
+}
+
+/// `[two_factor]`: where the key for two-factor secrets is.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TwoFactorConfig {
+    /// A file of 32 random bytes (mode 0600; Windows has no equivalent here, keep it out of everyone's reach). A relative
+    /// path is relative to the directory of `config.toml`.
+    pub key_file: PathBuf,
+    /// The key the secrets were sealed with before a rotation: new secrets are sealed with `key_file`, old ones still
+    /// open with this one until `two-factor rekey` has rewritten them. Remove it after that.
+    #[serde(default)]
+    pub key_file_old: Option<PathBuf>,
 }
 
 fn default_live_bytes() -> u64 {
     craft_cloud_meta::DEFAULT_LIVE_BYTES_PER_SPACE
+}
+
+/// `[spaces]`: limits of team spaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpacesConfig {
+    /// The most bytes one team space's live documents may hold together, as `live_bytes_per_user` does for a personal
+    /// space: every update in their logs, compacted ones too. An update that would go over it is refused
+    /// (`quota_exceeded`). Default 4 GiB.
+    #[serde(default = "default_team_live_bytes")]
+    pub team_live_bytes: u64,
+}
+
+impl Default for SpacesConfig {
+    fn default() -> Self {
+        Self { team_live_bytes: default_team_live_bytes() }
+    }
+}
+
+fn default_team_live_bytes() -> u64 {
+    craft_cloud_meta::DEFAULT_TEAM_LIVE_BYTES
+}
+
+/// `[audit]`: how the security audit log is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditConfig {
+    /// Days a security event is kept: `audit prune` deletes older ones, and a write does so now and then (at most once an
+    /// hour). 1 to 3650, default 365. A server that no one writes to keeps expired events until `audit prune` runs.
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u32,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self { retention_days: default_retention_days() }
+    }
+}
+
+fn default_retention_days() -> u32 {
+    365
+}
+
+/// `[web_admin]`: the admin pages in the browser and the lifetimes of their sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebAdminConfig {
+    /// Serve the admin pages under `/web`. Default off: a server that was not told to speak to browsers does not. Needs
+    /// `behind_proxy = true` and an `https://` `public_url` without a path.
+    #[serde(default)]
+    pub enabled: bool,
+    /// A session ends when it was not used for this many minutes: 5 to 1440, default 480 (8 hours).
+    #[serde(default = "default_idle_minutes")]
+    pub idle_minutes: u32,
+    /// A session ends this many hours after sign-in, however busy it is: 1 to 720, default 168 (7 days).
+    #[serde(default = "default_absolute_hours")]
+    pub absolute_hours: u32,
+}
+
+impl Default for WebAdminConfig {
+    fn default() -> Self {
+        Self { enabled: false, idle_minutes: default_idle_minutes(), absolute_hours: default_absolute_hours() }
+    }
+}
+
+fn default_idle_minutes() -> u32 {
+    8 * 60
+}
+
+fn default_absolute_hours() -> u32 {
+    7 * 24
+}
+
+impl WebAdminConfig {
+    /// The idle lifetime of a session in milliseconds.
+    pub fn idle_ms(&self) -> i64 {
+        i64::from(self.idle_minutes) * 60_000
+    }
+
+    /// The absolute lifetime of a session in milliseconds.
+    pub fn absolute_ms(&self) -> i64 {
+        i64::from(self.absolute_hours) * 3_600_000
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize)]
@@ -128,8 +345,33 @@ pub fn redact_url(url: &str) -> String {
 pub enum StorageConfig {
     Disk {
         path: PathBuf,
+        /// How much the store may hold, for the admin's storage overview. Unset: none is shown (the overview has the disk's own size besides).
+        #[serde(default)]
+        capacity: Option<Capacity>,
+        /// Refuse new uploads (`507 server_full`) when the filesystem would be left with less than `min_free`, or the store
+        /// would hold more than `capacity`. Default off: the numbers are information only.
+        #[serde(default)]
+        refuse_when_full: bool,
+        /// The free space to keep on the store's filesystem while `refuse_when_full` is on. Default 1 GiB.
+        #[serde(default, deserialize_with = "min_free_size")]
+        min_free: Option<Capacity>,
+        #[serde(default)]
+        compression: Compression,
+        #[serde(default)]
+        compression_level: CompressionLevel,
+        #[serde(default)]
+        compression_min_saving: MinSaving,
     },
     S3 {
+        /// How much the bucket may hold, for the admin's storage overview. S3 has no size to ask for, so unset: none is shown.
+        #[serde(default)]
+        capacity: Option<Capacity>,
+        /// Refuse new uploads (`507 server_full`) when the store would hold more than `capacity` (which it then needs).
+        #[serde(default)]
+        refuse_when_full: bool,
+        /// Not for S3; read only to say so.
+        #[serde(default, deserialize_with = "min_free_size")]
+        min_free: Option<Capacity>,
         bucket: String,
         #[serde(default)]
         prefix: String,
@@ -143,7 +385,175 @@ pub enum StorageConfig {
         secret_access_key: Option<Secret>,
         #[serde(default)]
         allow_http: bool,
+        #[serde(default)]
+        compression: Compression,
+        #[serde(default)]
+        compression_level: CompressionLevel,
+        #[serde(default)]
+        compression_min_saving: MinSaving,
     },
+}
+
+/// A size in bytes written as `"1 TiB"`: a whole number or one with one decimal, then B, KB, MB, GB, TB (powers of 1000)
+/// or KiB, MiB, GiB, TiB (powers of 1024), in any case, with or without a space. Or a plain positive integer, in bytes.
+/// At least one byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capacity(pub u64);
+
+impl Capacity {
+    /// Reads `text` as a size, or says what is wrong with it.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        Self::parse_as(text, "storage.capacity")
+    }
+
+    /// [`Capacity::parse`] for the setting `field`, which the messages name.
+    pub fn parse_as(text: &str, field: &str) -> Result<Self, String> {
+        let bad = || {
+            format!(
+                "{field} = {text:?} is not a size like \"1 TiB\" or \"500 GB\" (a number with at most one decimal, then B, KB, MB, GB, TB, KiB, MiB, GiB or TiB)"
+            )
+        };
+        let trimmed = text.trim();
+        // A plain whole number is bytes.
+        if !trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit()) {
+            let bytes: u64 = trimmed.parse().map_err(|_| format!("{field} = {text:?} is too big (the most is about 16 EiB)"))?;
+            return if bytes == 0 { Err(format!("{field} = {text:?} is empty: give a size like \"1 TiB\"")) } else { Ok(Self(bytes)) };
+        }
+        let split = trimmed.find(|c: char| !(c.is_ascii_digit() || c == '.')).ok_or_else(bad)?;
+        let (number, unit) = trimmed.split_at(split);
+        let multiplier: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+            "b" => 1,
+            "kb" => 1_000,
+            "mb" => 1_000_000,
+            "gb" => 1_000_000_000,
+            "tb" => 1_000_000_000_000,
+            "kib" => 1 << 10,
+            "mib" => 1 << 20,
+            "gib" => 1 << 30,
+            "tib" => 1 << 40,
+            _ => return Err(bad()),
+        };
+        let (whole, tenth) = match number.split_once('.') {
+            Some((whole, tenth)) if tenth.len() == 1 => (whole, tenth),
+            Some(_) => return Err(bad()),
+            None => (number, "0"),
+        };
+        if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) || !tenth.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(bad());
+        }
+        let whole: u64 = whole.parse().map_err(|_| bad())?;
+        let tenth: u64 = tenth.parse().map_err(|_| bad())?;
+        // The decimal is a tenth of the unit, rounded down to a byte.
+        let bytes = whole
+            .checked_mul(multiplier)
+            .and_then(|b| b.checked_add(multiplier / 10 * tenth + (multiplier % 10) * tenth / 10))
+            .ok_or_else(|| format!("{field} = {text:?} is too big (the most is about 16 EiB)"))?;
+        if bytes == 0 {
+            return Err(format!("{field} = {text:?} is empty: give a size like \"1 TiB\""));
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl<'de> Deserialize<'de> for Capacity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(SizeVisitor("storage.capacity"))
+    }
+}
+
+/// Reads `storage.min_free` as a size, naming that setting in its messages.
+fn min_free_size<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Capacity>, D::Error> {
+    deserializer.deserialize_any(SizeVisitor("storage.min_free")).map(Some)
+}
+
+/// A size as text or a number of bytes, for the setting it names.
+struct SizeVisitor(&'static str);
+
+impl serde::de::Visitor<'_> for SizeVisitor {
+    type Value = Capacity;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a size like \"1 TiB\" or a number of bytes")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Capacity, E> {
+        Capacity::parse_as(text, self.0).map_err(E::custom)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, bytes: u64) -> Result<Capacity, E> {
+        Capacity::parse_as(&bytes.to_string(), self.0).map_err(E::custom)
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, bytes: i64) -> Result<Capacity, E> {
+        Capacity::parse_as(&bytes.to_string(), self.0).map_err(E::custom)
+    }
+}
+
+/// The zstd level of new writes (`compression_level` in `[storage]`): 1 to 19, 3 by default. 20 to 22 are refused:
+/// they use windows the store's reader does not accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressionLevel(pub u8);
+
+impl Default for CompressionLevel {
+    fn default() -> Self {
+        Self(craft_cloud_store::DEFAULT_ZSTD_LEVEL)
+    }
+}
+
+impl<'de> Deserialize<'de> for CompressionLevel {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let n = i64::deserialize(deserializer)?;
+        match u8::try_from(n) {
+            Ok(level) if (craft_cloud_store::MIN_ZSTD_LEVEL..=craft_cloud_store::MAX_ZSTD_LEVEL).contains(&level) => Ok(Self(level)),
+            _ => Err(serde::de::Error::custom(format!(
+                "compression_level = {n} is not a zstd level this server writes: use a whole number from {} to {}",
+                craft_cloud_store::MIN_ZSTD_LEVEL,
+                craft_cloud_store::MAX_ZSTD_LEVEL
+            ))),
+        }
+    }
+}
+
+/// How much smaller a compressed blob must be to be kept (`compression_min_saving` in `[storage]`): 1 to 50 percent,
+/// 5 by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MinSaving(pub u8);
+
+impl Default for MinSaving {
+    fn default() -> Self {
+        Self(craft_cloud_store::DEFAULT_MIN_SAVING_PERCENT)
+    }
+}
+
+impl<'de> Deserialize<'de> for MinSaving {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let n = i64::deserialize(deserializer)?;
+        match u8::try_from(n) {
+            Ok(percent) if (1..=50).contains(&percent) => Ok(Self(percent)),
+            _ => Err(serde::de::Error::custom(format!("compression_min_saving = {n} is not a percentage from 1 to 50"))),
+        }
+    }
+}
+
+/// How blobs are written to storage (`compression` in `[storage]`). Reading understands both either way, so turning
+/// it off later leaves compressed blobs readable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Compression {
+    /// zstd where it saves at least 5% (the default).
+    #[default]
+    Zstd,
+    /// Every blob plain.
+    None,
+}
+
+impl From<Compression> for craft_cloud_store::Compression {
+    fn from(compression: Compression) -> Self {
+        match compression {
+            Compression::Zstd => craft_cloud_store::Compression::Zstd,
+            Compression::None => craft_cloud_store::Compression::None,
+        }
+    }
 }
 
 fn default_region() -> String {
@@ -164,7 +574,19 @@ impl std::fmt::Debug for Secret {
 impl Config {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read { path: path.to_owned(), source })?;
-        Self::parse(&text)
+        let mut config = Self::parse(&text)?;
+        // A relative path to the config file has a parent too, possibly empty: that is the working directory.
+        config.dir = Some(path.parent().map(Path::to_owned).unwrap_or_default());
+        Ok(config)
+    }
+
+    /// `path` of a `[two_factor]` key file as the server opens it: relative paths are relative to the config file's
+    /// directory (when the config was loaded from a file).
+    pub fn key_path(&self, path: &Path) -> PathBuf {
+        match (&self.dir, path.is_absolute()) {
+            (Some(dir), false) => dir.join(path),
+            _ => path.to_owned(),
+        }
     }
 
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
@@ -186,9 +608,47 @@ impl Config {
         {
             return Err(ConfigError::StoredBytesCapTooSmall(cap, MAX_CHUNK_BYTES));
         }
+        if !(craft_cloud_meta::MIN_RETENTION_DAYS..=craft_cloud_meta::MAX_RETENTION_DAYS).contains(&config.audit.retention_days) {
+            return Err(ConfigError::AuditRetention(
+                config.audit.retention_days,
+                craft_cloud_meta::MIN_RETENTION_DAYS,
+                craft_cloud_meta::MAX_RETENTION_DAYS,
+            ));
+        }
+        let web = &config.web_admin;
+        for (name, value, low, high) in [("idle_minutes", web.idle_minutes, 5, 1440), ("absolute_hours", web.absolute_hours, 1, 720)] {
+            if !(low..=high).contains(&value) {
+                return Err(ConfigError::WebAdminRange(name, value, low, high));
+            }
+        }
+        // The repository goes into links on the admin pages, so it is held to GitHub's name characters.
+        let repo_part = |part: &str| !part.is_empty() && part.len() <= 100 && part.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
+        if !config.updates.repo.split_once('/').is_some_and(|(owner, name)| repo_part(owner) && repo_part(name)) {
+            return Err(ConfigError::UpdatesRepo(config.updates.repo.clone()));
+        }
+        if !(MIN_TRASH_DAYS..=MAX_TRASH_DAYS).contains(&config.retention.trash_days) {
+            return Err(ConfigError::TrashDays(config.retention.trash_days));
+        }
+        // The same rule as `ignore_forwarded_for`: a setting that would do nothing is refused, not ignored.
+        match &config.storage {
+            StorageConfig::Disk { refuse_when_full: false, min_free: Some(_), .. } => return Err(ConfigError::MinFreeWithoutRefusing),
+            StorageConfig::S3 { min_free: Some(_), .. } => return Err(ConfigError::MinFreeOnS3),
+            StorageConfig::S3 { refuse_when_full: true, capacity: None, .. } => return Err(ConfigError::RefuseOnS3WithoutCapacity),
+            _ => {}
+        }
         let mut config = config;
         if let Some(url) = &config.public_url {
             config.public_url = Some(public_url(url)?);
+        }
+        if config.web_admin.enabled {
+            // The pages' address is an origin: https, a host and maybe a port, and no path to put in front of `/web`.
+            let origin_only = config.public_url.as_deref().and_then(|url| url.strip_prefix("https://")).is_some_and(|rest| !rest.contains('/'));
+            if !origin_only {
+                return Err(ConfigError::WebAdminPublicUrl);
+            }
+            if !config.behind_proxy {
+                return Err(ConfigError::WebAdminNeedsProxy);
+            }
         }
         Ok(config)
     }
@@ -218,10 +678,51 @@ fn describe_toml_error(text: &str, e: &toml::de::Error) -> String {
 }
 
 impl StorageConfig {
+    /// The size the config says the store may hold, in bytes.
+    pub fn capacity(&self) -> Option<u64> {
+        match self {
+            StorageConfig::Disk { capacity, .. } | StorageConfig::S3 { capacity, .. } => capacity.map(|c| c.0),
+        }
+    }
+
+    /// When the server refuses uploads because it is full (`refuse_when_full`), and where: `None` while the setting is off.
+    pub fn full_policy(&self) -> Option<crate::full::Policy> {
+        match self {
+            StorageConfig::Disk { refuse_when_full: true, min_free, capacity, .. } => {
+                Some(crate::full::Policy { capacity: capacity.map(|c| c.0), min_free: Some(min_free.map_or(crate::full::DEFAULT_MIN_FREE, |m| m.0)) })
+            }
+            StorageConfig::S3 { refuse_when_full: true, capacity, .. } => {
+                Some(crate::full::Policy { capacity: capacity.map(|c| c.0), min_free: None })
+            }
+            _ => None,
+        }
+    }
+
+    /// How blobs are written, whichever backend holds them.
+    pub fn compression(&self) -> Compression {
+        match self {
+            StorageConfig::Disk { compression, .. } | StorageConfig::S3 { compression, .. } => *compression,
+        }
+    }
+
+    /// The zstd level new writes use unless an admin changed it while the server runs.
+    pub fn compression_level(&self) -> u8 {
+        match self {
+            StorageConfig::Disk { compression_level, .. } | StorageConfig::S3 { compression_level, .. } => compression_level.0,
+        }
+    }
+
+    /// How much smaller (percent) a compressed blob must be to be kept.
+    pub fn compression_min_saving(&self) -> u8 {
+        match self {
+            StorageConfig::Disk { compression_min_saving, .. } | StorageConfig::S3 { compression_min_saving, .. } => compression_min_saving.0,
+        }
+    }
+
     /// The S3 settings, with credentials from the config or else the standard `AWS_ACCESS_KEY_ID` /
     /// `AWS_SECRET_ACCESS_KEY` environment variables. `None` for disk storage.
     pub fn s3(&self) -> Result<Option<S3Config>, ConfigError> {
-        let StorageConfig::S3 { bucket, prefix, region, endpoint, access_key_id, secret_access_key, allow_http } = self else {
+        let StorageConfig::S3 { bucket, prefix, region, endpoint, access_key_id, secret_access_key, allow_http, .. } = self else {
             return Ok(None);
         };
         let access_key_id = match access_key_id {
@@ -264,9 +765,171 @@ path = "/tmp/blobs"
         let c = Config::parse(DISK).unwrap();
         assert_eq!(c.listen, "127.0.0.1:8080".parse().unwrap());
         assert!(!c.behind_proxy && c.trusted_proxies.is_empty());
-        assert_eq!(c.storage, StorageConfig::Disk { path: "/tmp/blobs".into() });
+        assert_eq!(
+            c.storage,
+            StorageConfig::Disk {
+                path: "/tmp/blobs".into(),
+                capacity: None,
+                refuse_when_full: false,
+                min_free: None,
+                compression: Compression::Zstd,
+                compression_level: CompressionLevel(3),
+                compression_min_saving: MinSaving(5)
+            }
+        );
         assert_eq!(c.storage.s3().unwrap(), None);
         assert_eq!(c.public_url, None);
+    }
+
+    #[test]
+    fn the_capacity_is_optional_and_reads_sizes() {
+        assert_eq!(Config::parse(DISK).unwrap().storage.capacity(), None, "a config from before the option still loads");
+        let with = |value: &str| {
+            Config::parse(&DISK.replace(
+                "path = \"/tmp/blobs\"",
+                &format!(
+                    "path = \"/tmp/blobs\"
+capacity = {value}"
+                ),
+            ))
+        };
+        let bytes = |value: &str| with(value).unwrap().storage.capacity();
+        assert_eq!(bytes("\"1 TiB\""), Some(1 << 40));
+        assert_eq!(bytes("1000"), Some(1000), "an integer is bytes");
+        assert_eq!(bytes("\"1000\""), Some(1000));
+        assert_eq!(bytes("1_099_511_627_776"), Some(1 << 40));
+        assert_eq!(bytes("\"1TiB\""), Some(1 << 40));
+        assert_eq!(bytes("\"500 gb\""), Some(500_000_000_000));
+        assert_eq!(bytes("\"2 TB\""), Some(2_000_000_000_000));
+        assert_eq!(bytes("\"1.5 TB\""), Some(1_500_000_000_000));
+        assert_eq!(bytes("\"0.5 GiB\""), Some(1 << 29));
+        assert_eq!(bytes("\"1.5 KiB\""), Some(1536));
+        assert_eq!(bytes("\"64 B\""), Some(64));
+        assert_eq!(bytes("\"3 KB\""), Some(3000));
+        assert_eq!(bytes("\"2 MiB\""), Some(2 << 20));
+        assert_eq!(bytes("\"1 MB\""), Some(1_000_000));
+        assert_eq!(bytes("\"1 KiB\""), Some(1024));
+        assert_eq!(bytes("\"1 GB\""), Some(1_000_000_000));
+        assert_eq!(bytes("\"1 GiB\""), Some(1 << 30));
+        for bad in [
+            "\"\"",
+            "\"1.5\"",
+            "0",
+            "-5",
+            "1.5",
+            "\"-5\"",
+            "\"TiB\"",
+            "\"1 XB\"",
+            "\"1.25 TB\"",
+            "\"1. TB\"",
+            "\".5 TB\"",
+            "\"-1 TB\"",
+            "\"1e3 GB\"",
+            "\"0 B\"",
+            "\"0.0 TB\"",
+            "\"99999999 TiB\"",
+            "true",
+        ] {
+            assert!(matches!(with(bad), Err(ConfigError::Parse(_))), "{bad}");
+        }
+        let shown = with("\"1 XB\"").unwrap_err().to_string();
+        assert!(shown.contains("storage.capacity") && shown.contains("1 XB") && shown.contains("line"), "{shown}");
+        // S3 takes it too; without it S3 shows no size.
+        let s3 = "listen = \"127.0.0.1:8080\"
+[database]
+url = \"sqlite:/tmp/meta.db\"
+[storage]
+kind = \"s3\"
+bucket = \"b\"
+";
+        assert_eq!(Config::parse(s3).unwrap().storage.capacity(), None);
+        assert_eq!(
+            Config::parse(&format!(
+                "{s3}capacity = \"10 TB\"
+"
+            ))
+            .unwrap()
+            .storage
+            .capacity(),
+            Some(10_000_000_000_000)
+        );
+    }
+
+    #[test]
+    fn refusing_uploads_when_full_is_off_unless_asked_and_checked() {
+        let disk = |extra: &str| {
+            Config::parse(&DISK.replace(
+                "path = \"/tmp/blobs\"",
+                &format!(
+                    "path = \"/tmp/blobs\"
+{extra}"
+                ),
+            ))
+        };
+        let s3 = |extra: &str| {
+            Config::parse(&format!(
+                "listen = \"127.0.0.1:8080\"
+[database]
+url = \"sqlite:/tmp/meta.db\"
+[storage]
+kind = \"s3\"
+bucket = \"b\"
+{extra}
+"
+            ))
+        };
+        use crate::full::{DEFAULT_MIN_FREE, Policy};
+        assert_eq!(Config::parse(DISK).unwrap().storage.full_policy(), None, "off by default");
+        assert_eq!(disk("refuse_when_full = false").unwrap().storage.full_policy(), None);
+        assert_eq!(
+            disk("refuse_when_full = true").unwrap().storage.full_policy(),
+            Some(Policy { capacity: None, min_free: Some(DEFAULT_MIN_FREE) }),
+            "a disk keeps 1 GiB by default"
+        );
+        assert_eq!(
+            disk(
+                "refuse_when_full = true
+min_free = \"5 GB\"
+capacity = \"1 TB\""
+            )
+            .unwrap()
+            .storage
+            .full_policy(),
+            Some(Policy { capacity: Some(1_000_000_000_000), min_free: Some(5_000_000_000) })
+        );
+        assert_eq!(
+            s3("refuse_when_full = true
+capacity = \"1 TB\"")
+            .unwrap()
+            .storage
+            .full_policy(),
+            Some(Policy { capacity: Some(1_000_000_000_000), min_free: None })
+        );
+        // Settings that would do nothing, or can't work, are refused.
+        assert!(matches!(disk("min_free = \"1 GiB\""), Err(ConfigError::MinFreeWithoutRefusing)));
+        assert!(matches!(s3("refuse_when_full = true"), Err(ConfigError::RefuseOnS3WithoutCapacity)));
+        assert!(matches!(
+            s3("refuse_when_full = true
+capacity = \"1 TB\"
+min_free = \"1 GB\""),
+            Err(ConfigError::MinFreeOnS3)
+        ));
+        // A bad reserve names its own setting.
+        let shown = disk(
+            "refuse_when_full = true
+min_free = \"lots\"",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(shown.contains("storage.min_free") && !shown.contains("storage.capacity"), "{shown}");
+        assert!(matches!(
+            disk(
+                "refuse_when_full = true
+min_free = 0"
+            ),
+            Err(ConfigError::Parse(_))
+        ));
+        assert!(matches!(disk("refuse_when_full = \"yes\""), Err(ConfigError::Parse(_))));
     }
 
     #[test]
@@ -300,6 +963,11 @@ path = "/tmp/blobs"
         assert_eq!(Config::parse(DISK).unwrap().live_bytes_per_user, 1 << 30, "1 GiB by default");
         assert_eq!(Config::parse(&format!("live_bytes_per_user = 5_000_000\n{DISK}")).unwrap().live_bytes_per_user, 5_000_000);
         assert!(matches!(Config::parse(&format!("live_bytes_per_user = -1\n{DISK}")), Err(ConfigError::Parse(_))));
+        // A team space has a cap of its own (4 GiB by default) in the optional [spaces] section.
+        assert_eq!(Config::parse(DISK).unwrap().spaces.team_live_bytes, 4 << 30, "4 GiB by default");
+        assert_eq!(Config::parse(&format!("{DISK}\n[spaces]\nteam_live_bytes = 7_000_000\n")).unwrap().spaces.team_live_bytes, 7_000_000);
+        assert!(matches!(Config::parse(&format!("{DISK}\n[spaces]\nteam_live_bytes = -1\n")), Err(ConfigError::Parse(_))));
+        assert!(matches!(Config::parse(&format!("{DISK}\n[spaces]\nteam_stored = 1\n")), Err(ConfigError::Parse(_))), "unknown keys are refused");
     }
 
     #[test]
@@ -324,8 +992,170 @@ path = "/tmp/blobs"
     }
 
     #[test]
+    fn the_audit_section_is_optional_and_checked() {
+        assert_eq!(Config::parse(DISK).unwrap().audit.retention_days, 365, "a year by default");
+        let with = |section: &str| Config::parse(&format!("{DISK}\n{section}\n"));
+        assert_eq!(with("[audit]").unwrap().audit.retention_days, 365);
+        assert_eq!(with("[audit]\nretention_days = 30").unwrap().audit.retention_days, 30);
+        for days in [1, 3650] {
+            assert_eq!(with(&format!("[audit]\nretention_days = {days}")).unwrap().audit.retention_days, days);
+        }
+        for days in ["0", "3651", "-1", "\"30\"", "1.5"] {
+            assert!(with(&format!("[audit]\nretention_days = {days}")).is_err(), "{days}");
+        }
+        assert!(matches!(with("[audit]\nretention_days = 0"), Err(ConfigError::AuditRetention(0, 1, 3650))));
+        assert!(matches!(with("[audit]\nkeep = 5"), Err(ConfigError::Parse(_))), "unknown keys are refused");
+    }
+
+    #[test]
+    fn the_web_admin_is_off_by_default_and_checked_when_on() {
+        let c = Config::parse(DISK).unwrap();
+        assert_eq!(c.web_admin, WebAdminConfig { enabled: false, idle_minutes: 480, absolute_hours: 168 }, "off, 8 hours idle, 7 days at most");
+        assert_eq!((c.web_admin.idle_ms(), c.web_admin.absolute_ms()), (8 * 3_600_000, 7 * 24 * 3_600_000));
+        let proxied = DISK.replace("127.0.0.1:8080", "0.0.0.0:8080");
+        let with = |top: &str, section: &str| Config::parse(&format!("{top}\n{proxied}\n[web_admin]\n{section}\n"));
+        let proxy = "behind_proxy = true\ntrusted_proxies = [\"10.0.0.1\"]";
+        let good = format!("{proxy}\npublic_url = \"https://cloud.example.com\"");
+        let c = with(&good, "enabled = true\nidle_minutes = 30\nabsolute_hours = 12").unwrap();
+        assert_eq!((c.web_admin.enabled, c.web_admin.idle_minutes, c.web_admin.absolute_hours), (true, 30, 12));
+        // Each missing piece of the setup is refused with its own message.
+        assert!(matches!(with(proxy, "enabled = true"), Err(ConfigError::WebAdminPublicUrl)), "no public_url");
+        for url in ["http://cloud.example.com", "https://cloud.example.com/cloud"] {
+            let bad = format!("{proxy}\npublic_url = \"{url}\"");
+            assert!(matches!(with(&bad, "enabled = true"), Err(ConfigError::WebAdminPublicUrl)), "{url}");
+        }
+        let no_proxy = format!("public_url = \"https://cloud.example.com\"\n{DISK}\n[web_admin]\nenabled = true\n");
+        assert!(matches!(Config::parse(&no_proxy), Err(ConfigError::WebAdminNeedsProxy)));
+        // Off, none of it matters; the lifetimes are always in range; unknown keys are errors.
+        assert!(!Config::parse(&format!("{DISK}\n[web_admin]\nenabled = false\n")).unwrap().web_admin.enabled);
+        for section in ["idle_minutes = 4", "idle_minutes = 1441", "absolute_hours = 0", "absolute_hours = 721"] {
+            assert!(matches!(Config::parse(&format!("{DISK}\n[web_admin]\n{section}\n")), Err(ConfigError::WebAdminRange(..))), "{section}");
+        }
+        assert!(matches!(Config::parse(&format!("{DISK}\n[web_admin]\ncookie = 1\n")), Err(ConfigError::Parse(_))));
+    }
+
+    #[test]
+    fn the_trash_period_has_a_default_and_bounds() {
+        assert_eq!(Config::parse(DISK).unwrap().retention, RetentionConfig { trash_days: 30 });
+        // A table has to come after the top-level keys, so the section goes at the end.
+        let at_end = |days: &str| Config::parse(&format!("{DISK}\n[retention]\ntrash_days = {days}\n"));
+        assert_eq!(at_end("1").unwrap().retention.trash_days, 1);
+        assert_eq!(at_end("3650").unwrap().retention.trash_days, 3650);
+        for bad in ["0", "3651", "-1", "\"30\"", "1.5"] {
+            assert!(at_end(bad).is_err(), "{bad}");
+        }
+        assert!(matches!(at_end("0"), Err(ConfigError::TrashDays(0))));
+        assert!(matches!(at_end("3651"), Err(ConfigError::TrashDays(3651))));
+        // Nothing but `trash_days` is accepted in the section, and the section may be empty.
+        assert!(matches!(Config::parse(&format!("{DISK}\n[retention]\ngc_wait_hours = 24\n")), Err(ConfigError::Parse(_))));
+        assert_eq!(Config::parse(&format!("{DISK}\n[retention]\n")).unwrap().retention.trash_days, 30);
+    }
+
+    #[test]
+    fn compression_is_zstd_unless_turned_off() {
+        assert_eq!(Config::parse(DISK).unwrap().storage.compression(), Compression::Zstd);
+        let with = |value: &str| {
+            Config::parse(&format!(
+                "{DISK}compression = {value}
+"
+            ))
+        };
+        assert_eq!(with("\"zstd\"").unwrap().storage.compression(), Compression::Zstd);
+        assert_eq!(with("\"none\"").unwrap().storage.compression(), Compression::None);
+        assert_eq!(craft_cloud_store::Compression::from(Compression::None), craft_cloud_store::Compression::None);
+        let Err(ConfigError::Parse(message)) = with("\"gzip\"") else { panic!("an unknown compression must be refused") };
+        assert!(message.contains("gzip") && message.contains("zstd") && message.contains("none"), "{message}");
+        assert!(message.contains("line"), "{message}");
+        let s3 = "listen = \"127.0.0.1:9000\"
+[database]
+url = \"sqlite:/tmp/m.db\"
+[storage]
+kind = \"s3\"
+bucket = \"b\"
+compression = \"none\"
+";
+        assert_eq!(Config::parse(s3).unwrap().storage.compression(), Compression::None);
+    }
+
+    #[test]
+    fn the_compression_level_and_min_saving_have_defaults_and_ranges() {
+        let c = Config::parse(DISK).unwrap();
+        assert_eq!((c.storage.compression_level(), c.storage.compression_min_saving()), (3, 5));
+        let with = |lines: &str| {
+            Config::parse(&format!(
+                "{DISK}{lines}
+"
+            ))
+        };
+        assert_eq!(with("compression_level = 1").unwrap().storage.compression_level(), 1);
+        assert_eq!(with("compression_level = 19").unwrap().storage.compression_level(), 19);
+        assert_eq!(with("compression_min_saving = 50").unwrap().storage.compression_min_saving(), 50);
+        // The level and "none" are independent settings: "none" is read as "none" whatever the level.
+        let both = with(
+            "compression = \"none\"
+compression_level = 19",
+        )
+        .unwrap();
+        assert_eq!((both.storage.compression(), both.storage.compression_level()), (Compression::None, 19));
+        for bad in [
+            "compression_level = 0",
+            "compression_level = 20",
+            "compression_level = 22",
+            "compression_level = -3",
+            "compression_level = 3.5",
+            "compression_level = \"high\"",
+            "compression_level = 300",
+        ] {
+            let Err(ConfigError::Parse(message)) = with(bad) else { panic!("{bad} must be refused") };
+            assert!(message.contains("line"), "{bad}: {message}");
+        }
+        let Err(ConfigError::Parse(message)) = with("compression_level = 25") else { panic!("refused") };
+        assert!(message.contains("1 to 19") && message.contains("25"), "{message}");
+        for bad in ["compression_min_saving = 0", "compression_min_saving = 51", "compression_min_saving = -1"] {
+            let Err(ConfigError::Parse(message)) = with(bad) else { panic!("{bad} must be refused") };
+            assert!(message.contains("line") && message.contains("1 to 50"), "{bad}: {message}");
+        }
+        let s3 = "listen = \"127.0.0.1:9000\"
+[database]
+url = \"sqlite:/tmp/m.db\"
+[storage]
+kind = \"s3\"
+bucket = \"b\"
+compression_level = 9
+compression_min_saving = 10
+";
+        let c = Config::parse(s3).unwrap();
+        assert_eq!((c.storage.compression_level(), c.storage.compression_min_saving()), (9, 10));
+    }
+
+    #[test]
     fn unknown_keys_are_errors() {
         assert!(matches!(Config::parse(&format!("lisen = 1\n{DISK}")), Err(ConfigError::Parse(_))));
+    }
+
+    #[test]
+    fn the_two_factor_section_is_optional_and_strict() {
+        assert_eq!(Config::parse(DISK).unwrap().two_factor, None, "a config from before two-factor sign-in still loads");
+        let with = |section: &str| Config::parse(&format!("{DISK}\n[two_factor]\n{section}\n"));
+        let c = with("key_file = \"two-factor.key\"").unwrap();
+        assert_eq!(c.two_factor, Some(TwoFactorConfig { key_file: "two-factor.key".into(), key_file_old: None }));
+        let c = with("key_file = \"new.key\"\nkey_file_old = \"old.key\"").unwrap();
+        assert_eq!(c.two_factor.unwrap().key_file_old, Some("old.key".into()));
+        assert!(matches!(with("key_file = \"k\"\nkey = \"x\""), Err(ConfigError::Parse(_))), "an unknown key in the section");
+        assert!(matches!(with("key_file_old = \"old.key\""), Err(ConfigError::Parse(_))), "key_file is required");
+    }
+
+    #[test]
+    fn key_files_are_relative_to_the_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, format!("{DISK}\n[two_factor]\nkey_file = \"two-factor.key\"\n")).unwrap();
+        let c = Config::load(&path).unwrap();
+        assert_eq!(c.key_path(Path::new("two-factor.key")), dir.path().join("two-factor.key"));
+        let absolute = dir.path().join("elsewhere.key");
+        assert_eq!(c.key_path(&absolute), absolute);
+        // A config that was parsed from text has no directory: the path stays as it is.
+        assert_eq!(Config::parse(DISK).unwrap().key_path(Path::new("k")), PathBuf::from("k"));
     }
 
     #[test]
