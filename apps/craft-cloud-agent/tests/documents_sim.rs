@@ -82,6 +82,8 @@ fn down_text(frame: &ServerFrame) -> String {
         ServerFrame::Compact { upto, .. } => format!("compact upto {upto}"),
         ServerFrame::Snapshot { base, .. } => format!("snapshot base {base}"),
         ServerFrame::Presence { .. } => "presence".into(),
+        ServerFrame::WelcomeSpace { protocol, .. } => format!("welcome space {protocol}"),
+        ServerFrame::PresenceFrom { .. } => "presence from".into(),
         ServerFrame::CreatedDocument { kept, .. } => format!("created, kept {kept}"),
     }
 }
@@ -150,7 +152,7 @@ impl Sim {
                         app.doc.import(&bytes).unwrap();
                     }
                 }
-                DocEvent::Presence(..) => {}
+                DocEvent::Presence(..) | DocEvent::PresenceFrom(..) => {}
             }
         }
     }

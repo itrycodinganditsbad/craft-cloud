@@ -101,7 +101,7 @@ pub enum PassEnd {
     /// It failed for a reason that may pass by itself (exit code 1).
     Failed(String),
     /// It stopped for something that needs the user (exit code 3).
-    NeedsYou { reason: String, recheck: Recheck },
+    NeedsYou { reason: String, reason_code: Option<String>, recheck: Recheck },
 }
 
 /// What the loop is doing, for the status file.
@@ -114,7 +114,7 @@ pub enum Phase {
     /// The last pass failed; the next try is at `next_try`.
     Retrying { next_try: Ms, message: String },
     /// Stopped until the user does something; `next_check` when it looks again by itself.
-    Paused { reason: String, next_check: Option<Ms> },
+    Paused { reason: String, reason_code: Option<String>, next_check: Option<Ms> },
     /// Stopping: no new pass starts.
     Stopping,
 }
@@ -149,7 +149,7 @@ pub struct Scheduler {
     running: bool,
     failures: u32,
     retry: Option<(Ms, String)>,
-    paused: Option<(String, Recheck, Option<Ms>)>,
+    paused: Option<(String, Option<String>, Recheck, Option<Ms>)>,
     waiting_approval: bool,
     /// Deletes are held behind a link (as of the last pass that finished).
     holding: bool,
@@ -280,7 +280,7 @@ impl Scheduler {
                 self.failures = self.failures.saturating_add(1);
                 self.retry = Some((now.saturating_add(delay), message));
             }
-            PassEnd::NeedsYou { reason, recheck } => {
+            PassEnd::NeedsYou { reason, reason_code, recheck } => {
                 self.retry = None;
                 self.failures = 0;
                 let next_check = match recheck {
@@ -288,7 +288,7 @@ impl Scheduler {
                     Recheck::Slowly => Some(now.saturating_add(ms(self.timing.recheck_slow))),
                     Recheck::Never => None,
                 };
-                self.paused = Some((reason, recheck, next_check));
+                self.paused = Some((reason, reason_code, recheck, next_check));
             }
         }
     }
@@ -313,7 +313,7 @@ impl Scheduler {
 
     /// When the next pass is due, if one is.
     fn pass_due(&self) -> Option<Ms> {
-        if let Some((_, _, next_check)) = &self.paused {
+        if let Some((_, _, _, next_check)) = &self.paused {
             return *next_check;
         }
         if let Some((at, _)) = &self.retry {
@@ -366,8 +366,8 @@ impl Scheduler {
         if self.running {
             return Phase::Syncing;
         }
-        if let Some((reason, _, next_check)) = &self.paused {
-            return Phase::Paused { reason: reason.clone(), next_check: *next_check };
+        if let Some((reason, reason_code, _, next_check)) = &self.paused {
+            return Phase::Paused { reason: reason.clone(), reason_code: reason_code.clone(), next_check: *next_check };
         }
         if let Some((next_try, message)) = &self.retry {
             return Phase::Retrying { next_try: *next_try, message: message.clone() };
@@ -538,18 +538,18 @@ mod tests {
     #[test]
     fn pauses_say_why_and_only_some_recheck_by_themselves() {
         let mut s = scheduler(false);
-        run(&mut s, 0, PassEnd::NeedsYou { reason: "the folder is missing".into(), recheck: Recheck::Soon });
-        assert_eq!(s.phase(), Phase::Paused { reason: "the folder is missing".into(), next_check: Some(60_000) });
+        run(&mut s, 0, PassEnd::NeedsYou { reason: "the folder is missing".into(), reason_code: None, recheck: Recheck::Soon });
+        assert_eq!(s.phase(), Phase::Paused { reason: "the folder is missing".into(), reason_code: None, next_check: Some(60_000) });
         s.local_change(10);
         s.urgent_change();
         assert_eq!(s.next(20), Next::Wait(Some(60_000)), "nothing but the recheck runs a pass while paused");
         run(&mut s, 60_000, done());
         assert_eq!(s.phase(), Phase::Idle, "back once the folder is");
 
-        run(&mut s, 660_000, PassEnd::NeedsYou { reason: "protocol".into(), recheck: Recheck::Slowly });
+        run(&mut s, 660_000, PassEnd::NeedsYou { reason: "protocol".into(), reason_code: None, recheck: Recheck::Slowly });
         assert_eq!(s.next(660_001), Next::Wait(Some(1_260_000)));
 
-        run(&mut s, 1_260_000, PassEnd::NeedsYou { reason: "revoked".into(), recheck: Recheck::Never });
+        run(&mut s, 1_260_000, PassEnd::NeedsYou { reason: "revoked".into(), reason_code: None, recheck: Recheck::Never });
         assert_eq!(s.next(1_260_001), Next::Wait(None));
         assert_eq!(s.next(99_999_999), Next::Wait(None), "never by itself");
         s.stop();

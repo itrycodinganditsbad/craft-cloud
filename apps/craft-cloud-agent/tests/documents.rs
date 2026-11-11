@@ -442,8 +442,9 @@ fn presence_goes_between_machines_and_is_never_stored() {
         let frames = w.machines[a].replica().presence(doc, b"cursor 3");
         w.send(a, frames);
         w.settle().await;
-        assert!(w.events(b).contains(&DocEvent::Presence(doc, b"cursor 3".to_vec())));
-        assert!(!w.events(a).iter().any(|e| matches!(e, DocEvent::Presence(..))), "not back to its sender");
+        // On live protocol 3 (the agent's) the server stamps it with the account that sent it, whatever the bytes say.
+        assert!(w.events(b).contains(&DocEvent::PresenceFrom(doc, w.user.0, b"cursor 3".to_vec())));
+        assert!(!w.events(a).iter().any(|e| matches!(e, DocEvent::Presence(..) | DocEvent::PresenceFrom(..))), "not back to its sender");
         assert_eq!(w.meta.live_doc(w.space, doc).await.unwrap().unwrap().head, 0);
     });
 }
@@ -608,6 +609,7 @@ fn against_an_older_server_documents_wait_and_say_so() {
             opened_ms: 1,
             saved_ms: None,
             machine: "pc".into(),
+            open_now: Vec::new(),
         };
         let frames = w.machines[a].replica().add(&app, [1; 16], entry).unwrap();
         w.send(a, frames);

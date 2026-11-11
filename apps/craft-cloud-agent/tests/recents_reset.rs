@@ -19,7 +19,7 @@ use craft_cloud_store::memory::MemoryBackend;
 use tokio::sync::broadcast;
 
 fn entry(path: &str, title: &str, opened_ms: i64) -> RecentEntry {
-    RecentEntry { node: None, path: path.into(), title: title.into(), opened_ms, saved_ms: None, machine: "pc".into() }
+    RecentEntry { node: None, path: path.into(), title: title.into(), opened_ms, saved_ms: None, machine: "pc".into(), open_now: Vec::new() }
 }
 
 fn app() -> AppName {

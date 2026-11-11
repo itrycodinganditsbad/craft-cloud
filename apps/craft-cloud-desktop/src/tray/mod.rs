@@ -1,5 +1,6 @@
 //! The tray icon, where the desktop has a tray: synced, syncing, offline, needs attention or paused (from the 2 s
-//! status poll), with Open, Open folder, Pause or Resume, and Quit. `tray-icon` on Windows and macOS
+//! status poll), with a first, disabled line that says the sync state in words, then Open, Open folder, Pause or Resume,
+//! and Quit. `tray-icon` on Windows and macOS
 //! ([`windows_macos`]), in the window's process, where closing the window hides it into the tray. On Linux a
 //! StatusNotifierItem over the session D-Bus ([`linux`]) in a process of its own, `craft-cloud --tray`
 //! ([`process`]): Wayland can't hide a window, so there the window is a normal process that ends when closed, and the
@@ -72,6 +73,12 @@ pub fn state_of(status: Option<&Status>) -> TrayState {
     }
 }
 
+/// The first line of the tray's menu, which is not a button: the sync state in the words of the window's footer
+/// (`Online · Up to date`), or, when no agent answers, the icon's own words.
+pub fn status_line(status: Option<&Status>) -> String {
+    Some(crate::ui::state_line(status)).filter(|line| !line.is_empty()).unwrap_or_else(|| state_of(status).words().to_owned())
+}
+
 /// A menu entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Item {
@@ -115,8 +122,8 @@ impl Item {
 
 /// A tray icon that is up.
 pub trait Tray {
-    /// Shows `state`; `paused` makes Pause read Resume.
-    fn show(&mut self, state: TrayState, paused: bool);
+    /// Shows `state`; `paused` makes Pause read Resume; `line` is the menu's first, disabled line ([`status_line`]).
+    fn show(&mut self, state: TrayState, paused: bool, line: &str);
 }
 
 /// Where the menu's clicks go: the model's outside channel, then a wake of the UI.
@@ -187,11 +194,27 @@ mod tests {
         let retrying = Status { online: false, run_state: RunState::Retrying { message: "can't reach it".into() }, ..status() };
         assert_eq!(state_of(Some(&retrying)), TrayState::Offline);
         assert_eq!(state_of(Some(&Status { run_state: RunState::PausedByUser, ..status() })), TrayState::Paused);
-        let stuck = Status { run_state: RunState::Paused { reason: "the folder is missing".into() }, ..status() };
+        let stuck = Status { run_state: RunState::Paused { reason: "the folder is missing".into(), reason_code: None }, ..status() };
         assert_eq!(state_of(Some(&stuck)), TrayState::NeedsAttention);
         assert_eq!(state_of(Some(&Status { removed: true, ..stuck })), TrayState::NeedsAttention);
         assert_eq!(state_of(Some(&crate::model::tests::status(false))), TrayState::NeedsAttention, "not joined yet");
         assert_eq!(state_of(None), TrayState::NeedsAttention, "no agent");
+    }
+
+    #[test]
+    fn the_menus_first_line_says_the_state_as_the_footer_does() {
+        assert_eq!(status_line(Some(&status())), "Online · Up to date");
+        assert_eq!(
+            status_line(Some(&Status { online: false, run_state: RunState::Retrying { message: "x".into() }, ..status() })).split(" · ").next(),
+            Some("Offline")
+        );
+        let syncing = status_line(Some(&Status { run_state: RunState::Syncing, ..status() }));
+        assert!(syncing.starts_with("Online · "), "{syncing}");
+        assert_ne!(syncing, status_line(Some(&status())), "it follows the state");
+        let footer = crate::ui::state_line(Some(&status()));
+        assert_eq!(status_line(Some(&status())), footer);
+        // No agent: the icon's words, never an empty line.
+        assert_eq!(status_line(None), "Needs your attention");
     }
 
     #[test]

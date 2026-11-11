@@ -137,7 +137,7 @@ impl Host {
                         app.import(&bytes).unwrap();
                     }
                 }
-                DocEvent::Presence(..) => {}
+                DocEvent::Presence(..) | DocEvent::PresenceFrom(..) => {}
             }
         }
         let _ = node;
@@ -217,7 +217,9 @@ fn hold_time(world: &Arc<World>) {
                 idle = 0;
                 let meta = world.meta.clone();
                 let _ = tokio::task::spawn_blocking(move || {
+                    let started = std::time::Instant::now();
                     while meta.busy() {
+                        super::harness::stuck_check(started);
                         std::thread::sleep(Duration::from_micros(20));
                     }
                 })

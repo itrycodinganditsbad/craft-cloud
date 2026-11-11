@@ -298,9 +298,24 @@ pub fn fold_file_id(id: FileId) -> u64 {
     u64::from_le_bytes(first)
 }
 
+/// Which folder a path leads to: its canonical path and its ID (a link at `dir` itself is followed, as the synced root may be
+/// one). A session compares it with what it opened with, so a link that was pointed at another folder meanwhile is noticed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderIdentity {
+    pub path: PathBuf,
+    pub id: Option<u64>,
+}
+
+/// The identity of the folder `dir` leads to, or `None` if it can't be looked at (it is gone, a drive is unmounted).
+pub fn folder_identity(dir: &Path) -> Option<FolderIdentity> {
+    let path = fs::canonicalize(dir).ok()?;
+    let md = fs::metadata(&path).ok().filter(|md| md.is_dir())?;
+    Some(FolderIdentity { id: local_id(&md, &path), path })
+}
+
 /// The ID of the file or folder at `path`, whose metadata (not following links) is `md`.
 #[cfg(unix)]
-fn local_id(md: &Metadata, _path: &Path) -> Option<u64> {
+pub(crate) fn local_id(md: &Metadata, _path: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     Some(fold_file_id(FileId::new_inode(md.dev(), md.ino())))
 }
@@ -308,12 +323,12 @@ fn local_id(md: &Metadata, _path: &Path) -> Option<u64> {
 /// The ID of the file or folder at `path`. Windows metadata doesn't carry the file ID on stable Rust, so the
 /// `file-id` crate opens the entry (no data access, every share flag: it never blocks an app).
 #[cfg(windows)]
-fn local_id(_md: &Metadata, path: &Path) -> Option<u64> {
+pub(crate) fn local_id(_md: &Metadata, path: &Path) -> Option<u64> {
     file_id::get_file_id(path).ok().map(fold_file_id)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn local_id(_md: &Metadata, path: &Path) -> Option<u64> {
+pub(crate) fn local_id(_md: &Metadata, path: &Path) -> Option<u64> {
     file_id::get_file_id(path).ok().map(fold_file_id)
 }
 
