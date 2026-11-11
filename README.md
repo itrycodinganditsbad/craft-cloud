@@ -54,6 +54,16 @@ Light and dark, from a test server with made-up accounts. [The admin pages](docs
 |---|---|---|
 | ![Overview, light](https://raw.githubusercontent.com/Skyfuller1303/craft-cloud/screenshots/web-admin/overview-1280-light.png) | ![A team space, dark](https://raw.githubusercontent.com/Skyfuller1303/craft-cloud/screenshots/web-admin/space-1280-dark.png) | ![Team spaces on a phone, dark](https://raw.githubusercontent.com/Skyfuller1303/craft-cloud/screenshots/web-admin/spaces-390-dark.png) |
 
+## The app
+
+The Craft Cloud app, from a test setup with a made-up account. The overview shows the sync state, the storage in use and the computers on the account; Files lists the recent files of every app and computer; Shared lists invitations and team spaces.
+
+| Overview | Files | Shared |
+|---|---|---|
+| ![The app's overview](https://raw.githubusercontent.com/Skyfuller1303/craft-cloud/screenshots/app/overview-folders.png) | ![The app's recent files](https://raw.githubusercontent.com/Skyfuller1303/craft-cloud/screenshots/app/files-loaded.png) | ![The app's team spaces and invitations](https://raw.githubusercontent.com/Skyfuller1303/craft-cloud/screenshots/app/shared-list.png) |
+
+[Installing the Craft Cloud app](docs/install.md) shows how to add a computer.
+
 ## Documentation
 
 - [Installing the Craft Cloud app](docs/install.md) on Windows, macOS and Linux

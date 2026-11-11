@@ -21,6 +21,16 @@ Open Craft Cloud and enter a join string: an invite from the server's admin (`cr
 or a code from a computer that is signed in (Add a computer there). Then this computer starts syncing by itself
 at every login. A computer that was signed in before (with `login`) shows its account at once.
 
+To add a computer from one that is signed in, open its Computers tab and click **Add a computer**. The app shows a
+one-time code and a QR code, valid for ten minutes and for one use. Enter the code on the new computer, or scan the QR code with its camera.
+
+![Add a computer: a one-time code and a QR code](https://raw.githubusercontent.com/Skyfuller1303/craft-cloud/screenshots/app/adding-a-computer.png)
+
+The Computers tab lists every computer on the account with its kind, platform, version and when it was last seen. You can rename a
+computer there, remove one (it is signed out at once; its files stay on its disk) or sign out all the others.
+
+![The Computers tab](https://raw.githubusercontent.com/Skyfuller1303/craft-cloud/screenshots/app/computers-light.png)
+
 The tray icon says whether everything is synced, syncing, offline, paused or needs you, and has Open, Open
 folder, Pause and Quit (which stops syncing until the next login). On Windows and macOS, closing the window leaves
 it in the tray. On Linux the tray icon is a small process of its own (`craft-cloud --tray`, what starts at login),
