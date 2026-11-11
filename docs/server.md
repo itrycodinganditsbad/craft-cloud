@@ -884,7 +884,7 @@ To set it up by hand, copy `.env.example` to `.env`, fill it in, and run `docker
 | `server` | built from `packaging/docker/Dockerfile` | distroless `cc`, uid 65532, plain HTTP on port 8080 inside the stack |
 | `caddy` | `caddy:2.11-alpine` | the only service with published ports (80 and 443); TLS and the redirect from HTTP |
 | `secrets-init` | `caddy:2.11-alpine` | one-shot, no network: renders `config.toml` and writes the secret files |
-| `update-check` | `alpine` | on `edge` only; asks GitHub every 12 hours for a newer release and writes a status file (see "Data, upgrading and backups") |
+| `update-check` | `alpine` | on `edge` only; when turned on (off by default), asks GitHub every 12 hours for a newer release and writes a status file (see "Data, upgrading and backups") |
 | `db`, `db-init` | `postgres:17-alpine` | only with `compose.postgres.yaml` |
 
 Every base image is pinned by the digest of its multi-arch index, with the tag in a comment next to it. To update

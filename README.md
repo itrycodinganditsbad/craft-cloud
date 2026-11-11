@@ -24,8 +24,9 @@ There is no hosted service and no account with anyone but you. Nothing phones ho
 - **Looked after from a browser.** The server can serve admin pages for accounts, invites, team spaces, storage and the
   audit log, in light and dark and on a phone. They are off until you turn them on.
 - **Yours to host.** Run the server from a binary or with the Docker setup (Caddy, TLS, SQLite or Postgres). Blobs can live
-  on disk, S3 or an SFTP server, and the server can back itself up to an SFTP server. In Docker the admin pages tell you
-  when a newer version exists and show the command that updates it; the server never updates itself.
+  on disk, S3 or an SFTP server, and the server can back itself up to an SFTP server. In Docker the admin pages can tell you
+  when a newer version exists and show the command that updates it, if you turn the update check on (it is off by
+  default); the server never updates itself.
 
 ## Quick start
 

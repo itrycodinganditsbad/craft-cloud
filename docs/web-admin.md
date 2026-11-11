@@ -16,7 +16,7 @@ The overview shows the server's health (the database, the store, and whether upl
 full), the number of accounts, signed-in computers, stored bytes and live documents, and the server's version, store and
 database kind. It links to the other pages.
 
-When the update check has found a newer Craft Cloud, a banner at the top gives the version, a link to the release notes (or
+When the update check is turned on (it is off by default) and has found a newer Craft Cloud, a banner at the top gives the version, a link to the release notes (or
 the comparison, for a branch check) and the command that updates a Docker install. The server never updates itself. See
 "Data, upgrading and backups" in [`server.md`](server.md#data-upgrading-and-backups) for the check and the script.
 
