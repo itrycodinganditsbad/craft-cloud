@@ -12,6 +12,10 @@ behind_proxy = true
 trusted_proxies = ["@TRUSTED_PROXY@"]
 public_url = "@PUBLIC_URL@"
 
+[updates]
+#updates#status_file = "/var/lib/craft-cloud-updates/status.json"
+install_dir = "@INSTALL_DIR@"
+
 # Optional limits, in bytes. See docs/server.md.
 # stored_bytes_per_user = 2_000_000_000_000
 # live_bytes_per_user = 1_073_741_824

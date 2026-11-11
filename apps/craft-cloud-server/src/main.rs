@@ -49,6 +49,7 @@ async fn run_server(config_path: &std::path::Path) -> Result<(), String> {
         .map_err(|e| e.message)?
         .with_public_url(config.public_url.clone())
         .with_web_admin(web)
+        .with_updates(craft_cloud_server::updates::UpdateSettings::from_config(&config.updates))
         .with_two_factor(secrets)
         .with_trash_days(config.retention.trash_days)
         .with_storage_info(storage_info.clone())

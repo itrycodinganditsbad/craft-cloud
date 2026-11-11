@@ -8,6 +8,7 @@
 #   TRUSTED_PROXY   the proxy's IPv4 address     (required)
 #   DB_KIND         sqlite (default) or postgres
 #   STORAGE_KIND    disk (default) or s3
+#   CC_INSTALL_DIR  checkout path shown in the update command
 #   S3_BUCKET S3_PREFIX S3_REGION S3_ENDPOINT S3_ALLOW_HTTP   with STORAGE_KIND=s3 (bucket and region required)
 # Secrets are read from files in $SECRETS_DIR (default /run/secrets), never from the environment:
 #   db_password                                   with DB_KIND=postgres
@@ -56,10 +57,17 @@ public_url=${PUBLIC_URL:-}
 check "PUBLIC_URL" "$public_url" '^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$'
 trusted_proxy=${TRUSTED_PROXY:-}
 check "TRUSTED_PROXY" "$trusted_proxy" '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+install_dir=${CC_INSTALL_DIR:-/opt/craft-cloud}
+check "CC_INSTALL_DIR" "$install_dir" '^[A-Za-z0-9._/ -]+$'
 
 db_kind=${DB_KIND:-sqlite}
 storage_kind=${STORAGE_KIND:-disk}
-active=" $db_kind $storage_kind "
+update_check=${CC_UPDATE_CHECK:-on}
+case $update_check in
+    on) active=" $db_kind $storage_kind updates " ;;
+    off) active=" $db_kind $storage_kind " ;;
+    *) die "CC_UPDATE_CHECK must be on or off" ;;
+esac
 db_password=
 s3_bucket=
 s3_prefix=
@@ -131,6 +139,7 @@ while IFS= read -r line || [ -n "$line" ]; do
     esac
     replace TRUSTED_PROXY "$trusted_proxy"
     replace PUBLIC_URL "$public_url"
+    replace INSTALL_DIR "$install_dir"
     replace DB_PASSWORD "$db_password"
     replace S3_BUCKET "$s3_bucket"
     replace S3_PREFIX "$s3_prefix"

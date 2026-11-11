@@ -78,12 +78,13 @@ pub fn page(ctx: Option<&Ctx>, title: &str, body: &str) -> String {
     let nav = match ctx {
         Some(ctx) => format!(
             "<nav aria-label=\"Admin\"><ul><li><a href=\"/web\"{}>Overview</a></li><li><a href=\"/web/users\"{}>Users</a></li>\
-             <li><a href=\"/web/spaces\"{}>Team spaces</a></li><li><a href=\"/web/audit\"{}>Audit log</a></li></ul>\
+             <li><a href=\"/web/spaces\"{}>Team spaces</a></li><li><a href=\"/web/storage\"{}>Storage</a></li><li><a href=\"/web/audit\"{}>Audit log</a></li></ul>\
              <form method=\"post\" action=\"/web/logout\" class=\"inline\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
              <span>Signed in as <strong>{}</strong></span> <button type=\"submit\">Sign out</button></form></nav>",
             current("Overview"),
             current("Users"),
             current("Team spaces"),
+            current("Storage"),
             current("Audit log"),
             esc(&ctx.csrf),
             esc(&ctx.username)
@@ -113,6 +114,22 @@ fn nav_item(title: &str) -> &str {
 /// A page heading and its first paragraph.
 pub fn heading(text: &str) -> String {
     format!("<h1>{}</h1>", esc(text))
+}
+
+/// A stat cell with a value and a label.
+pub fn stat(value: &str, label: &str) -> String {
+    format!("<div class=\"stat\"><span class=\"stat-value\">{}</span><span class=\"stat-label\">{}</span></div>", esc(value), esc(label))
+}
+
+/// A status badge with a fixed visual tone.
+pub fn badge(text: &str, tone: &str) -> String {
+    let class = match tone {
+        "active" | "two-factor" => "status-active",
+        "disabled" => "status-disabled",
+        "invited" => "status-invited",
+        _ => "status-neutral",
+    };
+    format!("<span class=\"status-badge {class}\">{}</span>", esc(text))
 }
 
 /// A notice that something worked (`role=status`) or failed (`role=alert`).

@@ -42,6 +42,9 @@ expect_line 'listen = "0.0.0.0:8080"'
 expect_line 'behind_proxy = true'
 expect_line 'trusted_proxies = ["172.29.215.2"]'
 expect_line 'public_url = "https://cloud.example.org"'
+expect_line '[updates]'
+expect_line 'status_file = "/var/lib/craft-cloud-updates/status.json"'
+expect_line 'install_dir = "/opt/craft-cloud"'
 expect_line 'url = "sqlite:/var/lib/craft-cloud/meta.db"'
 expect_line 'kind = "disk"'
 expect_line 'path = "/var/lib/craft-cloud/blobs"'
@@ -53,6 +56,9 @@ reject_line 'postgres'
 reject_line 's3'
 reject_line '#sqlite#'
 reject_line "$password"
+
+run CC_UPDATE_CHECK=off || fail "updates-off profile failed: $(cat "$work/err")"
+reject_line 'status_file ='
 
 # 2. Postgres.
 run DB_KIND=postgres || fail "postgres profile failed: $(cat "$work/err")"

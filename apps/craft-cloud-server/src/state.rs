@@ -142,6 +142,8 @@ pub struct AppState {
     pub web_logins: Limiter,
     /// The admin pages' settings; `None`: they are off and `/web` does not exist.
     pub web: Option<crate::web::WebSettings>,
+    pub updates: crate::updates::UpdateSettings,
+    pub(crate) update_cache: Mutex<Option<(std::time::Instant, Option<crate::updates::UpdateInfo>)>>,
     /// Seals and opens the secrets of two-factor sign-in; `None`: no key is configured, so it can't be set up.
     pub two_factor: Option<Arc<SecretBox>>,
     pub notifier: Notifier,
@@ -183,6 +185,19 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Reads configured update status at most once per minute; file errors never fail an admin page.
+    pub fn update_info(&self) -> Option<crate::updates::UpdateInfo> {
+        let mut cache = self.update_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((at, value)) = &*cache
+            && at.elapsed() < Duration::from_secs(60)
+        {
+            return value.clone();
+        }
+        let value = crate::updates::read(&self.updates);
+        *cache = Some((std::time::Instant::now(), value.clone()));
+        value
+    }
+
     pub fn new(meta: Meta, store: Store, trusted_proxies: Vec<IpAddr>) -> Result<Self, ApiError> {
         let compression = CompressionSettings::of(&store);
         let limits = Limits::default();
@@ -197,6 +212,8 @@ impl AppState {
             second_factors: Limiter::new(Duration::from_secs(300)),
             web_logins: Limiter::new(Duration::from_secs(300)),
             web: None,
+            updates: crate::updates::UpdateSettings::default(),
+            update_cache: Mutex::new(None),
             two_factor: None,
             notifier: Notifier::default(),
             live: LiveHub::default(),
@@ -244,6 +261,12 @@ impl AppState {
     /// The state with the admin pages on (`None`: off, the default): their address, session lifetimes and the like.
     pub fn with_web_admin(mut self, web: Option<crate::web::WebSettings>) -> Self {
         self.web = web;
+        self
+    }
+
+    /// The local update status file and links shown to administrators.
+    pub fn with_updates(mut self, updates: crate::updates::UpdateSettings) -> Self {
+        self.updates = updates;
         self
     }
 

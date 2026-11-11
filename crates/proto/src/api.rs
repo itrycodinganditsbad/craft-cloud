@@ -26,6 +26,16 @@ pub const PROTOCOL_MAX: u32 = 2;
 /// Most chunk IDs in one `POST /chunks/missing`.
 pub const MAX_MISSING_IDS: usize = 10_000;
 
+/// `update` in `GET /admin/server`: locally checked update metadata. No updater action is exposed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminUpdateInfo {
+    pub available: bool,
+    pub latest: String,
+    pub current: String,
+    pub channel: String,
+    pub checked_at: String,
+}
+
 /// `GET /api/v1/info`: what the server speaks and its limits. No sign-in needed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InfoResponse {

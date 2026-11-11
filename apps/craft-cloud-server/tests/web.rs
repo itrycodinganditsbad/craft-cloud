@@ -60,6 +60,18 @@ fn test_box() -> SecretBox {
 }
 
 async fn start(meta: Meta, url: String, dirs: Vec<tempfile::TempDir>, pg: Option<PgGuard>, trusted: Vec<std::net::IpAddr>, web: bool) -> Web {
+    start_with_updates(meta, url, dirs, pg, trusted, web, None).await
+}
+
+async fn start_with_updates(
+    meta: Meta,
+    url: String,
+    dirs: Vec<tempfile::TempDir>,
+    pg: Option<PgGuard>,
+    trusted: Vec<std::net::IpAddr>,
+    web: bool,
+    updates: Option<craft_cloud_server::updates::UpdateSettings>,
+) -> Web {
     let blobs = tempfile::tempdir().unwrap();
     let store = Store::new(DiskBackend::new(blobs.path()).unwrap());
     let settings = web.then(|| WebSettings::new(ORIGIN, IDLE_MS, ABSOLUTE_MS).unwrap());
@@ -70,6 +82,7 @@ async fn start(meta: Meta, url: String, dirs: Vec<tempfile::TempDir>, pg: Option
         .with_two_factor(Some(test_box()))
         .with_public_url(Some(ORIGIN.to_owned()))
         .with_web_admin(settings)
+        .with_updates(updates.unwrap_or_default())
         .with_clock(Arc::new(move || match ticking.load(Ordering::SeqCst) {
             0 => craft_cloud_server::state::now_ms(),
             frozen => frozen,
@@ -161,6 +174,10 @@ on_sqlite_and_postgres!(
     an_admin_with_two_factor_confirms_a_team_space_with_a_code,
     team_space_names_are_escaped,
     a_space_whose_owners_cannot_sign_in_is_shown_as_having_none,
+    storage_page_is_for_administrators_and_has_secure_headers,
+    storage_compression_form_checks_csrf_confirmation_and_audits,
+    storage_compression_confirmation_uses_two_factor,
+    overview_shows_server_health_and_account_usage_rows,
 );
 
 // ---- helpers ----
@@ -1278,7 +1295,12 @@ async fn the_user_list_pages_and_searches(s: &Web) {
     }
     // The overview counts.
     let overview = s.get("/web", Some(&sess.token)).await.text().await.unwrap();
-    assert!(overview.contains("<dt>Accounts</dt><dd>63</dd>") && overview.contains("<dt>Database</dt>"), "{overview}");
+    assert!(
+        overview.contains("class=\"stat-value\">63</span>")
+            && overview.contains("class=\"stat-label\">Accounts</span>")
+            && overview.contains("<dt>Database</dt>"),
+        "{overview}"
+    );
 }
 
 async fn the_audit_log_filters_pages_and_downloads(s: &Web) {
@@ -1366,6 +1388,7 @@ async fn user_controlled_text_is_escaped(s: &Web) {
     drop(conn);
     let pages = [
         s.get("/web", Some(&sess.token)).await,
+        s.get("/web/storage", Some(&sess.token)).await,
         s.get("/web/users", Some(&sess.token)).await,
         s.get(&format!("/web/users/{}", ana.id.0), Some(&sess.token)).await,
         s.get("/web/audit", Some(&sess.token)).await,
@@ -1392,6 +1415,147 @@ async fn user_controlled_text_is_escaped(s: &Web) {
         shown.contains("Effective quota") && shown.contains("Trash estimate (overlapping)") && shown.contains("History estimate (overlapping)"),
         "the account usage is shown"
     );
+}
+
+async fn storage_page_is_for_administrators_and_has_secure_headers(s: &Web) {
+    let anonymous = s.get("/web/storage", None).await;
+    assert_eq!((anonymous.status(), location(&anonymous).as_str()), (StatusCode::SEE_OTHER, "/web/login"));
+
+    // A member cannot get a browser session at all (only administrators can sign in), so the anonymous case covers them.
+    s.add_admin("root").await;
+    let admin = s.sign_in("root").await;
+    let response = s.get("/web/storage", Some(&admin.token)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let csp = header(&response, "content-security-policy");
+    let frame_options = header(&response, "x-frame-options");
+    let content_options = header(&response, "x-content-type-options");
+    let referrer_policy = header(&response, "referrer-policy");
+    let cache_control = header(&response, "cache-control");
+    let html = response.text().await.unwrap();
+    assert!(html.contains("<h1>Storage</h1>") && html.contains("<h2>Compression</h2>") && html.contains("name=\"compression_level\""), "{html}");
+    assert!(csp.contains("script-src 'none'"));
+    assert_eq!(frame_options, "DENY");
+    assert_eq!(content_options, "nosniff");
+    assert_eq!(referrer_policy, "no-referrer");
+    assert_eq!(cache_control, "no-store");
+    assert!(!html.contains("<script"));
+}
+
+async fn storage_compression_form_checks_csrf_confirmation_and_audits(s: &Web) {
+    use craft_cloud_meta::{AuditAction, AuditQuery};
+    s.add_admin("root").await;
+    let admin = s.sign_in("root").await;
+    let device = s.device("root").await;
+    let before: serde_json::Value = s.api(Some(&device), Method::GET, "/admin/storage", None).await.json().await.unwrap();
+    let initial = before["compression"]["level"].as_u64().unwrap();
+    let initial_events = s.meta.audit_list(&AuditQuery { limit: 200, ..Default::default() }).await.unwrap();
+    let count = |events: &[craft_cloud_meta::AuditEvent]| events.iter().filter(|event| event.action == AuditAction::AdminCompressionChanged).count();
+    let initial_count = count(&initial_events);
+
+    let no_csrf = s.post("/web/storage", Some(&admin.token), &[("compression_level", "7"), ("password", PASSWORD)]).await;
+    assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN, "missing csrf");
+    let wrong_csrf = s.post("/web/storage", Some(&admin.token), &[("csrf", "wrong"), ("compression_level", "7"), ("password", PASSWORD)]).await;
+    assert_eq!(wrong_csrf.status(), StatusCode::FORBIDDEN, "wrong csrf");
+    let no_password = s.post("/web/storage", Some(&admin.token), &[("csrf", &admin.csrf), ("compression_level", "7")]).await;
+    assert_eq!(no_password.status(), StatusCode::BAD_REQUEST, "missing confirmation");
+    let wrong_password =
+        s.post("/web/storage", Some(&admin.token), &[("csrf", &admin.csrf), ("compression_level", "7"), ("password", "wrong")]).await;
+    assert_eq!(wrong_password.status(), StatusCode::FORBIDDEN, "wrong confirmation");
+    for level in ["0", "20"] {
+        let invalid = s.act(&admin, "/web/storage", &[("compression_level", level)]).await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST, "level {level}");
+        assert!(invalid.text().await.unwrap().contains("The compression level is 1 to 19."));
+    }
+    let unchanged: serde_json::Value = s.api(Some(&device), Method::GET, "/admin/storage", None).await.json().await.unwrap();
+    assert_eq!(unchanged["compression"]["level"].as_u64(), Some(initial));
+    assert_eq!(count(&s.meta.audit_list(&AuditQuery { limit: 200, ..Default::default() }).await.unwrap()), initial_count);
+
+    let updated = s.act(&admin, "/web/storage", &[("compression_level", "7")]).await;
+    assert_eq!((updated.status(), location(&updated).as_str()), (StatusCode::SEE_OTHER, "/web/storage?notice=compression"));
+    let shown = s.get(&location(&updated), Some(&admin.token)).await.text().await.unwrap();
+    assert!(shown.contains("The compression level was updated."));
+    let after: serde_json::Value = s.api(Some(&device), Method::GET, "/admin/storage", None).await.json().await.unwrap();
+    assert_eq!(after["compression"]["level"].as_u64(), Some(7));
+    let events = s.meta.audit_list(&AuditQuery { limit: 200, ..Default::default() }).await.unwrap();
+    assert_eq!(count(&events), initial_count + 1);
+    let event = events.iter().find(|event| event.action == AuditAction::AdminCompressionChanged).unwrap();
+    assert_eq!(event.actor_user.map(|user| user.0), Some(s.id_of("root").await));
+    assert_eq!(event.actor_device, None);
+}
+
+async fn storage_compression_confirmation_uses_two_factor(s: &Web) {
+    s.add_admin("root").await;
+    let tf = turn_on_two_factor(s, "root").await;
+    let admin = sign_in_with_factor(s, "root", &tf).await;
+    let html = s.get("/web/storage", Some(&admin.token)).await.text().await.unwrap();
+    assert!(html.contains("name=\"totp_code\"") && html.contains("name=\"recovery_code\""));
+    let denied = s.act(&admin, "/web/storage", &[("compression_level", "8")]).await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN, "no second factor");
+    let code = tf.fresh_code(s);
+    let accepted = s.act(&admin, "/web/storage", &[("compression_level", "8"), ("totp_code", &code)]).await;
+    assert_eq!(accepted.status(), StatusCode::SEE_OTHER);
+}
+
+async fn overview_shows_server_health_and_account_usage_rows(s: &Web) {
+    s.add_admin("root").await;
+    let account = s.add_user("ana", Role::Member).await;
+    let admin = s.sign_in("root").await;
+    let overview = s.get("/web", Some(&admin.token)).await.text().await.unwrap();
+    assert!(overview.contains("Server health") && overview.contains("Healthy"), "{overview}");
+    let page = s.get(&format!("/web/users/{}", account.id.0), Some(&admin.token)).await.text().await.unwrap();
+    for label in ["Usage stored", "Physical", "Files", "Effective quota", "Trash estimate (overlapping)", "History estimate (overlapping)"] {
+        assert!(page.contains(&format!("<dt>{label}</dt>")), "missing {label}: {page}");
+    }
+}
+
+#[tokio::test]
+async fn update_banner_only_appears_for_a_valid_newer_release() {
+    let run = async |contents: Option<&str>, configured: bool, unreadable: bool| {
+        let db = tempfile::tempdir().unwrap();
+        let status_dir = tempfile::tempdir().unwrap();
+        let status_file = status_dir.path().join("status.json");
+        if unreadable {
+            std::fs::create_dir(&status_file).unwrap();
+        } else if let Some(contents) = contents {
+            std::fs::write(&status_file, contents).unwrap();
+        }
+        let url = format!("sqlite:{}", db.path().join("meta.db").display());
+        let meta = Meta::open(&url).await.unwrap();
+        let updates = configured.then(|| craft_cloud_server::updates::UpdateSettings {
+            status_file: Some(status_file),
+            install_dir: "/srv/craft & cloud".into(),
+            repo: "owner/repo".into(),
+        });
+        let server = start_with_updates(meta, url, vec![db, status_dir], None, vec![], true, updates).await;
+        server.add_admin("root").await;
+        let admin = server.sign_in("root").await;
+        let page = server.get("/web", Some(&admin.token)).await;
+        assert_eq!(page.status(), StatusCode::OK);
+        assert!(
+            page.headers()
+                .get("content-security-policy")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("script-src 'none'"))
+        );
+        page.text().await.unwrap()
+    };
+
+    let mut parts = env!("CARGO_PKG_VERSION").split('.').map(|part| part.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
+    if parts.len() < 3 {
+        parts.resize(3, 0);
+    }
+    parts[2] += 1;
+    let newer = format!("v{}.{}.{}", parts[0], parts[1], parts[2]);
+    let fixture = format!(r#"{{"channel":"release","latest":"{newer}","checked_at":"2026-11-10T00:00:00Z"}}"#);
+    let shown = run(Some(&fixture), true, false).await;
+    assert!(shown.contains(&format!("Update available: {newer}")), "{shown}");
+    assert!(shown.contains("cd /srv/craft &amp; cloud &amp;&amp; ./packaging/docker/update.sh"), "{shown}");
+    let equal = format!(r#"{{"channel":"release","latest":"{}","checked_at":"today"}}"#, env!("CARGO_PKG_VERSION"));
+    assert!(!run(Some(&equal), true, false).await.contains("Update available:"));
+    assert!(!run(Some("not json"), true, false).await.contains("Update available:"));
+    assert!(!run(None, true, false).await.contains("Update available:"));
+    assert!(!run(None, true, true).await.contains("Update available:"));
+    assert!(!run(Some(&fixture), false, false).await.contains("Update available:"));
 }
 
 async fn old_sessions_are_cleaned_up_at_sign_in(s: &Web) {
@@ -1713,7 +1877,7 @@ async fn team_spaces_are_made_listed_and_changed(s: &Web) {
     // The page: an empty list and the form, with the confirmation's password field and the navigation entry.
     let html = s.get("/web/spaces", Some(&boss.token)).await.text().await.unwrap();
     assert!(html.contains("No team spaces match.") && html.contains("action=\"/web/spaces\"") && html.contains("name=\"password\""), "{html}");
-    assert!(html.contains("<a href=\"/web/spaces\" aria-current=\"page\">Team spaces</a>"), "the navigation names the page and marks it");
+    assert!(html.contains("<a href=\"/web/spaces\" aria-current=\"page\">Team spaces</a>"), "the navigation names the page and marks it current");
     assert!(!html.contains("name=\"totp_code\""), "no code field without two-factor sign-in");
 
     // Create: the errors first, each with its status, and nothing made.
@@ -1751,7 +1915,7 @@ async fn team_spaces_are_made_listed_and_changed(s: &Web) {
     assert!(html.contains("The team space was created.") && html.contains("Team space Studio"), "{html}");
     assert!(html.contains("16.0 MiB") && html.contains(&format!("/web/users/{}", owner.id.0)) && html.contains("<td>owner</td>"), "{html}");
     let html = s.get("/web/spaces", Some(&boss.token)).await.text().await.unwrap();
-    assert!(html.contains("Studio") && html.contains("0 B of 16.0 MiB") && html.contains("<td>active</td>"), "{html}");
+    assert!(html.contains("Studio") && html.contains("0 B of 16.0 MiB") && html.contains("status-badge status-active\">active</span>"), "{html}");
     let base = format!("/web/spaces/{}", space.id.as_uuid());
 
     // The limit: set, refused, removed.

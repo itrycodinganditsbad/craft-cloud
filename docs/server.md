@@ -429,6 +429,13 @@ Open `https://cloud.example.org/web` and sign in as an admin. The server refuses
 `behind_proxy = true` and `public_url` is an `https://` address with no path: the pages' cookie is `Secure` (a browser only
 sends it over HTTPS) and every form is checked against the origin of `public_url`.
 
+The Overview shows server health and whether uploads are refused because the server is full. Users, team spaces and the audit
+log have their own pages. Storage shows stored and physical bytes, compression savings, the configured capacity, measured
+filesystem space when available, the ten largest accounts and remembered compression estimates. Set the compression level
+there with a form; every change requires the admin's password and, when enabled, a second-factor code. Loading the page does
+not run a storage estimate. Account pages show stored bytes, quota and available trash and history estimates; physical size
+and file counts are not currently measured per account.
+
 **Behind the proxy.**
 
 - The proxy terminates TLS and forwards `/web` and `/api` (and `/join`) to the server's `listen` address. It must pass the
@@ -983,9 +990,45 @@ will not start without the key its two-factor secrets were sealed with (see "Two
 The image creates the directory for uid 65532 with mode 0700, so a new named volume gets that owner. A bind mount
 instead of the volume must be prepared first: `chown 65532:65532 DIR && chmod 0700 DIR`.
 
-To upgrade, update the source, then run `docker compose build server` and `docker compose up -d --wait`. The server
-migrates the database when it opens it and refuses a database newer than itself, so back up before an upgrade and do
-not go back to an older image without the backup.
+The browser admin overview can show a GitHub update notice. Docker's `update-check` service contacts only the GitHub
+API for the configured repository; it sends no installation data. The server has no outbound network access and reads
+the checker's status file from a read-only volume. The service starts with a random delay of up to 30 minutes, then
+checks every 12 hours. It writes nothing after a network or response parsing error, preserving the last good result.
+
+Set these optional values in `.env`:
+
+```sh
+CC_UPDATE_CHECK=on                 # off disables checking
+CC_UPDATE_REPO=itrycodinganditsbad/craft-cloud
+CC_UPDATE_CHANNEL=release          # release or branch
+CC_UPDATE_BRANCH=main              # branch channel only
+CC_INSTALL_DIR=/opt/craft-cloud   # checkout path shown in the command
+```
+
+After changing update settings, run `docker compose up -d --force-recreate secrets-init` and
+`docker compose up -d --force-recreate update-check server` so the rendered config and services use them.
+
+`install.sh` writes its checkout path to `CC_INSTALL_DIR` when it creates `.env`. For a branch check, the server
+compares the latest SHA with the revision embedded at build time. Unknown revisions suppress the notice. A release
+check compares semantic versions. The admin page links to GitHub release notes or the branch comparison and shows
+`cd <install_dir> && ./packaging/docker/update.sh`. Read release notes before running it. The script refuses a dirty
+working tree, asks before it changes anything, pulls with `--ff-only` and builds the new image while the old server
+keeps running, so a failed build changes nothing. Then it stops the server, backs up the data volume (and dumps
+Postgres when configured) into `backups/<time>/`, and starts the new server. It keeps the backup after a failure and
+never rolls back a migrated database automatically.
+`--yes` skips its confirmation. `--skip-backup` is an explicit override and prints a warning.
+
+To upgrade manually, stop the server and back up first. SQLite backup: copy `meta.db*`, `blobs/` and
+`two-factor.key` from the `data` volume. Postgres backup: `pg_dump` from `db`, plus `blobs/` and `two-factor.key`.
+Then update the source, run `docker compose build server` and `docker compose up -d --wait`. The server migrates the
+database when it opens it and refuses a database newer than itself, so do not go back to an older image without
+restoring the pre-upgrade backup.
+
+For a plain binary install, use manual upgrades with a backup. `packaging/docker/update-check.sh` checks every 12
+hours on its own, so run it as a long-running service (a systemd unit, not a timer) with `CC_UPDATE_REPO`, `CC_UPDATE_CHANNEL`, `CC_UPDATE_BRANCH`, and
+`CC_UPDATE_STATUS_DIR` set to a directory writable by the checker and readable by the server. Set the server's
+`[updates].status_file` to `<CC_UPDATE_STATUS_DIR>/status.json`. The checker contacts GitHub's API and sends no
+installation data. Do not grant an updater service root rights: the server must not be able to replace itself.
 
 `craft-cloud-server backup` (see "Backing up to an SFTP server" in the server guide) copies a SQLite server to an SFTP server while it runs; there is no schedule built in. By hand: stop the server (`docker compose stop server`), copy the volume (SQLite:
 `meta.db`, `meta.db-wal`, `meta.db-shm`, `blobs/` and `two-factor.key` together; Postgres: `pg_dump` from the `db` container plus

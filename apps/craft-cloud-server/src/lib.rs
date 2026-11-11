@@ -29,6 +29,7 @@ pub mod storage_info;
 pub mod storage_tools;
 pub mod totp;
 pub mod two_factor;
+pub mod updates;
 pub mod verify;
 pub mod web;
 

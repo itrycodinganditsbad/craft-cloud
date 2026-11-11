@@ -671,6 +671,7 @@ pub fn routes(state: Shared) -> Router<Shared> {
         .route("/spaces/{id}/archive", post(team::archive))
         .route("/spaces/{id}/unarchive", post(team::unarchive))
         .route("/spaces/{id}/owner", post(team::set_owner))
+        .route("/storage", get(pages::storage).post(pages::set_compression))
         .route("/audit", get(pages::audit))
         .route("/audit/export", get(pages::audit_export))
         .fallback(no_such_page)
