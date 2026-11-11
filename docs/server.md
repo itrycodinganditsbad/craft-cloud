@@ -118,7 +118,8 @@ process limits, and a `noexec` tmpfs for `/tmp`. The exceptions are explained ne
 root filesystem.
 
 Three networks keep the parts apart: `edge` (published ports and outbound access, Caddy only), `frontend` (internal;
-Caddy to the server) and `backend` (internal; the server to Postgres, Caddy is not attached).
+Caddy to the server) and `backend` (internal; the server to Postgres, Caddy is not attached). The S3 overlay adds a
+fourth, `egress`, for the server alone.
 
 ### Configuration and secrets
 
@@ -177,8 +178,10 @@ leaves the internal `backend` network. An external Postgres over TLS is not cove
 
 `compose.s3.yaml` replaces the disk storage with an S3 bucket: fill in the `CC_S3_*` and `CC_SECRET_S3_*` lines of
 `.env.example` in `.env` and add `compose.s3.yaml` to `COMPOSE_FILE`. The keys end up in `config.toml` like the
-database password, not in the server's environment. The server joins the `edge` network to reach the endpoint. The
-image holds the CA certificates the server needs for HTTPS endpoints. The overlay has been tried with a local S3 mock
+database password, not in the server's environment. The server joins a network of its own, `egress`, to reach the endpoint. It does not join `edge`: Caddy
+would then reach it from its `edge` address instead of `CC_CADDY_IP`, the server would not trust that peer and would
+ignore `X-Forwarded-For` (all clients would share one sign-in limit), and `update-check` could reach the server without
+Caddy. The image holds the CA certificates the server needs for HTTPS endpoints. The overlay has been tried with a local S3 mock
 over plain HTTP (`CC_S3_ALLOW_HTTP=true`), not with a real S3 service or an HTTPS endpoint.
 
 ### The first admin and more accounts

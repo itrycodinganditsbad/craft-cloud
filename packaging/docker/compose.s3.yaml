@@ -3,8 +3,11 @@
 # Set CC_S3_* and CC_SECRET_S3_* in .env. The keys go into config.toml (mode 0400, readable by the server only) like
 # the database password; they are not in the server's environment.
 #
-# The server needs a route to the S3 endpoint, so it also joins the `edge` network, the only one with outbound access.
-# That network publishes no port of the server.
+# The server needs a route to the S3 endpoint, so it joins `egress`, a network of its own with outbound access. It does
+# not join `edge`: Caddy is on `edge` too, and Docker's DNS would then answer `server` with the address on `edge`. Caddy
+# would connect from its `edge` address instead of CC_CADDY_IP, the server would not trust that peer and would ignore
+# X-Forwarded-For (every client would share one sign-in limit), and update-check, also on `edge`, could reach the server
+# without Caddy. On `egress` nothing but the server is attached, and no port is published.
 
 services:
   # Compose puts a file secret into the container's root filesystem, so this one service cannot be read-only here.
@@ -22,7 +25,11 @@ services:
       - s3_secret_access_key
 
   server:
-    networks: [edge]
+    networks: [egress]
+
+networks:
+  # Outbound access for the server (the S3 endpoint) only. Caddy and update-check are not attached.
+  egress: {}
 
 secrets:
   s3_access_key_id: {environment: CC_SECRET_S3_ACCESS_KEY_ID}
