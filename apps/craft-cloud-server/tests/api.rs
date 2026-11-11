@@ -1726,8 +1726,10 @@ async fn a_device_is_renamed_by_its_owner_only(s: &Server) {
     assert_eq!((renamed.id, renamed.name.as_str(), renamed.current), (pc_id, "studio pc", true));
     let renamed: DeviceInfo = patch(&pc, laptop_id, json!("old laptop")).await.json().await.unwrap();
     assert_eq!((renamed.name.as_str(), renamed.current), ("old laptop", false));
-    let names: Vec<_> = devices_of(s, &pc).await.into_iter().map(|d| d.name).collect();
-    assert_eq!(names, ["studio pc", "old laptop"]);
+    // The list is ordered by creation time, and two sign-ins in the same millisecond tie: compare as a set.
+    let mut names: Vec<_> = devices_of(s, &pc).await.into_iter().map(|d| d.name).collect();
+    names.sort();
+    assert_eq!(names, ["old laptop", "studio pc"]);
     // Someone else's device and one that doesn't exist are the same answer: not found, never forbidden.
     for id in [bobs_id, craft_cloud_proto::DeviceId::generate()] {
         let (status, body) = error(patch(&pc, id, json!("mine now")).await).await;
