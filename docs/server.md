@@ -795,8 +795,13 @@ updated, the image rebuilt) and how to go back with `git reset --hard <old commi
 after a failure; a migrated database is never rolled back automatically. `--yes` skips the confirmation.
 `--skip-backup` is an explicit override and prints a warning.
 
-Every update adds a full copy of the data volume, blobs included, to `backups/`. Nothing removes old ones: check the
-free space and delete backups you no longer need.
+Every update adds a full copy of the data volume, blobs included, to `backups/`. After an update that succeeded,
+`update.sh` keeps the newest 3 backups (this run's included) and removes the older ones, and prints each one it removes.
+Change the number with `--keep N` or the environment variable `CC_BACKUP_KEEP`; `0` keeps every backup. Only directories
+named like its own (`backups/20260101T120000Z`) are touched. A failed update, `--skip-backup` and `--keep 0` remove
+nothing. The files in a backup belong to the server's user (uid 65532), so a short-lived container removes them as root,
+as one made them; if that fails the script says so and goes on, and you remove the directory by hand. Three backups of a
+large data volume still take three times its size: check the free space, and move a backup you want to keep elsewhere.
 
 To upgrade manually, stop the server and back up first. SQLite backup: copy `meta.db*`, `blobs/` and
 `two-factor.key` from the `data` volume. Postgres backup: `pg_dump` from `db`, plus `blobs/` and `two-factor.key`.

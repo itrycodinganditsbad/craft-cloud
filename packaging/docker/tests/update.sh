@@ -38,7 +38,17 @@ case $1 in
         esac
         ;;
     image) echo "${STUB_REVISION:-}" ;;
-    run) [ "${STUB_FAIL:-}" != copy ] || exit 1 ;;
+    run)
+        case $* in
+            *'rm -rf'*)
+                # Removing an old backup: the last argument is its name.
+                for last; do :; done
+                [ "${STUB_FAIL:-}" != remove ] || exit 1
+                rm -rf "$STUB_BACKUPS/$last"
+                ;;
+            *) [ "${STUB_FAIL:-}" != copy ] || exit 1 ;;
+        esac
+        ;;
 esac
 exit 0
 STUB
@@ -65,8 +75,9 @@ git_ -C "$work/other" push -q origin main
 second=$(git -C "$work/other" rev-parse HEAD)
 install="$work/install"
 STUB_LOG="$work/log"
+STUB_BACKUPS="$install/backups"
 PATH="$work/bin:$PATH"
-export STUB_LOG PATH
+export STUB_LOG STUB_BACKUPS PATH
 
 run_update() { (cd "$install" && sh packaging/docker/update.sh "$@") >"$work/out" 2>&1; }
 fail() {
@@ -146,6 +157,78 @@ if run_update --yes; then fail "accepted a detached HEAD"; fi
 grep -q 'detached HEAD' "$work/out" || fail "no message about the detached HEAD"
 git_ -C "$install" checkout -q main
 
-# 9. The script starts with a restrictive umask.
+# 9. Old backups: the newest N are kept (this run's included), older ones are removed through a container, other names and
+# links are left alone, and nothing is removed after a failure, with --skip-backup or with --keep 0.
+old_backups() {
+    rm -rf "$install/backups"
+    mkdir -p "$install/backups"
+    for stamp in 20200101T000000Z 20200102T000000Z 20200103T000000Z 20200104T000000Z; do
+        mkdir "$install/backups/$stamp"
+        echo data >"$install/backups/$stamp/database.sql"
+    done
+    mkdir "$install/backups/notes"
+    mkdir "$install/backups/20200105T000000Z.keep"
+    mkdir -p "$work/elsewhere"
+    # A link where the system has them, otherwise a plain file: neither is a backup directory.
+    ln -s "$work/elsewhere" "$install/backups/20200106T000000Z" 2>/dev/null || true
+    if [ ! -L "$install/backups/20200106T000000Z" ]; then
+        rm -rf "$install/backups/20200106T000000Z"
+        : >"$install/backups/20200106T000000Z"
+    fi
+}
+backups_left() { ls -1 "$install/backups" | grep -E '^2020' | tr '
+' ' '; }
+reset_to_first() { git_ -C "$install" reset -q --hard "$first"; }
+
+reset_to_first
+old_backups
+: >"$work/log"
+STUB_REVISION=$first run_update --yes || fail "the update with old backups failed"
+current=$(ls -1 "$install/backups" | grep -E '^20[0-9]{2}(0[1-9]|1[0-2])' | grep -v '^2020' | head -n 1)
+[ -n "$current" ] || fail "this run's backup is gone"
+[ -d "$install/backups/20200104T000000Z" ] && [ -d "$install/backups/20200103T000000Z" ] || fail "the newest old backups were removed"
+[ ! -d "$install/backups/20200102T000000Z" ] && [ ! -d "$install/backups/20200101T000000Z" ] || fail "old backups beyond the default of 3 were kept"
+[ -d "$install/backups/notes" ] && [ -d "$install/backups/20200105T000000Z.keep" ] || fail "a directory that is no backup was removed"
+[ -e "$install/backups/20200106T000000Z" ] || [ -L "$install/backups/20200106T000000Z" ] || fail "a link or file in backups/ was removed"
+[ -d "$work/elsewhere" ] || fail "a link in backups/ was followed"
+grep -q 'Removed old backup: .*20200102T000000Z' "$work/out" || fail "the removal of a backup is not printed"
+grep -q 'Removed old backup: .*20200101T000000Z' "$work/out" || fail "the removal of the oldest backup is not printed"
+grep -q ' | run --rm --network none -v .*/backups:/backups' "$work/log" || fail "old backups are not removed through a container"
+
+reset_to_first
+old_backups
+STUB_REVISION=$first run_update --yes --keep 1 || fail "the update with --keep 1 failed"
+[ -d "$install/backups/$current" ] || [ "$(ls -1 "$install/backups" | grep -Ec '^20[0-9]{2}(0[1-9]|1[0-2])')" -ge 1 ] || fail "--keep 1 removed this run's backup"
+[ -z "$(backups_left | grep -E '2020010[1-4]')" ] || fail "--keep 1 kept an old backup: $(backups_left)"
+
+reset_to_first
+old_backups
+CC_BACKUP_KEEP=0 STUB_REVISION=$first run_update --yes || fail "the update with CC_BACKUP_KEEP=0 failed"
+[ "$(backups_left | grep -Eo '2020010[1-4]' | wc -l)" -eq 4 ] || fail "CC_BACKUP_KEEP=0 removed backups: $(backups_left)"
+
+reset_to_first
+old_backups
+STUB_REVISION=$first run_update --yes --skip-backup || fail "the update with --skip-backup failed"
+[ "$(backups_left | grep -Eo '2020010[1-4]' | wc -l)" -eq 4 ] || fail "--skip-backup removed backups: $(backups_left)"
+
+reset_to_first
+old_backups
+if STUB_REVISION=$first STUB_FAIL=up run_update --yes; then fail "ignored a failed start"; fi
+[ "$(backups_left | grep -Eo '2020010[1-4]' | wc -l)" -eq 4 ] || fail "a failed update removed backups: $(backups_left)"
+
+# A backup that cannot be removed is a warning, not a failed update.
+reset_to_first
+old_backups
+STUB_REVISION=$first STUB_FAIL=remove run_update --yes || fail "a failed removal failed the update"
+grep -q 'could not remove the old backup' "$work/out" || fail "no warning about a backup that could not be removed"
+
+# Not a number, and no value.
+reset_to_first
+if run_update --yes --keep many; then fail "accepted --keep many"; fi
+grep -q 'whole number' "$work/out" || fail "no message about a bad --keep"
+if run_update --keep; then fail "accepted --keep without a value"; fi
+if CC_BACKUP_KEEP=-1 run_update --yes; then fail "accepted CC_BACKUP_KEEP=-1"; fi
+
+# 10. The script starts with a restrictive umask.
 grep -q '^umask 077$' "$script" || fail "no umask 077"
 echo 'update tests passed'

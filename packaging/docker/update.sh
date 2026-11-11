@@ -1,11 +1,15 @@
 #!/bin/sh
 # Back up and upgrade a Docker checkout of Craft Cloud.
 #
-#   packaging/docker/update.sh [--yes] [--skip-backup]
+#   packaging/docker/update.sh [--yes] [--skip-backup] [--keep N]
 #
 # Git runs at the repository root; every `docker compose` command runs in packaging/docker, where `.env` and the
 # COMPOSE_FILE list (the Postgres overlay) live. The order is: fetch, ask, fast-forward to the confirmed commit, build
 # the new image while the old server runs, stop the server, dump Postgres (if used), copy the data volume, start.
+#
+# Every backup is a full copy of the data volume under backups/<UTC time>/. After a successful update the newest N
+# backups are kept (N is 3 unless --keep N or CC_BACKUP_KEEP says otherwise; 0 keeps all) and older ones are removed,
+# never the one made by this run. A run that fails or skips the backup removes nothing.
 set -eu
 umask 077
 
@@ -20,13 +24,23 @@ dc() {
 
 yes=0
 skip_backup=0
-for arg in "$@"; do
-    case $arg in
+keep=${CC_BACKUP_KEEP:-3}
+while [ $# -gt 0 ]; do
+    case $1 in
         --yes) yes=1 ;;
         --skip-backup) skip_backup=1 ;;
-        *) echo "update.sh: unknown option $arg" >&2; exit 2 ;;
+        --keep)
+            [ $# -ge 2 ] || { echo "update.sh: --keep needs a number" >&2; exit 2; }
+            keep=$2
+            shift
+            ;;
+        *) echo "update.sh: unknown option $1" >&2; exit 2 ;;
     esac
+    shift
 done
+case $keep in
+    '' | *[!0-9]*) echo "update.sh: the number of backups to keep (--keep, CC_BACKUP_KEEP) must be a whole number, 0 for all" >&2; exit 2 ;;
+esac
 [ -f "$compose_dir/.env" ] || { echo "update.sh: $compose_dir/.env not found; this is not a set-up Docker installation (run packaging/docker/install.sh first)" >&2; exit 1; }
 git symbolic-ref -q HEAD >/dev/null || { echo "update.sh: the checkout is on a detached HEAD; check out the branch you follow first" >&2; exit 1; }
 git diff --quiet || { echo "update.sh: working tree has local changes" >&2; exit 1; }
@@ -82,6 +96,7 @@ if ! CC_VERSION=$version CC_REVISION=$new_sha dc build server; then
 fi
 
 backup=skipped
+stamp=
 if [ "$skip_backup" -eq 1 ]; then
     echo "WARNING: backup skipped by explicit request."
 else
@@ -111,9 +126,35 @@ else
     echo "Backup: $backup"
 fi
 
+# prune_backups: after a successful update, keeps the newest $keep backups (this run's included) and removes the older
+# ones. Only directories named like a backup of this script are touched. The files in a backup belong to the user of the
+# server (uid 65532) and are not readable by you, so a container that runs as root removes them, as it made them.
+prune_backups() {
+    [ -n "$stamp" ] || return 0
+    [ "$keep" -gt 0 ] || { echo "Old backups are kept (--keep 0)."; return 0; }
+    [ -d "$root/backups" ] || return 0
+    kept=0
+    ls -1 "$root/backups" | grep -E '^[0-9]{8}T[0-9]{6}Z$' | sort -r | while IFS= read -r name; do
+        # A link or a file with such a name is none of ours: neither counted nor removed.
+        if [ ! -d "$root/backups/$name" ] || [ -L "$root/backups/$name" ]; then
+            continue
+        fi
+        if [ "$name" = "$stamp" ] || [ "$kept" -lt "$keep" ]; then
+            kept=$((kept + 1))
+            continue
+        fi
+        if docker run --rm --network none -v "$root/backups:/backups" alpine:3.22.1@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1 sh -c 'rm -rf -- "/backups/$1"' sh "$name"; then
+            echo "Removed old backup: $root/backups/$name"
+        else
+            echo "update.sh: warning: could not remove the old backup $root/backups/$name; remove it by hand" >&2
+        fi
+    done
+}
+
 if ! dc up -d --wait; then
     echo "update.sh: the new server did not come up. Backup: $backup. The database may already be migrated, so going back needs the backup:" >&2
     echo "  $back_to_source, then in packaging/docker: docker compose build server, restore the backup into the data volume, then docker compose up -d --wait" >&2
     exit 1
 fi
+prune_backups
 echo "Craft Cloud updated to $new_sha. Backup: $backup"
